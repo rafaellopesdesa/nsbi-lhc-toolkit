@@ -1,9 +1,10 @@
 # ML4HEP-TIFR NSBI tutorial — Google Colab edition
 
 These are the **Colab-ready tutorial notebooks**. Exercises 1--4 mirror the
-original ML4HEP-TIFR sequence, while Exercises 5--7 extend the tutorial with
-hybrid neural ratio estimation, efficient Asimov sampling, and a study of
-model misspecification. Each notebook includes:
+original ML4HEP-TIFR sequence, while Exercises 5--8 extend the tutorial with
+hybrid neural ratio estimation, efficient Asimov sampling, model
+misspecification, and semi-parametric systematic uncertainties. Each notebook
+includes:
 
 1. exactly one **"Open in Colab"** badge, and
 2. a **setup cell** near the beginning that installs the dependencies, pulls the
@@ -28,6 +29,7 @@ browser.
 | Exercise 5 — Hybrid flow and density ratios | [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/iris-hep/nsbi-lhc-toolkit/blob/ml4hep_school_tutorial/workshops/ml4hep_tifr_colab/Exercise_5_Hybrid_NormalizingFlow_DensityRatio.ipynb) |
 | Exercise 6 — Neural importance-sampled Asimov data | [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/iris-hep/nsbi-lhc-toolkit/blob/ml4hep_school_tutorial/workshops/ml4hep_tifr_colab/Exercise_6_NeuralImportanceSampling_Asimov.ipynb) |
 | Exercise 7 — Asimov closure and misspecification | [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/iris-hep/nsbi-lhc-toolkit/blob/ml4hep_school_tutorial/workshops/ml4hep_tifr_colab/Exercise_7_Asimov_Misspecification_Coverage.ipynb) |
+| Exercise 8 — Semi-parametric systematics | [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/rafaellopesdesa/nsbi-lhc-toolkit/blob/ml4hep_school_tutorial/workshops/ml4hep_tifr_colab/Exercise_8_SemiParametric_Systematics.ipynb) |
 
 ## Notes for running on Colab
 
@@ -51,3 +53,8 @@ browser.
 - Exercises 6 and 7 load the expensive PRESEL, reference-flow, and ratio
   checkpoints produced by Exercise 5. Run Exercise 5 first and keep
   `USE_DRIVE = True` in all three notebooks so those checkpoints persist.
+- Exercise 8 loads the PRESEL and nominal signal/reference and
+  background/reference checkpoints produced by Exercise 5, then trains only
+  the four new scale-variation ratios. It also creates the up/down parquets in
+  streamed batches when the nominal generated samples already exist. Keep
+  `USE_DRIVE = True` in Exercises 5 and 8 so the nominal checkpoints persist.
