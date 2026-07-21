@@ -343,102 +343,21 @@ def split_train_inference(df, train_fraction=0.5, n_train=None, seed=0):
     return train, inference
 
 
-# ---------------------------------------------------------------------------
-# Gaussian-mixture model definition
-# ---------------------------------------------------------------------------
-# This is the SINGLE SOURCE OF TRUTH for the toy distributions.  Both
-# ``generate_distributions.py`` (which samples from these mixtures) and the
-# parameter-fitting notebook (which evaluates the *analytic* density ratios to
-# separate training quality from inference-statistics effects) import these
-# definitions, so the "truth" ratios are guaranteed to match the data.
-
-
-def build_cov(sigmas, correlations=None):
-    """Full covariance from per-feature sigmas and a sparse dict of pairwise
-    correlations ``{(i, j): rho}``.  Off-diagonal correlations "rotate" the
-    components; mixing rotated components gives the curved density contours."""
-    sigmas = np.asarray(sigmas, dtype=float)
-    corr = np.eye(len(sigmas))
-    if correlations:
-        for (i, j), rho in correlations.items():
-            corr[i, j] = corr[j, i] = rho
-    return np.outer(sigmas, sigmas) * corr
-
-
-# Shared broad component -- present in EVERY sample.  Guarantees overlapping
-# support so trained (and truth) density ratios stay bounded everywhere.
-BASE_MEAN = np.array([2.5, 2.0, 3.0, 1.5, 2.5])
-BASE_SIGMA = np.array([2.5, 2.4, 2.5, 2.4, 2.5])
-BASE_COV = build_cov(BASE_SIGMA)
-BASE_FRAC = 0.20
-
-
-def background_components():
-    """Bimodal, correlated background mixture: two modes plus the base."""
-    bg1 = (
-        0.45,
-        np.array([2.0, 1.0, 2.5, 0.8, 2.0]),
-        build_cov([1.0, 0.9, 1.2, 0.9, 1.0], {(0, 1): 0.6, (3, 4): 0.5}),
-    )
-    bg2 = (
-        0.35,
-        np.array([4.2, 3.1, 4.6, 2.6, 3.6]),
-        build_cov([0.9, 1.0, 1.0, 0.9, 1.1], {(0, 1): -0.5, (2, 3): 0.5}),
-    )
-    base = (BASE_FRAC, BASE_MEAN, BASE_COV)
-    return [bg1, bg2, base]
-
-
-def signal_components(v=10):
-    """Signal mixture at parameter value ``v`` (default ``v=10``, the signal
-    used in the measurement).  Two modes whose means slide with ``t = v / 10``
-    (so v=0 sits close to the background and v=10 is the most displaced), plus
-    the shared base component."""
-    t = v / 10.0
-    sig_a = (
-        0.50,
-        np.array([2.2, 1.3, 2.8, 1.0, 2.2]) + t * np.array([2.3, 1.9, 1.5, 1.3, 1.8]),
-        build_cov([0.9, 0.8, 1.0, 0.8, 0.9], {(0, 2): 0.5, (1, 4): 0.4}),
-    )
-    sig_b = (
-        0.30,
-        np.array([3.5, 2.5, 3.8, 2.0, 3.0]) + t * np.array([0.8, 0.7, 1.2, 0.6, 1.0]),
-        build_cov([0.8, 0.9, 0.9, 0.8, 1.0], {(0, 1): 0.5, (2, 4): -0.4}),
-    )
-    base = (BASE_FRAC, BASE_MEAN, BASE_COV)
-    return [sig_a, sig_b, base]
-
-
-def mixture_density(X, components):
-    """Evaluate the mixture pdf at points ``X`` (shape ``(n, n_dim)``).
-
-    ``components`` is a list of ``(fraction, mean, cov)``; fractions are
-    renormalised to sum to 1.  Returns an array of shape ``(n,)``.
-    """
-    from scipy.stats import multivariate_normal
-
-    X = np.asarray(X, dtype=float)
-    fracs = np.array([c[0] for c in components], dtype=float)
-    fracs = fracs / fracs.sum()
-    p = np.zeros(len(X))
-    for (_, mean, cov), f in zip(components, fracs):
-        p += f * multivariate_normal(mean, cov).pdf(X)
-    return p
-
-def smearing_parameters():
-    scale = np.array([1.2, 1.1, 0.99, 0.96, 1.01])
-    resolution = np.array([1.0, 0.1, 0.9, 1.3, 0.2])
-    return [scale, resolution]
-
-def reference_density(X, lam_bkg, lam_sig0):
-    """Analytic density of the *training reference* (numerator of nothing, the
-    common denominator).  The reference used in notebooks 2a/2b is
-    ``concat(background, signal_0)`` weighted by physics weights, so as a
-    normalised density it is the yield-weighted mixture of the two.
-    """
-    p_bkg = mixture_density(X, background_components())
-    p_sig0 = mixture_density(X, signal_components(0))
-    return (lam_bkg * p_bkg + lam_sig0 * p_sig0) / (lam_bkg + lam_sig0)
+# Re-export the lightweight toy-distribution definitions so existing notebooks
+# can continue importing them from ``utils``.  Keeping these definitions in a
+# NumPy-only module lets the large dataset generator avoid importing PyTorch.
+from utils_distributions import (  # noqa: E402,F401
+    BASE_COV,
+    BASE_FRAC,
+    BASE_MEAN,
+    BASE_SIGMA,
+    background_components,
+    build_cov,
+    mixture_density,
+    reference_density,
+    signal_components,
+    smearing_parameters,
+)
 
 
 # ---------------------------------------------------------------------------

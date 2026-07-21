@@ -11,11 +11,12 @@ which make the joint density genuinely non-trivial to model -- a good stress
 test for a Normalizing Flow density estimator (planned follow-up), while still
 being cheap to sample and to reason about analytically.
 
-We generate nominal ``background`` and ``signal`` samples plus an independent
-nominal ``data`` draw for visualisation.  On request, detector-scale up/down
-variations are derived in streamed batches.  They keep the latent density and
-Gaussian resolution residual fixed while multiplying the response mean by 1.1
-or 0.9.
+We generate nominal ``background`` and ``signal`` samples plus, unless disabled,
+an independent nominal ``data`` draw for visualisation.  Nominal samples and
+detector-scale up/down variations are both written in bounded batches, so peak
+memory is independent of the requested event count.  The variations keep the
+latent density and Gaussian resolution residual fixed while multiplying the
+response mean by 1.1 or 0.9.
 
 Numerical-stability design
 ---------------------------
@@ -30,14 +31,18 @@ blows up.
 """
 
 import argparse
+import gc
 import os
 from pathlib import Path
 
-import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
-from utils import background_components, signal_components, smearing_parameters
+from utils_distributions import (
+    background_components,
+    signal_components,
+    smearing_parameters,
+)
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--n_bkg", type=int, default=1_000_000)
@@ -55,7 +60,29 @@ parser.add_argument(
         "parquets without regenerating the latent events."
     ),
 )
+parser.add_argument(
+    "--generation-batch-size",
+    type=int,
+    default=100_000,
+    help="Maximum number of nominal events held in memory at once.",
+)
 parser.add_argument("--systematics-batch-size", type=int, default=100_000)
+parser.add_argument(
+    "--plot-sample-size",
+    type=int,
+    default=200_000,
+    help="Maximum events retained per sample for diagnostic plots.",
+)
+parser.add_argument(
+    "--skip-data",
+    action="store_true",
+    help="Do not generate the independent pseudo-data sample.",
+)
+parser.add_argument(
+    "--skip-plots",
+    action="store_true",
+    help="Do not create the generator-level diagnostic plots.",
+)
 args = parser.parse_args()
 
 n_bkg = args.n_bkg
@@ -76,9 +103,8 @@ SCALE_VARIATIONS = {
 }
 
 
-# The mixture definitions (build_cov, BASE_*, background_components,
-# signal_components) live in utils.py so the parameter-fitting notebook can
-# import the exact same distributions to compute the "truth" density ratios.
+# The mixture definitions live in the lightweight ``utils_distributions``
+# module and are re-exported by ``utils.py`` for the parameter-fitting notebooks.
 def sample_mixture(components, n, rng):
     """Sample ``n`` events from a Gaussian mixture.
 
@@ -89,25 +115,27 @@ def sample_mixture(components, n, rng):
     fracs = np.array([c[0] for c in components], dtype=float)
     fracs = fracs / fracs.sum()
     counts = rng.multinomial(n, fracs)
-    chunks = []
+    n_dimensions = len(np.asarray(components[0][1]))
+    sample = np.empty((n, n_dimensions), dtype=float)
+    offset = 0
     for (_, mean, cov), c in zip(components, counts):
         if c > 0:
-            chunks.append(rng.multivariate_normal(mean, cov, size=c))
-    x = np.concatenate(chunks, axis=0)
-    rng.shuffle(x)  # avoid block-ordering by component
-    return x
+            sample[offset : offset + c] = rng.multivariate_normal(
+                mean, cov, size=c
+            )
+            offset += c
+    rng.shuffle(sample)  # avoid block-ordering by component
+    return sample
+
 
 def add_reco_smearing(df, rng):
     """Add x1,...,x5 as independently smeared versions of z1,...,z5."""
     scale, resolution = smearing_parameters()
 
-    y = df[features].to_numpy(dtype=float)
-
-    x = rng.normal(
-        loc=y * scale[None, :],
-        scale=resolution[None, :],
-        size=y.shape,
-    )
+    y = df[features].to_numpy(dtype=float, copy=False)
+    x = rng.normal(loc=0.0, scale=resolution[None, :], size=y.shape)
+    for index, response_scale in enumerate(scale):
+        x[:, index] += response_scale * y[:, index]
 
     df[reco] = x
     return df
@@ -137,14 +165,129 @@ def scale_variation_dataframe(nominal_df, mean_multiplier):
     scale = np.asarray(scale, dtype=float)
     z = nominal_df[features].to_numpy(dtype=float)
     x_nominal = nominal_df[reco].to_numpy(dtype=float)
-    nominal_mean = z * scale[None, :]
-    resolution_residual = x_nominal - nominal_mean
-
     varied = nominal_df.copy()
-    varied[reco] = (
-        mean_multiplier * nominal_mean + resolution_residual
+    varied[reco] = x_nominal + (mean_multiplier - 1.0) * (
+        z * scale[None, :]
     )
     return varied
+
+
+def nominal_batch_dataframe(
+    components,
+    n_events,
+    rng,
+    *,
+    label,
+    expected_yield=None,
+    total_events=None,
+):
+    """Generate one nominal batch with the established parquet schema."""
+    n_events = int(n_events)
+    batch = pd.DataFrame(
+        sample_mixture(components, n_events, rng), columns=features
+    )
+    batch["fold"] = rng.integers(0, 2, size=n_events)
+    batch["label"] = int(label)
+    if expected_yield is not None:
+        if total_events is None or int(total_events) < 1:
+            raise ValueError("total_events must be positive for weighted samples.")
+        batch["weight"] = float(expected_yield) / int(total_events)
+    return add_reco_smearing(batch, rng)
+
+
+def write_nominal_sample(
+    output_path,
+    components,
+    n_events,
+    rng,
+    *,
+    label,
+    expected_yield=None,
+    batch_size=100_000,
+    plot_sample_size=200_000,
+):
+    """Generate and write one nominal sample with bounded peak memory.
+
+    Only a small, bounded latent-feature sample is retained for diagnostic
+    plots.  The complete event table is transferred directly from each batch
+    to a Parquet row group and is never assembled as a single dataframe.
+    """
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path = output_path.with_suffix(output_path.suffix + ".tmp")
+    temporary_path.unlink(missing_ok=True)
+
+    n_events = int(n_events)
+    batch_size = int(batch_size)
+    plot_sample_size = max(0, int(plot_sample_size))
+    if n_events < 1:
+        raise ValueError("n_events must be positive.")
+    if batch_size < 1:
+        raise ValueError("batch_size must be positive.")
+
+    retained = []
+    n_retained = 0
+    writer = None
+    sample_name = output_path.stem
+    report_interval = max(
+        batch_size,
+        ((n_events + 10 * batch_size - 1) // (10 * batch_size)) * batch_size,
+    )
+    next_report = report_interval
+
+    print(
+        f"Generating {sample_name}: {n_events:,} events "
+        f"in batches of at most {batch_size:,}..."
+    )
+    try:
+        for start in range(0, n_events, batch_size):
+            current_size = min(batch_size, n_events - start)
+            batch = nominal_batch_dataframe(
+                components,
+                current_size,
+                rng,
+                label=label,
+                expected_yield=expected_yield,
+                total_events=n_events,
+            )
+
+            n_to_retain = min(plot_sample_size - n_retained, current_size)
+            if n_to_retain > 0:
+                retained.append(batch.iloc[:n_to_retain][features].copy())
+                n_retained += n_to_retain
+
+            table = pa.Table.from_pandas(batch, preserve_index=False)
+            if writer is None:
+                writer = pq.ParquetWriter(
+                    temporary_path, table.schema, use_dictionary=False
+                )
+            writer.write_table(table)
+            del table, batch
+
+            batch_index = start // batch_size + 1
+            if batch_index % 10 == 0:
+                gc.collect()
+                pa.default_memory_pool().release_unused()
+
+            n_written = start + current_size
+            if n_written >= next_report or n_written == n_events:
+                print(
+                    f"  {sample_name}: {n_written:,}/{n_events:,} "
+                    f"({100.0 * n_written / n_events:.0f}%)"
+                )
+                while next_report <= n_written:
+                    next_report += report_interval
+    finally:
+        if writer is not None:
+            writer.close()
+
+    os.replace(temporary_path, output_path)
+    if retained:
+        return pd.concat(retained, ignore_index=True)
+    return pd.DataFrame(columns=features)
 
 
 def write_scale_variations(
@@ -181,12 +324,35 @@ def write_scale_variations(
         variation: target.with_suffix(target.suffix + ".tmp")
         for variation, target in targets.items()
     }
+    for temporary_target in temporary_targets.values():
+        temporary_target.unlink(missing_ok=True)
     writers = {variation: None for variation in SCALE_VARIATIONS}
 
     try:
-        parquet = pq.ParquetFile(nominal_path)
-        for record_batch in parquet.iter_batches(batch_size=batch_size):
-            nominal_batch = record_batch.to_pandas()
+        # ``pre_buffer`` defaults to True in current PyArrow releases.  Leaving
+        # it enabled makes an otherwise batched pass retain the complete input
+        # parquet in Arrow memory, which is fatal for the 100M-event sample.
+        parquet = pq.ParquetFile(nominal_path, pre_buffer=False)
+        n_events = parquet.metadata.num_rows
+        report_interval = max(
+            batch_size,
+            ((n_events + 10 * batch_size - 1) // (10 * batch_size))
+            * batch_size,
+        )
+        next_report = report_interval
+        n_written = 0
+        print(
+            f"Writing {sample_name} scale variations for {n_events:,} events "
+            f"in batches of at most {batch_size:,}..."
+        )
+        for batch_index, record_batch in enumerate(
+            parquet.iter_batches(batch_size=batch_size, use_threads=False),
+            start=1,
+        ):
+            current_size = record_batch.num_rows
+            nominal_batch = record_batch.to_pandas(
+                self_destruct=True, use_threads=False
+            )
             for variation, multiplier in SCALE_VARIATIONS.items():
                 varied_batch = scale_variation_dataframe(
                     nominal_batch, multiplier
@@ -194,13 +360,31 @@ def write_scale_variations(
                 table = pa.Table.from_pandas(varied_batch, preserve_index=False)
                 if writers[variation] is None:
                     writers[variation] = pq.ParquetWriter(
-                        temporary_targets[variation], table.schema
+                        temporary_targets[variation],
+                        table.schema,
+                        use_dictionary=False,
                     )
                 writers[variation].write_table(table)
+                del table, varied_batch
+            del nominal_batch, record_batch
+
+            if batch_index % 10 == 0:
+                gc.collect()
+                pa.default_memory_pool().release_unused()
+
+            n_written += current_size
+            if n_written >= next_report or n_written == n_events:
+                print(
+                    f"  {sample_name} variations: {n_written:,}/{n_events:,} "
+                    f"({100.0 * n_written / n_events:.0f}%)"
+                )
+                while next_report <= n_written:
+                    next_report += report_interval
     finally:
         for writer in writers.values():
             if writer is not None:
                 writer.close()
+        pa.default_memory_pool().release_unused()
 
     for variation, target in targets.items():
         os.replace(temporary_targets[variation], target)
@@ -221,38 +405,48 @@ if args.systematics_only:
     raise SystemExit(0)
 
 rng = np.random.default_rng(42)
+generation_batch_size = int(args.generation_batch_size)
+plot_sample_size = 0 if args.skip_plots else int(args.plot_sample_size)
+if generation_batch_size < 1:
+    raise ValueError("--generation-batch-size must be positive.")
+if not args.skip_plots and plot_sample_size < 1:
+    raise ValueError("--plot-sample-size must be positive unless plots are skipped.")
 
-# --- Background ---
-background = pd.DataFrame(
-    sample_mixture(background_components(), n_bkg, rng), columns=features
+# Write each nominal sample before generating the next one.  At Exercise 8
+# scale this replaces three simultaneously resident 100M/20M/100M-event
+# dataframes with one bounded batch plus a small plotting sample.
+background_plot = write_nominal_sample(
+    "dataframes/background.parquet",
+    background_components(),
+    n_bkg,
+    rng,
+    label=0,
+    expected_yield=LAM_BKG,
+    batch_size=generation_batch_size,
+    plot_sample_size=plot_sample_size,
 )
-background["fold"] = rng.integers(0, 2, size=n_bkg)
-background["label"] = 0
-background["weight"] = LAM_BKG / n_bkg  # total yield = LAM_BKG
-
-# --- Signal ---
-signal = pd.DataFrame(
-    sample_mixture(signal_components(), n_sig, rng), columns=features
+signal_plot = write_nominal_sample(
+    "dataframes/signal.parquet",
+    signal_components(),
+    n_sig,
+    rng,
+    label=1,
+    expected_yield=LAM_SIG,
+    batch_size=generation_batch_size,
+    plot_sample_size=plot_sample_size,
 )
-signal["fold"] = rng.integers(0, 2, size=n_sig)
-signal["label"] = 1
-signal["weight"] = LAM_SIG / n_sig  # total yield = LAM_SIG
 
-# --- Pseudo-data: an independent draw from the background mixture ---
-data = pd.DataFrame(
-    sample_mixture(background_components(), n_bkg, rng), columns=features
-)
-data["fold"] = rng.integers(0, 2, size=n_bkg)
-data["label"] = 0
-
-background = add_reco_smearing(background, rng)
-signal = add_reco_smearing(signal, rng)
-data = add_reco_smearing(data, rng)
-
-os.makedirs("dataframes", exist_ok=True)
-background.to_parquet("dataframes/background.parquet", index=False)
-signal.to_parquet("dataframes/signal.parquet", index=False)
-data.to_parquet("dataframes/data.parquet", index=False)
+data_plot = None
+if not args.skip_data:
+    data_plot = write_nominal_sample(
+        "dataframes/data.parquet",
+        background_components(),
+        n_bkg,
+        rng,
+        label=0,
+        batch_size=generation_batch_size,
+        plot_sample_size=plot_sample_size,
+    )
 
 if args.with_systematics:
     # Build the detector-response variations from the nominal parquets in
@@ -270,87 +464,90 @@ if args.with_systematics:
         batch_size=args.systematics_batch_size,
     )
 
-os.makedirs("plots", exist_ok=True)
+if not args.skip_plots:
+    import matplotlib.pyplot as plt
+    from matplotlib.colors import LogNorm
 
+    os.makedirs("plots", exist_ok=True)
 
-def feature_bins(feat):
-    lo = min(background[feat].quantile(0.005), signal[feat].quantile(0.005))
-    hi = max(background[feat].quantile(0.995), signal[feat].quantile(0.995))
-    return np.linspace(lo, hi, 61)
+    def feature_bins(feat):
+        lo = min(
+            background_plot[feat].quantile(0.005),
+            signal_plot[feat].quantile(0.005),
+        )
+        hi = max(
+            background_plot[feat].quantile(0.995),
+            signal_plot[feat].quantile(0.995),
+        )
+        return np.linspace(lo, hi, 61)
 
+    # Plot bounded representative samples rather than reopening full parquets.
+    for feat in features:
+        fig, ax = plt.subplots(figsize=(7, 5))
+        bins = feature_bins(feat)
+        bin_centers = (bins[:-1] + bins[1:]) / 2
 
-# --- Plot 1: per-feature signal vs background (with pseudo-data points) ---
-for feat in features:
-    fig, ax = plt.subplots(figsize=(7, 5))
-    bins = feature_bins(feat)
-    bin_centers = (bins[:-1] + bins[1:]) / 2
+        if data_plot is not None:
+            ax.errorbar(
+                bin_centers,
+                np.histogram(data_plot[feat], bins=bins, density=True)[0],
+                yerr=0,
+                fmt="k.",
+                capsize=3,
+                ms=4,
+                lw=1.2,
+                label="Data",
+                zorder=5,
+            )
+        ax.hist(
+            background_plot[feat],
+            bins=bins,
+            density=True,
+            histtype="stepfilled",
+            lw=2,
+            color="black",
+            alpha=0.15,
+            label="Background",
+        )
+        ax.hist(
+            signal_plot[feat],
+            bins=bins,
+            density=True,
+            histtype="step",
+            lw=2,
+            color=SIGNAL_COLOR,
+            label="Signal",
+        )
+        ax.set_xlabel(feat, loc="right")
+        ax.set_ylabel("Density", loc="top")
+        ax.legend(fontsize=8)
+        fig.savefig(f"plots/{feat}.pdf", bbox_inches="tight")
+        plt.close(fig)
 
-    ax.errorbar(
-        bin_centers,
-        np.histogram(data[feat], bins=bins, density=True)[0],
-        yerr=0,
-        fmt="k.",
-        capsize=3,
-        ms=4,
-        lw=1.2,
-        label="Data",
-        zorder=5,
-    )
-    ax.hist(
-        background[feat],
-        bins=bins,
-        density=True,
-        histtype="stepfilled",
-        lw=2,
-        color="black",
-        alpha=0.15,
-        label="Background",
-    )
-    ax.hist(
-        signal[feat],
-        bins=bins,
-        density=True,
-        histtype="step",
-        lw=2,
-        color=SIGNAL_COLOR,
-        label="Signal",
-    )
-    ax.set_xlabel(feat, loc="right")
-    ax.set_ylabel("Density", loc="top")
-    ax.legend(fontsize=8)
-    fig.savefig(f"plots/{feat}.pdf", bbox_inches="tight")
+    # A log colour scale exposes the shared broad support component.
+    fig, axes = plt.subplots(1, 2, figsize=(13, 5))
+    for ax, (fi, fj) in zip(axes, [(0, 1), (2, 3)]):
+        ax.hist2d(
+            background_plot[features[fi]],
+            background_plot[features[fj]],
+            bins=80,
+            cmap="Greys",
+            norm=LogNorm(),
+        )
+        ax.scatter(
+            signal_plot[features[fi]].iloc[:2000],
+            signal_plot[features[fj]].iloc[:2000],
+            s=3,
+            color=SIGNAL_COLOR,
+            alpha=0.4,
+            label="signal",
+        )
+        ax.set_xlabel(features[fi])
+        ax.set_ylabel(features[fj])
+        ax.legend(fontsize=8)
+    fig.suptitle("Background density on a LOG scale (grey) with signal overlaid")
+    fig.savefig("plots/2d_structure.pdf", bbox_inches="tight")
     plt.close(fig)
-
-# --- Plot 2: 2D views exposing the multi-modal, correlated structure ---
-# A LOG colour scale is essential here: on a linear scale the sharp background
-# peak saturates the colour map and hides the broad, low-but-nonzero density
-# floor (the shared BASE component). That floor is precisely what makes the
-# support overlap total and the density ratios bounded, so we must show it.
-from matplotlib.colors import LogNorm
-
-fig, axes = plt.subplots(1, 2, figsize=(13, 5))
-for ax, (fi, fj) in zip(axes, [(0, 1), (2, 3)]):
-    ax.hist2d(
-        background[features[fi]],
-        background[features[fj]],
-        bins=80,
-        cmap="Greys",
-        norm=LogNorm(),
-    )
-    ax.scatter(
-        signal[features[fi]][:2000],
-        signal[features[fj]][:2000],
-        s=3,
-        color=SIGNAL_COLOR,
-        alpha=0.4,
-        label="signal",
-    )
-    ax.set_xlabel(features[fi])
-    ax.set_ylabel(features[fj])
-    ax.legend(fontsize=8)
-fig.suptitle("Background density on a LOG scale (grey) with signal overlaid")
-fig.savefig("plots/2d_structure.pdf", bbox_inches="tight")
-plt.close(fig)
 
 variation_message = (
     ", including scale-up/down detector variations"
@@ -360,5 +557,11 @@ variation_message = (
 print(
     f"Done. Generated background ({n_bkg:,}, yield {LAM_BKG:g}) and "
     f"signal ({n_sig:,}, yield {LAM_SIG:g}){variation_message}. "
-    "Saved to dataframes/, plots to plots/"
+    + ("Pseudo-data generation was skipped. " if args.skip_data else "")
+    + "Saved to dataframes/"
+    + (
+        "; diagnostic plots were skipped."
+        if args.skip_plots
+        else ", plots to plots/."
+    )
 )

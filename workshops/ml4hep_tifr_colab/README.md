@@ -56,5 +56,8 @@ browser.
 - Exercise 8 loads the PRESEL and nominal signal/reference and
   background/reference checkpoints produced by Exercise 5, then trains only
   the four new scale-variation ratios. It also creates the up/down parquets in
-  streamed batches when the nominal generated samples already exist. Keep
-  `USE_DRIVE = True` in Exercises 5 and 8 so the nominal checkpoints persist.
+  streamed batches when the nominal generated samples already exist. Nominal
+  generation is also streamed, and Exercise 8 skips the unused pseudo-data and
+  generator-level plots, so the 100M/20M-event configuration has bounded peak
+  memory. Keep `USE_DRIVE = True` in Exercises 5 and 8 so the nominal
+  checkpoints persist.
