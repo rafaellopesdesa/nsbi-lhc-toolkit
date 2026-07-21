@@ -1,10 +1,10 @@
 # ML4HEP-TIFR NSBI tutorial — Google Colab edition
 
 These are the **Colab-ready tutorial notebooks**. Exercises 1--4 mirror the
-original ML4HEP-TIFR sequence, while Exercises 5--8 extend the tutorial with
+original ML4HEP-TIFR sequence, while Exercises 5--9 extend the tutorial with
 hybrid neural ratio estimation, efficient Asimov sampling, model
-misspecification, and semi-parametric systematic uncertainties. Each notebook
-includes:
+misspecification, semi-parametric systematic uncertainties, and dual hybrid
+Bayesian posterior/likelihood estimation. Each notebook includes:
 
 1. exactly one **"Open in Colab"** badge, and
 2. a **setup cell** near the beginning that installs the dependencies, pulls the
@@ -30,6 +30,7 @@ browser.
 | Exercise 6 — Neural importance-sampled Asimov data | [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/iris-hep/nsbi-lhc-toolkit/blob/ml4hep_school_tutorial/workshops/ml4hep_tifr_colab/Exercise_6_NeuralImportanceSampling_Asimov.ipynb) |
 | Exercise 7 — Asimov closure and misspecification | [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/iris-hep/nsbi-lhc-toolkit/blob/ml4hep_school_tutorial/workshops/ml4hep_tifr_colab/Exercise_7_Asimov_Misspecification_Coverage.ipynb) |
 | Exercise 8 — Semi-parametric systematics | [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/rafaellopesdesa/nsbi-lhc-toolkit/blob/ml4hep_school_tutorial/workshops/ml4hep_tifr_colab/Exercise_8_SemiParametric_Systematics.ipynb) |
+| Exercise 9 — Dual hNPE--hNDE | [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/rafaellopesdesa/nsbi-lhc-toolkit/blob/ml4hep_school_tutorial/workshops/ml4hep_tifr_colab/Exercise_9_Hybrid_NPE_NDE.ipynb) |
 
 ## Notes for running on Colab
 
@@ -61,3 +62,10 @@ browser.
   generator-level plots, so the 100M/20M-event configuration has bounded peak
   memory. Keep `USE_DRIVE = True` in Exercises 5 and 8 so the nominal
   checkpoints persist.
+- Exercise 9 is self-contained and uses a small nonlinear Bayesian simulator
+  with an explicit nuisance parameter. It trains a conditional spline NPE, a
+  posterior-residual ratio, and the dual spline hNDE likelihood. The default
+  `FAST_MODE = True` is intended for a first Colab run; disabling it increases
+  the independent training and validation samples for smoother evidence and
+  selection calculations. Its checkpoints are stored in the same persistent
+  working directory when `USE_DRIVE = True`.
