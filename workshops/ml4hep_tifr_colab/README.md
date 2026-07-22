@@ -1,16 +1,16 @@
 # ML4HEP-TIFR NSBI tutorial — Google Colab edition
 
 These are the **Colab-ready tutorial notebooks**. Exercises 1--4 mirror the
-original ML4HEP-TIFR sequence, while Exercises 5--9 extend the tutorial with
+original ML4HEP-TIFR sequence, while Exercises 5--10 extend the tutorial with
 hybrid neural ratio estimation, efficient Asimov sampling, model
 misspecification, semi-parametric systematic uncertainties, and dual hybrid
-Bayesian posterior/likelihood estimation. Each notebook includes:
+Bayesian posterior/likelihood estimation, followed by external `sbibm`
+benchmarking. Each notebook includes:
 
 1. exactly one **"Open in Colab"** badge, and
-2. a **setup cell** near the beginning that installs the dependencies, pulls the
-   `nsbi_common_utils` package plus the tutorial helpers (`utils.py`,
-   `generate_distributions.py`), creates or reuses the legacy working directory,
-   and generates the dataset there when it is missing.
+2. a **setup cell** near the beginning that installs the required dependencies,
+   pulls the relevant tutorial helpers, creates or reuses the legacy working
+   directory, and acquires or generates the required data when they are missing.
 
 Use these when the local `pixi` environment isn't available — no install, just a
 browser.
@@ -31,6 +31,7 @@ browser.
 | Exercise 7 — Asimov closure and misspecification | [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/iris-hep/nsbi-lhc-toolkit/blob/ml4hep_school_tutorial/workshops/ml4hep_tifr_colab/Exercise_7_Asimov_Misspecification_Coverage.ipynb) |
 | Exercise 8 — Semi-parametric systematics | [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/rafaellopesdesa/nsbi-lhc-toolkit/blob/ml4hep_school_tutorial/workshops/ml4hep_tifr_colab/Exercise_8_SemiParametric_Systematics.ipynb) |
 | Exercise 9 — Dual hNPE--hNDE | [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/rafaellopesdesa/nsbi-lhc-toolkit/blob/ml4hep_school_tutorial/workshops/ml4hep_tifr_colab/Exercise_9_Hybrid_NPE_NDE.ipynb) |
+| Exercise 10 — `sbibm` hybrid benchmark | [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/rafaellopesdesa/nsbi-lhc-toolkit/blob/ml4hep_school_tutorial/workshops/ml4hep_tifr_colab/Exercise_10_SBIBM_Hybrid_Benchmark.ipynb) |
 
 ## Notes for running on Colab
 
@@ -76,3 +77,11 @@ browser.
   calculations. Its checkpoints are stored in the same persistent working
   directory when `USE_DRIVE = True`, and its completed figures are exported to
   self-contained scripts in `exercise9_figures_scripts/`.
+- Exercise 10 is self-contained and installs the official `sbibm` task and
+  metric framework. It caches an exact-budget prior-predictive simulation bank,
+  trains hNPE and (for continuous tasks) the dual hNDE with optional two-fold
+  cross-fitting, and compares 10,000 posterior samples to the official
+  reference posteriors with the paper's five-fold C2ST. The `challenge` profile
+  is intentionally a long GPU run; `quick` performs a one-observation
+  diagnostic at a 10,000-simulation budget. SIR and Lotka--Volterra additionally
+  require the Julia/diffeqtorch backend and are not default Colab targets.
