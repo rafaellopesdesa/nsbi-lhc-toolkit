@@ -61,11 +61,18 @@ browser.
   generation is also streamed, and Exercise 8 skips the unused pseudo-data and
   generator-level plots, so the 100M/20M-event configuration has bounded peak
   memory. Keep `USE_DRIVE = True` in Exercises 5 and 8 so the nominal
-  checkpoints persist.
+  checkpoints persist. Its final Asimov diagnostic profiles both `mu` and the
+  scale nuisance, reports the residual nuisance displacement from zero, and
+  exports every completed figure to self-contained scripts in
+  `exercise8_figures_scripts/`.
 - Exercise 9 is self-contained and uses a small nonlinear Bayesian simulator
   with an explicit nuisance parameter. It trains a conditional spline NPE, a
-  posterior-residual ratio, and the dual spline hNDE likelihood. The default
-  `FAST_MODE = True` is intended for a first Colab run; disabling it increases
-  the independent training and validation samples for smoother evidence and
-  selection calculations. Its checkpoints are stored in the same persistent
-  working directory when `USE_DRIVE = True`.
+  four-member posterior-residual ratio ensemble, and the dual spline hNDE
+  likelihood with a second four-member ratio ensemble. The raw ratios are
+  averaged without post-hoc calibration and use the Exercise 5 learning-rate
+  sequence (`1e-3`, `1e-5`, `1e-7`, ...). Setting `FAST_MODE = True` provides
+  a quicker first Colab run; the full setting increases the independent
+  training and validation samples for smoother evidence and selection
+  calculations. Its checkpoints are stored in the same persistent working
+  directory when `USE_DRIVE = True`, and its completed figures are exported to
+  self-contained scripts in `exercise9_figures_scripts/`.

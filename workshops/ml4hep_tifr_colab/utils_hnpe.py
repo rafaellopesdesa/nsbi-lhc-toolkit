@@ -613,20 +613,34 @@ def train_ratio_classifier(
         lr=float(training_config["learning_rate"]),
         weight_decay=float(training_config.get("weight_decay", 0.0)),
     )
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer,
-        mode="min",
-        factor=float(training_config.get("lr_scheduler_factor", 0.3)),
-        patience=int(training_config.get("lr_scheduler_patience", 2)),
-        min_lr=float(training_config.get("min_learning_rate", 1.0e-6)),
-    )
+    scheduler_name = str(
+        training_config.get("lr_scheduler", "plateau")
+    ).lower()
+    if scheduler_name == "step":
+        scheduler = torch.optim.lr_scheduler.StepLR(
+            optimizer,
+            step_size=int(training_config.get("lr_scheduler_patience", 10)),
+            gamma=float(training_config.get("lr_scheduler_factor", 0.01)),
+        )
+        scheduler_uses_metric = False
+    elif scheduler_name == "plateau":
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer,
+            mode="min",
+            factor=float(training_config.get("lr_scheduler_factor", 0.3)),
+            patience=int(training_config.get("lr_scheduler_patience", 2)),
+            min_lr=float(training_config.get("min_learning_rate", 1.0e-6)),
+        )
+        scheduler_uses_metric = True
+    else:
+        raise ValueError("lr_scheduler must be 'step' or 'plateau'.")
     n_epochs = int(training_config["n_epochs"])
     patience = int(training_config.get("patience", n_epochs))
     gradient_clip = float(training_config.get("gradient_clip", 5.0))
     best_validation = math.inf
     best_state = None
     stale_epochs = 0
-    history = {"train": [], "validation": []}
+    history = {"train": [], "validation": [], "learning_rate": []}
     print(f"Training balanced ratio classifier on {n_per_class:,} rows per class")
 
     for epoch in range(1, n_epochs + 1):
@@ -656,9 +670,14 @@ def train_ratio_classifier(
                 validation_losses.append(float(loss.detach().cpu()))
         train_loss = float(np.mean(train_losses))
         validation_loss = float(np.mean(validation_losses))
+        learning_rate = float(optimizer.param_groups[0]["lr"])
         history["train"].append(train_loss)
         history["validation"].append(validation_loss)
-        scheduler.step(validation_loss)
+        history["learning_rate"].append(learning_rate)
+        if scheduler_uses_metric:
+            scheduler.step(validation_loss)
+        else:
+            scheduler.step()
         if validation_loss < best_validation - 1.0e-5:
             best_validation = validation_loss
             best_state = copy.deepcopy(model.state_dict())
@@ -666,8 +685,8 @@ def train_ratio_classifier(
         else:
             stale_epochs += 1
         print(
-            f"  epoch {epoch:02d}/{n_epochs}: train={train_loss:.4f}, "
-            f"validation={validation_loss:.4f}"
+            f"  epoch {epoch:02d}/{n_epochs}: lr={learning_rate:.3e}, "
+            f"train={train_loss:.4f}, validation={validation_loss:.4f}"
         )
         if stale_epochs >= patience:
             print(f"  early stopping after {epoch} epochs")
@@ -720,6 +739,54 @@ def ratio_classifier_logit(
             + float(pack.get("calibration_intercept", 0.0))
         )
     return logits
+
+
+def ratio_classifier_ensemble_logit(
+    packs: list[Mapping[str, Any]],
+    values: np.ndarray,
+    *,
+    batch_size: int = 65_536,
+) -> np.ndarray:
+    """Return the log of the arithmetic-mean ratio from raw classifiers.
+
+    Each member estimates a positive density ratio through ``exp(logit)``.
+    Averaging the ratios, rather than the logits, matches the ensemble
+    convention used in Exercise 5.  No post-hoc calibration is applied.
+    """
+    if not packs:
+        raise ValueError("At least one ratio-classifier pack is required.")
+    member_logits = np.stack(
+        [
+            ratio_classifier_logit(
+                pack,
+                values,
+                calibrated=False,
+                batch_size=batch_size,
+            )
+            for pack in packs
+        ],
+        axis=0,
+    )
+    maximum = np.max(member_logits, axis=0)
+    return maximum + np.log(
+        np.mean(np.exp(member_logits - maximum[None, :]), axis=0)
+    )
+
+
+def ratio_classifier_ensemble_ratio(
+    packs: list[Mapping[str, Any]],
+    values: np.ndarray,
+    *,
+    max_abs_log_ratio: float = 20.0,
+    batch_size: int = 65_536,
+) -> np.ndarray:
+    """Return the uncalibrated arithmetic-mean density ratio of an ensemble."""
+    log_ratio = ratio_classifier_ensemble_logit(
+        packs,
+        values,
+        batch_size=batch_size,
+    )
+    return np.exp(np.clip(log_ratio, -max_abs_log_ratio, max_abs_log_ratio))
 
 
 def calibrate_ratio_classifier(

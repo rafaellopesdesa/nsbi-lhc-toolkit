@@ -99,12 +99,20 @@ def predict_with_model(
 
 
 def _capture_plotting_call(plotter, *args, **kwargs):
-    """Run an upstream plotter and retain figures it normally clears."""
+    """Run an upstream plotter and retain figures it normally shows/clears.
+
+    Colab's inline backend may close a figure as soon as ``plt.show()`` is
+    called.  Suppress both ``show`` and ``clf`` while the upstream plotting
+    function runs so the completed figure can be collected reliably in local
+    notebooks and Colab alike.
+    """
     import matplotlib.pyplot as plt
 
     figure_numbers_before = set(plt.get_fignums())
     original_clf = plt.clf
+    original_show = plt.show
     plt.clf = lambda: None
+    plt.show = lambda *_, **__: None
     try:
         plotter(*args, **kwargs)
         new_numbers = [
@@ -115,6 +123,7 @@ def _capture_plotting_call(plotter, *args, **kwargs):
         figures = [plt.figure(number) for number in new_numbers]
     finally:
         plt.clf = original_clf
+        plt.show = original_show
     for figure in figures:
         plt.close(figure)
     return figures
