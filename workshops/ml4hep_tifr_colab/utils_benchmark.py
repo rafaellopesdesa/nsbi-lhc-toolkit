@@ -5,13 +5,16 @@ therefore keeps simulation, model training, posterior construction, and metric
 evaluation separate.  A single cached simulation bank can be shared by the
 posterior and likelihood routes without hiding additional simulator calls.
 
-The neural building blocks are imported from :mod:`utils_hnpe`, so Exercise 10
-uses exactly the quadratic-spline flows, raw ratio ensembles, and learning-rate
-machinery introduced in Exercise 9.
+Exercise 10 deliberately keeps its improved training machinery in this module:
+the spline flows use learned LU mixing, the simulation bank is genuinely
+cross-fitted, and the ratio networks use the unchanged raw-ensemble convention
+from :mod:`utils_hnpe`.  Exercises 1--9 therefore retain their original
+algorithms and checkpoint formats.
 """
 
 from __future__ import annotations
 
+import copy
 import math
 import random
 from dataclasses import dataclass
@@ -21,14 +24,17 @@ from typing import Any, Iterable, Mapping, Sequence
 import numpy as np
 import pandas as pd
 import torch
+import torch.nn.functional as F
 from scipy.special import logsumexp
+from scipy.stats import kstest
+from torch.utils.data import DataLoader, TensorDataset
 
 from utils_hnpe import (
+    ArrayStandardizer,
     ratio_classifier_ensemble_logit,
     sample_spline_flow,
     spline_flow_log_prob,
     train_ratio_classifier,
-    train_spline_flow,
 )
 
 
@@ -187,6 +193,304 @@ def seed_everything(seed: int) -> None:
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+
+
+def _build_lu_mixed_spline(
+    *,
+    n_features: int,
+    context_features: int,
+    n_coupling_layers: int,
+    hidden_features: int,
+    hidden_layers: int,
+    spline_num_bins: int,
+    spline_tail_bound: float,
+    dropout_probability: float,
+) -> torch.nn.Module:
+    """Build an NSF whose coupling layers are separated by learned LU mixing.
+
+    This mirrors the transform topology used by the ``sbi`` NSF benchmark:
+    alternating masks alone decide which coordinates are transformed, while
+    every coupling is followed by an invertible learned linear map.  In
+    particular, no reversal is combined with an alternating two-dimensional
+    mask, which would repeatedly transform the same original coordinate.
+    """
+
+    try:
+        from nflows.distributions.normal import StandardNormal
+        from nflows.flows.base import Flow
+        from nflows.nn.nets import ResidualNet
+        from nflows.transforms.base import CompositeTransform
+        from nflows.transforms.coupling import (
+            PiecewiseRationalQuadraticCouplingTransform,
+        )
+        from nflows.transforms.lu import LULinear
+        from nflows.utils.torchutils import create_alternating_binary_mask
+    except ImportError as exc:
+        raise ImportError(
+            "Exercise 10 requires nflows. Install it with `pip install nflows`."
+        ) from exc
+
+    def make_net(in_features: int, out_features: int) -> torch.nn.Module:
+        return ResidualNet(
+            in_features=in_features,
+            out_features=out_features,
+            hidden_features=int(hidden_features),
+            context_features=(int(context_features) or None),
+            num_blocks=int(hidden_layers),
+            activation=F.relu,
+            dropout_probability=float(dropout_probability),
+            use_batch_norm=False,
+        )
+
+    transforms = []
+    for layer_index in range(int(n_coupling_layers)):
+        mask = create_alternating_binary_mask(
+            features=int(n_features),
+            even=(layer_index % 2 == 0),
+        )
+        transforms.extend(
+            [
+                PiecewiseRationalQuadraticCouplingTransform(
+                    mask=mask,
+                    transform_net_create_fn=make_net,
+                    num_bins=int(spline_num_bins),
+                    tails="linear",
+                    tail_bound=float(spline_tail_bound),
+                    apply_unconditional_transform=False,
+                ),
+                LULinear(int(n_features), identity_init=True),
+            ]
+        )
+    return Flow(
+        transform=CompositeTransform(transforms),
+        distribution=StandardNormal(shape=[int(n_features)]),
+    )
+
+
+def _torch_load(path: Path, device: torch.device) -> dict[str, Any]:
+    try:
+        return torch.load(path, map_location=device, weights_only=False)
+    except TypeError:
+        return torch.load(path, map_location=device)
+
+
+def _build_lu_flow_from_config(
+    config: Mapping[str, Any], device: torch.device
+) -> torch.nn.Module:
+    if str(config.get("architecture", "")) != "lu_mixed_nsf_v2":
+        raise ValueError(
+            "This checkpoint is not an Exercise 10 LU-mixed v2 flow. "
+            "Use the v2 run tag rather than an Exercise 9/v1 checkpoint."
+        )
+    return _build_lu_mixed_spline(
+        n_features=int(config["n_features"]),
+        context_features=int(config.get("context_features", 0)),
+        n_coupling_layers=int(config["n_coupling_layers"]),
+        hidden_features=int(config["hidden_features"]),
+        hidden_layers=int(config["hidden_layers"]),
+        spline_num_bins=int(config["spline_num_bins"]),
+        spline_tail_bound=float(config["spline_tail_bound"]),
+        dropout_probability=float(config.get("dropout_probability", 0.0)),
+    ).to(device)
+
+
+def load_lu_mixed_spline_flow(
+    checkpoint: str | Path, device: torch.device
+) -> dict[str, Any]:
+    """Load a benchmark-only LU-mixed spline flow."""
+
+    checkpoint = Path(checkpoint)
+    saved = _torch_load(checkpoint, device)
+    config = dict(saved["config"])
+    flow = _build_lu_flow_from_config(config, device)
+    flow.load_state_dict(saved["state_dict"])
+    flow.eval()
+    context_scaler = None
+    if saved.get("context_mean") is not None:
+        context_scaler = ArrayStandardizer(
+            mean=np.asarray(saved["context_mean"], dtype=np.float32),
+            std=np.asarray(saved["context_std"], dtype=np.float32),
+        )
+    return {
+        "flow": flow,
+        "target_scaler": ArrayStandardizer(
+            mean=np.asarray(saved["target_mean"], dtype=np.float32),
+            std=np.asarray(saved["target_std"], dtype=np.float32),
+        ),
+        "context_scaler": context_scaler,
+        "config": config,
+        "checkpoint": checkpoint,
+        "history": saved.get("history", {}),
+    }
+
+
+def train_lu_mixed_spline_flow(
+    target: np.ndarray,
+    *,
+    context: np.ndarray | None,
+    checkpoint: str | Path,
+    model_config: Mapping[str, Any],
+    training_config: Mapping[str, Any],
+    device: torch.device,
+    seed: int,
+    load_if_available: bool = True,
+) -> dict[str, Any]:
+    """Train the independent Exercise 10 LU-mixed spline architecture."""
+
+    checkpoint = Path(checkpoint)
+    checkpoint.parent.mkdir(parents=True, exist_ok=True)
+    if load_if_available and checkpoint.exists():
+        print(f"Loading LU-mixed spline flow from {checkpoint}")
+        return load_lu_mixed_spline_flow(checkpoint, device)
+
+    target = _as_float32_2d(target, "target")
+    if len(target) < 4:
+        raise ValueError("At least four target rows are required.")
+    if context is not None:
+        context = _as_float32_2d(context, "context")
+        if len(context) != len(target):
+            raise ValueError("context must contain one row per target row.")
+
+    config = dict(model_config)
+    config.update(
+        {
+            "architecture": "lu_mixed_nsf_v2",
+            "n_features": int(target.shape[1]),
+            "context_features": 0 if context is None else int(context.shape[1]),
+        }
+    )
+    target_scaler = ArrayStandardizer.fit(target)
+    target_scaled = target_scaler.transform(target)
+    context_scaler = None
+    context_scaled = None
+    if context is not None:
+        context_scaler = ArrayStandardizer.fit(context)
+        context_scaled = context_scaler.transform(context)
+
+    validation_fraction = float(training_config.get("validation_fraction", 0.1))
+    if not 0.0 < validation_fraction < 1.0:
+        raise ValueError("validation_fraction must be between zero and one.")
+    n_validation = min(
+        len(target_scaled) - 1,
+        max(1, int(round(validation_fraction * len(target_scaled)))),
+    )
+    generator = torch.Generator().manual_seed(int(seed))
+    order = torch.randperm(len(target_scaled), generator=generator).numpy()
+    validation_indices = order[:n_validation]
+    training_indices = order[n_validation:]
+
+    target_tensor = torch.tensor(target_scaled, dtype=torch.float32)
+    if context_scaled is None:
+        training_dataset = TensorDataset(target_tensor[training_indices])
+        validation_dataset = TensorDataset(target_tensor[validation_indices])
+    else:
+        context_tensor = torch.tensor(context_scaled, dtype=torch.float32)
+        training_dataset = TensorDataset(
+            target_tensor[training_indices], context_tensor[training_indices]
+        )
+        validation_dataset = TensorDataset(
+            target_tensor[validation_indices], context_tensor[validation_indices]
+        )
+
+    batch_size = int(training_config["batch_size"])
+    training_loader = DataLoader(
+        training_dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        generator=generator,
+    )
+    validation_loader = DataLoader(
+        validation_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+    )
+    seed_everything(seed)
+    flow = _build_lu_flow_from_config(config, device)
+    optimizer = torch.optim.AdamW(
+        flow.parameters(),
+        lr=float(training_config["learning_rate"]),
+        weight_decay=float(training_config.get("weight_decay", 0.0)),
+    )
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer,
+        mode="min",
+        factor=float(training_config.get("lr_scheduler_factor", 0.3)),
+        patience=int(training_config.get("lr_scheduler_patience", 3)),
+        min_lr=float(training_config.get("min_learning_rate", 1.0e-6)),
+    )
+    n_epochs = int(training_config["n_epochs"])
+    patience = int(training_config.get("patience", n_epochs))
+    gradient_clip = float(training_config.get("gradient_clip", 5.0))
+    min_delta = float(training_config.get("min_delta", 1.0e-4))
+    best_validation = math.inf
+    best_state = None
+    stale_epochs = 0
+    history = {"train": [], "validation": [], "learning_rate": []}
+    print(
+        f"Training {'conditional' if context is not None else 'unconditional'} "
+        f"LU-mixed spline flow on {len(training_dataset):,} rows"
+    )
+
+    for epoch in range(1, n_epochs + 1):
+        flow.train()
+        train_losses = []
+        for batch in training_loader:
+            target_batch = batch[0].to(device)
+            context_batch = batch[1].to(device) if len(batch) == 2 else None
+            loss = -flow.log_prob(target_batch, context=context_batch).mean()
+            optimizer.zero_grad(set_to_none=True)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(flow.parameters(), gradient_clip)
+            optimizer.step()
+            train_losses.append(float(loss.detach().cpu()))
+
+        flow.eval()
+        validation_losses = []
+        with torch.no_grad():
+            for batch in validation_loader:
+                target_batch = batch[0].to(device)
+                context_batch = batch[1].to(device) if len(batch) == 2 else None
+                loss = -flow.log_prob(target_batch, context=context_batch).mean()
+                validation_losses.append(float(loss.detach().cpu()))
+        train_loss = float(np.mean(train_losses))
+        validation_loss = float(np.mean(validation_losses))
+        learning_rate = float(optimizer.param_groups[0]["lr"])
+        history["train"].append(train_loss)
+        history["validation"].append(validation_loss)
+        history["learning_rate"].append(learning_rate)
+        scheduler.step(validation_loss)
+
+        if validation_loss < best_validation - min_delta:
+            best_validation = validation_loss
+            best_state = copy.deepcopy(flow.state_dict())
+            stale_epochs = 0
+        else:
+            stale_epochs += 1
+        print(
+            f"  epoch {epoch:03d}/{n_epochs}: lr={learning_rate:.3e}, "
+            f"train={train_loss:.4f}, validation={validation_loss:.4f}"
+        )
+        if stale_epochs >= patience:
+            print(f"  early stopping after {epoch} epochs")
+            break
+
+    if best_state is not None:
+        flow.load_state_dict(best_state)
+    flow.eval()
+    torch.save(
+        {
+            "state_dict": flow.state_dict(),
+            "config": config,
+            "target_mean": target_scaler.mean,
+            "target_std": target_scaler.std,
+            "context_mean": None if context_scaler is None else context_scaler.mean,
+            "context_std": None if context_scaler is None else context_scaler.std,
+            "history": history,
+        },
+        checkpoint,
+    )
+    print(f"Saved LU-mixed spline flow to {checkpoint}")
+    return load_lu_mixed_spline_flow(checkpoint, device)
 
 
 def budget_label(num_simulations: int) -> str:
@@ -351,28 +655,41 @@ def load_or_simulate_bank(
 def split_simulation_bank(
     bank: SimulationBank,
     *,
-    flow_fraction: float = 0.5,
     seed: int,
     fold: int = 0,
+    n_folds: int = 5,
 ) -> dict[str, np.ndarray]:
-    """Split a bank into statistically separate flow and ratio subsets.
+    """Return one complementary split of a genuine K-fold cross-fit.
 
-    ``fold=1`` swaps the two subsets.  Training both folds is cross-fitting: it
-    doubles neural training but performs no additional simulations.
+    The held-out fold trains the density-ratio correction; all other folds
+    train the reference flow.  Across all K fits every simulation is used once
+    for ratio estimation and K-1 times for flow estimation.  The same ``seed``
+    must be used for every fold so that the partitions remain complementary.
     """
 
-    if not 0.0 < float(flow_fraction) < 1.0:
-        raise ValueError("flow_fraction must be strictly between zero and one.")
-    if int(fold) not in (0, 1):
-        raise ValueError("fold must be zero or one.")
+    n_folds = int(n_folds)
+    fold = int(fold)
+    if n_folds < 2:
+        raise ValueError("n_folds must be at least two.")
+    if n_folds > bank.num_simulations:
+        raise ValueError("n_folds cannot exceed the number of simulations.")
+    if not 0 <= fold < n_folds:
+        raise ValueError(f"fold must lie in [0, {n_folds}).")
     rng = np.random.default_rng(int(seed))
     order = rng.permutation(bank.num_simulations)
-    n_flow = int(round(float(flow_fraction) * bank.num_simulations))
-    n_flow = min(bank.num_simulations - 2, max(2, n_flow))
-    flow_indices, ratio_indices = order[:n_flow], order[n_flow:]
-    if int(fold) == 1:
-        flow_indices, ratio_indices = ratio_indices, flow_indices
+    partitions = [
+        np.asarray(values, dtype=np.int64)
+        for values in np.array_split(order, n_folds)
+    ]
+    ratio_indices = partitions[fold]
+    flow_indices = np.concatenate(
+        [values for index, values in enumerate(partitions) if index != fold]
+    )
+    if np.intersect1d(flow_indices, ratio_indices).size:
+        raise RuntimeError("Cross-fit flow and ratio subsets unexpectedly overlap.")
     return {
+        "flow_indices": flow_indices,
+        "ratio_indices": ratio_indices,
         "theta_flow": bank.theta[flow_indices],
         "x_flow": bank.x[flow_indices],
         "theta_ratio": bank.theta[ratio_indices],
@@ -579,6 +896,8 @@ class HybridBenchmarkModel:
     r_l_ensemble: list[Mapping[str, Any]] | None
     defensive_epsilon: float
     fold: int
+    n_folds: int
+    split_seed: int
     num_simulations: int
 
     @property
@@ -597,10 +916,11 @@ def train_hybrid_benchmark_model(
     ratio_training_config: Mapping[str, Any],
     device: torch.device,
     seed: int,
+    split_seed: int,
     ensemble_size: int = 4,
     defensive_epsilon: float = 0.02,
-    flow_fraction: float = 0.5,
     fold: int = 0,
+    n_folds: int = 5,
     train_hnde: bool = True,
     load_if_available: bool = True,
     retrain_outliers: bool = True,
@@ -615,15 +935,15 @@ def train_hybrid_benchmark_model(
     model_dir.mkdir(parents=True, exist_ok=True)
     split = split_simulation_bank(
         bank,
-        flow_fraction=flow_fraction,
-        seed=int(seed),
+        seed=int(split_seed),
         fold=int(fold),
+        n_folds=int(n_folds),
     )
     transform = infer_parameter_transform(task)
     z_flow = transform.forward(split["theta_flow"])
     z_ratio = transform.forward(split["theta_ratio"])
 
-    q_phi = train_spline_flow(
+    q_phi = train_lu_mixed_spline_flow(
         z_flow,
         context=split["x_flow"],
         checkpoint=model_dir / "q_phi_conditional_posterior.pt",
@@ -659,7 +979,7 @@ def train_hybrid_benchmark_model(
     q_eta = None
     r_l_ensemble = None
     if train_hnde:
-        q_eta = train_spline_flow(
+        q_eta = train_lu_mixed_spline_flow(
             split["x_flow"],
             context=None,
             checkpoint=model_dir / "q_eta_observation_reference.pt",
@@ -695,6 +1015,52 @@ def train_hybrid_benchmark_model(
         r_l_ensemble=r_l_ensemble,
         defensive_epsilon=float(defensive_epsilon),
         fold=int(fold),
+        n_folds=int(n_folds),
+        split_seed=int(split_seed),
+        num_simulations=bank.num_simulations,
+    )
+
+
+@dataclass
+class NPEBaselineModel:
+    """All-data NSF baseline with the architecture used in the paper era."""
+
+    task: Any
+    transform: ParameterTransform
+    q_phi: Mapping[str, Any]
+    num_simulations: int
+
+
+def train_official_style_nsf_baseline(
+    task: Any,
+    bank: SimulationBank,
+    *,
+    checkpoint: str | Path,
+    model_config: Mapping[str, Any],
+    training_config: Mapping[str, Any],
+    device: torch.device,
+    seed: int,
+    load_if_available: bool = True,
+) -> NPEBaselineModel:
+    """Train a small, correctly mixed conditional NSF on the complete bank."""
+
+    if bank.task_name != str(task.name):
+        raise ValueError("The simulation bank belongs to a different task.")
+    transform = infer_parameter_transform(task)
+    q_phi = train_lu_mixed_spline_flow(
+        transform.forward(bank.theta),
+        context=bank.x,
+        checkpoint=checkpoint,
+        model_config=model_config,
+        training_config=training_config,
+        device=device,
+        seed=int(seed),
+        load_if_available=load_if_available,
+    )
+    return NPEBaselineModel(
+        task=task,
+        transform=transform,
+        q_phi=q_phi,
         num_simulations=bank.num_simulations,
     )
 
@@ -740,6 +1106,7 @@ def draw_hybrid_posterior(
     models: HybridBenchmarkModel | Sequence[HybridBenchmarkModel],
     observation: np.ndarray,
     *,
+    baseline_model: NPEBaselineModel | None = None,
     n_proposal: int = 200_000,
     n_samples: int = 10_000,
     seed: int,
@@ -759,6 +1126,10 @@ def draw_hybrid_posterior(
         raise ValueError("At least one hybrid model is required.")
     if len({str(model.task.name) for model in models}) != 1:
         raise ValueError("All folds must belong to the same benchmark task.")
+    if baseline_model is not None and str(baseline_model.task.name) != str(
+        models[0].task.name
+    ):
+        raise ValueError("The baseline and hybrid folds must use the same task.")
     observation = _as_float32_2d(np.atleast_2d(observation), "observation")
     if len(observation) != 1:
         raise ValueError("Exactly one observation is required.")
@@ -839,6 +1210,16 @@ def draw_hybrid_posterior(
             rng.choice(len(npe_candidates), int(n_samples), replace=False)
         ]
     }
+    if baseline_model is not None:
+        seed_everything(int(seed) + 900_000)
+        z_baseline = sample_spline_flow(
+            baseline_model.q_phi,
+            int(n_samples),
+            context=observation,
+        )
+        samples["all-data NSF baseline"] = baseline_model.transform.inverse(
+            z_baseline
+        )
     combined_weights = {}
     for method, chunks in log_weight_chunks.items():
         # Every fold is an independently normalized importance estimate of the
@@ -911,6 +1292,7 @@ def evaluate_posterior_samples(
 def evaluate_observation_suite(
     models: HybridBenchmarkModel | Sequence[HybridBenchmarkModel],
     *,
+    baseline_model: NPEBaselineModel | None = None,
     observations: Iterable[int] = range(1, 11),
     n_proposal: int = 200_000,
     n_samples: int = 10_000,
@@ -937,6 +1319,7 @@ def evaluate_observation_suite(
         draws = draw_hybrid_posterior(
             model_list,
             observation.detach().cpu().numpy(),
+            baseline_model=baseline_model,
             n_proposal=n_proposal,
             n_samples=n_samples,
             seed=int(seed) + 10_000 * int(num_observation),
@@ -956,6 +1339,313 @@ def evaluate_observation_suite(
         if keep_draws:
             draws_by_observation[int(num_observation)] = draws
     return pd.concat(result_frames, ignore_index=True), draws_by_observation
+
+
+def crossfit_coverage_table(
+    bank: SimulationBank,
+    *,
+    n_folds: int,
+    split_seed: int,
+) -> pd.DataFrame:
+    """Verify that every row has exactly the intended K-fold role counts."""
+
+    ratio_counts = np.zeros(bank.num_simulations, dtype=np.int16)
+    flow_counts = np.zeros(bank.num_simulations, dtype=np.int16)
+    rows = []
+    for fold in range(int(n_folds)):
+        split = split_simulation_bank(
+            bank,
+            seed=int(split_seed),
+            fold=fold,
+            n_folds=int(n_folds),
+        )
+        ratio_counts[split["ratio_indices"]] += 1
+        flow_counts[split["flow_indices"]] += 1
+        rows.append(
+            {
+                "fold": fold,
+                "flow_rows": len(split["flow_indices"]),
+                "ratio_rows": len(split["ratio_indices"]),
+                "overlap_rows": int(
+                    np.intersect1d(
+                        split["flow_indices"], split["ratio_indices"]
+                    ).size
+                ),
+            }
+        )
+    if not np.all(ratio_counts == 1):
+        raise RuntimeError("Cross-fitting did not use every row exactly once for ratios.")
+    if not np.all(flow_counts == int(n_folds) - 1):
+        raise RuntimeError(
+            "Cross-fitting did not use every row K-1 times for flow training."
+        )
+    table = pd.DataFrame(rows)
+    table["ratio_coverage_min"] = int(ratio_counts.min())
+    table["ratio_coverage_max"] = int(ratio_counts.max())
+    table["flow_coverage_min"] = int(flow_counts.min())
+    table["flow_coverage_max"] = int(flow_counts.max())
+    return table
+
+
+def training_diagnostics(
+    models: HybridBenchmarkModel | Sequence[HybridBenchmarkModel],
+    bank: SimulationBank,
+    *,
+    max_rows_per_fold: int = 10_000,
+    seed: int = 1,
+) -> pd.DataFrame:
+    """Evaluate pre-benchmark flow and normalization diagnostics.
+
+    Only simulation-bank pairs and neural validation histories are used.  No
+    reference posterior sample or C2ST result enters these diagnostics.
+    """
+
+    if isinstance(models, HybridBenchmarkModel):
+        models = [models]
+    rows = []
+    for model_index, model in enumerate(models):
+        split = split_simulation_bank(
+            bank,
+            seed=model.split_seed,
+            fold=model.fold,
+            n_folds=model.n_folds,
+        )
+        rng = np.random.default_rng(int(seed) + 1000 * model_index)
+        n_check = min(int(max_rows_per_fold), len(split["ratio_indices"]))
+        chosen = rng.choice(len(split["ratio_indices"]), n_check, replace=False)
+        theta = split["theta_ratio"][chosen]
+        x = split["x_ratio"][chosen]
+        z = model.transform.forward(theta)
+        q_phi_nll = -float(
+            np.mean(spline_flow_log_prob(model.q_phi, z, context=x))
+        )
+        z_negative = _sample_defensive_latent_matched(
+            model.q_phi,
+            model.task,
+            model.transform,
+            x,
+            epsilon=model.defensive_epsilon,
+            seed=int(seed) + 10_000 + model_index,
+        )
+        log_r_p = ratio_classifier_ensemble_logit(
+            model.r_p_ensemble,
+            np.column_stack([z_negative, x]),
+        )
+        row = {
+            "fold": model.fold,
+            "flow_rows": len(split["flow_indices"]),
+            "ratio_rows": len(split["ratio_indices"]),
+            "q_phi_heldout_nll": q_phi_nll,
+            "rP_validation_bce": float(
+                np.mean([_validation_score(pack) for pack in model.r_p_ensemble])
+            ),
+            "E_q_rP": float(np.exp(logsumexp(log_r_p) - np.log(n_check))),
+        }
+        if model.has_hnde:
+            row["q_eta_heldout_nll"] = -float(
+                np.mean(spline_flow_log_prob(model.q_eta, x))
+            )
+            seed_everything(int(seed) + 20_000 + model_index)
+            x_reference = sample_spline_flow(model.q_eta, n_check)
+            log_r_l = ratio_classifier_ensemble_logit(
+                model.r_l_ensemble,
+                np.column_stack([z, x_reference]),
+            )
+            row["rL_validation_bce"] = float(
+                np.mean([_validation_score(pack) for pack in model.r_l_ensemble])
+            )
+            row["E_qeta_rL"] = float(
+                np.exp(logsumexp(log_r_l) - np.log(n_check))
+            )
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def simulation_based_calibration_diagnostics(
+    models: HybridBenchmarkModel | Sequence[HybridBenchmarkModel],
+    bank: SimulationBank,
+    *,
+    n_cases_per_fold: int = 32,
+    n_proposal: int = 512,
+    seed: int = 1,
+) -> pd.DataFrame:
+    """Compute lightweight cross-fit SBC ranks for every hybrid route."""
+
+    if isinstance(models, HybridBenchmarkModel):
+        models = [models]
+    models = list(models)
+    rank_chunks: dict[str, list[np.ndarray]] = {
+        "NPE reference": [],
+        "hNPE": [],
+    }
+    if all(model.has_hnde for model in models):
+        rank_chunks.update({"hNDE": [], "dual hNPE--hNDE": []})
+
+    for model_index, model in enumerate(models):
+        split = split_simulation_bank(
+            bank,
+            seed=model.split_seed,
+            fold=model.fold,
+            n_folds=model.n_folds,
+        )
+        rng = np.random.default_rng(int(seed) + 1000 * model_index)
+        n_cases = min(int(n_cases_per_fold), len(split["ratio_indices"]))
+        chosen = rng.choice(len(split["ratio_indices"]), n_cases, replace=False)
+        z_true = model.transform.forward(split["theta_ratio"][chosen])
+        x_cases = split["x_ratio"][chosen]
+        seed_everything(int(seed) + 2000 * model_index)
+        z_npe = sample_spline_flow(
+            model.q_phi,
+            int(n_proposal),
+            context=x_cases,
+        )
+        if z_npe.ndim == 2:
+            z_npe = z_npe[None, :, :]
+        z_prior = _sample_prior_latent(
+            model.task,
+            model.transform,
+            n_cases * int(n_proposal),
+            seed=int(seed) + 2000 * model_index + 1,
+        ).reshape(n_cases, int(n_proposal), -1)
+        use_prior = (
+            rng.random((n_cases, int(n_proposal))) < model.defensive_epsilon
+        )
+        z_proposal = np.where(use_prior[:, :, None], z_prior, z_npe)
+        z_flat = z_proposal.reshape(-1, z_proposal.shape[-1])
+        x_flat = np.repeat(x_cases, int(n_proposal), axis=0)
+        inputs = np.column_stack([z_flat, x_flat])
+        log_r_p = ratio_classifier_ensemble_logit(
+            model.r_p_ensemble,
+            inputs,
+        ).reshape(n_cases, int(n_proposal))
+        weights_p = np.exp(log_r_p - logsumexp(log_r_p, axis=1, keepdims=True))
+        rank_chunks["NPE reference"].append(
+            np.mean(z_npe <= z_true[:, None, :], axis=1)
+        )
+        rank_chunks["hNPE"].append(
+            np.sum(
+                weights_p[:, :, None]
+                * (z_proposal <= z_true[:, None, :]),
+                axis=1,
+            )
+        )
+
+        if "hNDE" in rank_chunks:
+            log_q_phi = spline_flow_log_prob(
+                model.q_phi,
+                z_flat,
+                context=x_flat,
+            ).reshape(n_cases, int(n_proposal))
+            log_prior = _prior_log_prob_latent(
+                model.task,
+                model.transform,
+                z_flat,
+            ).reshape(n_cases, int(n_proposal))
+            log_q_defensive = np.logaddexp(
+                np.log1p(-model.defensive_epsilon) + log_q_phi,
+                np.log(model.defensive_epsilon) + log_prior,
+            )
+            log_r_l = ratio_classifier_ensemble_logit(
+                model.r_l_ensemble,
+                inputs,
+            ).reshape(n_cases, int(n_proposal))
+            log_weights_l = log_prior + log_r_l - log_q_defensive
+            weights_l = np.exp(
+                log_weights_l
+                - logsumexp(log_weights_l, axis=1, keepdims=True)
+            )
+            rank_chunks["hNDE"].append(
+                np.sum(
+                    weights_l[:, :, None]
+                    * (z_proposal <= z_true[:, None, :]),
+                    axis=1,
+                )
+            )
+            log_weights_dual = 0.5 * (
+                log_r_p
+                - logsumexp(log_r_p, axis=1, keepdims=True)
+                + log_weights_l
+                - logsumexp(log_weights_l, axis=1, keepdims=True)
+            )
+            weights_dual = np.exp(
+                log_weights_dual
+                - logsumexp(log_weights_dual, axis=1, keepdims=True)
+            )
+            rank_chunks["dual hNPE--hNDE"].append(
+                np.sum(
+                    weights_dual[:, :, None]
+                    * (z_proposal <= z_true[:, None, :]),
+                    axis=1,
+                )
+            )
+
+    rows = []
+    for method, chunks in rank_chunks.items():
+        ranks = np.concatenate(chunks, axis=0)
+        for dimension in range(ranks.shape[1]):
+            statistic, p_value = kstest(ranks[:, dimension], "uniform")
+            rows.append(
+                {
+                    "algorithm": method,
+                    "dimension": dimension,
+                    "num_ranks": len(ranks),
+                    "rank_mean": float(np.mean(ranks[:, dimension])),
+                    "rank_variance": float(np.var(ranks[:, dimension])),
+                    "KS_uniform": float(statistic),
+                    "KS_pvalue": float(p_value),
+                }
+            )
+    return pd.DataFrame(rows)
+
+
+def posterior_predictive_diagnostics(
+    task: Any,
+    posterior_samples: np.ndarray,
+    observation: np.ndarray,
+    *,
+    n_simulations: int = 2_000,
+    seed: int = 1,
+) -> pd.DataFrame:
+    """Run an optional posterior-predictive check with explicitly extra calls.
+
+    These simulator calls are diagnostic and must not be counted as part of
+    the official 100k training budget or used to tune a reported benchmark
+    after C2ST/reference samples have been examined.
+    """
+
+    posterior_samples = _as_float32_2d(
+        posterior_samples, "posterior_samples"
+    )
+    observation = _as_float32_2d(np.atleast_2d(observation), "observation")
+    if len(observation) != 1:
+        raise ValueError("Exactly one observation is required.")
+    n_simulations = min(int(n_simulations), len(posterior_samples))
+    rng = np.random.default_rng(int(seed))
+    chosen = rng.choice(len(posterior_samples), n_simulations, replace=False)
+    seed_everything(seed)
+    simulator = task.get_simulator(max_calls=n_simulations)
+    x_predictive = simulator(
+        torch.as_tensor(posterior_samples[chosen], dtype=torch.float32)
+    )
+    x_predictive = (
+        task.flatten_data(x_predictive).detach().cpu().numpy().astype(np.float64)
+    )
+    center = x_predictive.mean(axis=0)
+    scale = x_predictive.std(axis=0, ddof=1)
+    scale = np.where(scale > 1.0e-12, scale, 1.0)
+    z_residual = (observation[0] - center) / scale
+    rows = [
+        {
+            "dimension": dimension,
+            "observed": float(observation[0, dimension]),
+            "predictive_mean": float(center[dimension]),
+            "predictive_std": float(scale[dimension]),
+            "z_residual": float(z_residual[dimension]),
+            "extra_simulator_calls": n_simulations,
+        }
+        for dimension in range(len(center))
+    ]
+    return pd.DataFrame(rows)
 
 
 def summarize_our_results(results: pd.DataFrame) -> pd.DataFrame:
