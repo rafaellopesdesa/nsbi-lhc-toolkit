@@ -7,9 +7,10 @@ posterior and likelihood routes without hiding additional simulator calls.
 
 Exercise 10 deliberately keeps its improved training machinery in this module:
 the spline flows use learned LU mixing, the simulation bank is genuinely
-cross-fitted, and the ratio networks use the unchanged raw-ensemble convention
-from :mod:`utils_hnpe`.  Exercises 1--9 therefore retain their original
-algorithms and checkpoint formats.
+cross-fitted, and paired classifier rows receive an honest grouped validation
+split.  The likelihood route uses the conditional-reference utilities in
+:mod:`utils_dual_hnde`; the standard hNDE code used by Exercises 5--8 is not
+imported or modified.
 """
 
 from __future__ import annotations
@@ -29,6 +30,15 @@ from scipy.special import logsumexp
 from scipy.stats import kstest
 from torch.utils.data import DataLoader, TensorDataset
 
+from utils_dual_hnde import (
+    conditional_flow_c2st,
+    conditional_log_normalizer,
+    conditional_normalization_diagnostics,
+    conditional_residual_log_ratio,
+    importance_tail_summary,
+    ratio_member_tail_diagnostics,
+    train_conditional_log_normalizer,
+)
 from utils_hnpe import (
     ArrayStandardizer,
     ratio_classifier_ensemble_logit,
@@ -838,6 +848,7 @@ def _train_ratio_ensemble(
     seed: int,
     load_if_available: bool,
     retrain_outliers: bool,
+    paired_group_ids: np.ndarray | None = None,
 ) -> list[dict[str, Any]]:
     packs = []
     checkpoints = []
@@ -857,6 +868,7 @@ def _train_ratio_ensemble(
                 device=device,
                 seed=int(seed) + 100 * member,
                 load_if_available=load_if_available,
+                paired_group_ids=paired_group_ids,
             )
         )
     if retrain_outliers and len(packs) >= 3:
@@ -880,6 +892,7 @@ def _train_ratio_ensemble(
                     device=device,
                     seed=int(seed) + 10_000 + 100 * int(member),
                     load_if_available=False,
+                    paired_group_ids=paired_group_ids,
                 )
     return packs
 
@@ -894,6 +907,7 @@ class HybridBenchmarkModel:
     r_p_ensemble: list[Mapping[str, Any]]
     q_eta: Mapping[str, Any] | None
     r_l_ensemble: list[Mapping[str, Any]] | None
+    hnde_log_normalizer: Mapping[str, Any] | None
     defensive_epsilon: float
     fold: int
     n_folds: int
@@ -902,7 +916,11 @@ class HybridBenchmarkModel:
 
     @property
     def has_hnde(self) -> bool:
-        return self.q_eta is not None and bool(self.r_l_ensemble)
+        return (
+            self.q_eta is not None
+            and bool(self.r_l_ensemble)
+            and self.hnde_log_normalizer is not None
+        )
 
 
 def train_hybrid_benchmark_model(
@@ -924,8 +942,10 @@ def train_hybrid_benchmark_model(
     train_hnde: bool = True,
     load_if_available: bool = True,
     retrain_outliers: bool = True,
+    normalizer_contexts: int = 2_048,
+    normalizer_reference_per_context: int = 64,
 ) -> HybridBenchmarkModel:
-    """Train an exact-budget hNPE and, optionally, its dual hNDE route."""
+    """Train exact-budget hNPE and conditional-reference hNDE routes."""
 
     if bank.task_name != str(task.name):
         raise ValueError("The simulation bank belongs to a different task.")
@@ -974,15 +994,17 @@ def train_hybrid_benchmark_model(
         seed=int(seed) + 31,
         load_if_available=load_if_available,
         retrain_outliers=retrain_outliers,
+        paired_group_ids=split["ratio_indices"],
     )
 
     q_eta = None
     r_l_ensemble = None
+    hnde_log_normalizer = None
     if train_hnde:
         q_eta = train_lu_mixed_spline_flow(
             split["x_flow"],
-            context=None,
-            checkpoint=model_dir / "q_eta_observation_reference.pt",
+            context=z_flow,
+            checkpoint=model_dir / "q_eta_conditional_likelihood_reference.pt",
             model_config=flow_model_config,
             training_config=flow_training_config,
             device=device,
@@ -990,13 +1012,17 @@ def train_hybrid_benchmark_model(
             load_if_available=load_if_available,
         )
         seed_everything(int(seed) + 51)
-        x_negative = sample_spline_flow(q_eta, len(z_ratio))
+        x_negative = sample_spline_flow(
+            q_eta,
+            1,
+            context=z_ratio,
+        )[:, 0, :]
         r_l_positive = np.column_stack([z_ratio, split["x_ratio"]])
         r_l_negative = np.column_stack([z_ratio, x_negative])
         r_l_ensemble = _train_ratio_ensemble(
             r_l_positive,
             r_l_negative,
-            checkpoint_stem=model_dir / "r_l_likelihood",
+            checkpoint_stem=model_dir / "r_c_conditional_residual",
             ensemble_size=ensemble_size,
             model_config=ratio_model_config,
             training_config=ratio_training_config,
@@ -1004,6 +1030,23 @@ def train_hybrid_benchmark_model(
             seed=int(seed) + 61,
             load_if_available=load_if_available,
             retrain_outliers=retrain_outliers,
+            paired_group_ids=split["ratio_indices"],
+        )
+        normalizer_context = _sample_prior_latent(
+            task,
+            transform,
+            int(normalizer_contexts),
+            seed=int(seed) + 71,
+        )
+        hnde_log_normalizer = train_conditional_log_normalizer(
+            q_eta,
+            r_l_ensemble,
+            normalizer_context,
+            checkpoint=model_dir / "r_c_conditional_log_normalizer.pt",
+            device=device,
+            seed=int(seed) + 72,
+            n_reference=int(normalizer_reference_per_context),
+            load_if_available=load_if_available,
         )
 
     return HybridBenchmarkModel(
@@ -1013,6 +1056,7 @@ def train_hybrid_benchmark_model(
         r_p_ensemble=r_p_ensemble,
         q_eta=q_eta,
         r_l_ensemble=r_l_ensemble,
+        hnde_log_normalizer=hnde_log_normalizer,
         defensive_epsilon=float(defensive_epsilon),
         fold=int(fold),
         n_folds=int(n_folds),
@@ -1177,17 +1221,55 @@ def draw_hybrid_posterior(
             "proposal_rows": int(count),
             "E_q_rP": float(np.exp(logsumexp(log_r_p) - np.log(count))),
         }
+        row.update(
+            {
+                f"fold_{name}_hNPE": value
+                for name, value in importance_tail_summary(log_r_p).items()
+            }
+        )
 
         if "hNDE" in log_weight_chunks:
-            log_r_l = ratio_classifier_ensemble_logit(model.r_l_ensemble, inputs)
-            log_weight_l = log_prior_z + log_r_l - log_q_defensive
+            log_r_l = conditional_residual_log_ratio(
+                model.r_l_ensemble,
+                model.hnde_log_normalizer,
+                z_proposal,
+                x_repeated,
+            )
+            log_q_eta = spline_flow_log_prob(
+                model.q_eta,
+                x_repeated,
+                context=z_proposal,
+            )
+            log_weight_l = (
+                log_prior_z
+                + log_q_eta
+                + log_r_l
+                - log_q_defensive
+            )
             log_weight_chunks["hNDE"].append(log_weight_l)
             # Normalize before combining because the two ratios differ by an
             # observation-dependent constant.
             log_p_normalized = log_r_p - logsumexp(log_r_p)
             log_l_normalized = log_weight_l - logsumexp(log_weight_l)
-            log_weight_chunks["dual hNPE--hNDE"].append(
-                0.5 * (log_p_normalized + log_l_normalized)
+            log_weight_dual = 0.5 * (
+                log_p_normalized + log_l_normalized
+            )
+            log_weight_chunks["dual hNPE--hNDE"].append(log_weight_dual)
+            row.update(
+                {
+                    f"fold_{name}_hNDE": value
+                    for name, value in importance_tail_summary(
+                        log_weight_l
+                    ).items()
+                }
+            )
+            row.update(
+                {
+                    f"fold_{name}_dual": value
+                    for name, value in importance_tail_summary(
+                        log_weight_dual
+                    ).items()
+                }
             )
             row["hNPE_hNDE_log_weight_rms"] = float(
                 np.sqrt(
@@ -1233,10 +1315,9 @@ def draw_hybrid_posterior(
         samples[method] = _resample(proposals, weights, int(n_samples), rng)
     diagnostics = pd.DataFrame(diagnostic_rows)
     for method, weights in combined_weights.items():
-        diagnostics[f"ESS_{method}"] = effective_sample_size(weights)
-        diagnostics[f"ESS_fraction_{method}"] = effective_sample_size(weights) / len(
-            weights
-        )
+        global_ess = effective_sample_size(weights)
+        diagnostics[f"global_ESS_{method}"] = global_ess
+        diagnostics[f"global_ESS_fraction_{method}"] = global_ess / len(weights)
     return PosteriorDraws(
         samples=samples,
         proposals=proposals,
@@ -1331,10 +1412,17 @@ def evaluate_observation_suite(
             seed=int(seed) + int(num_observation),
         )
         metrics["num_simulations"] = model_list[0].num_simulations
-        for method in draws.weights:
-            metrics.loc[
-                metrics["algorithm"] == method, "ESS"
-            ] = effective_sample_size(draws.weights[method])
+        for method, weights in draws.weights.items():
+            tail = importance_tail_summary(
+                np.log(np.maximum(weights, np.finfo(float).tiny))
+            )
+            selection = metrics["algorithm"] == method
+            metrics.loc[selection, "ESS"] = tail["ESS"]
+            metrics.loc[selection, "ESS_fraction"] = tail["ESS_fraction"]
+            metrics.loc[selection, "max_weight_fraction"] = tail[
+                "max_weight_fraction"
+            ]
+            metrics.loc[selection, "pareto_k"] = tail["pareto_k"]
         result_frames.append(metrics)
         if keep_draws:
             draws_by_observation[int(num_observation)] = draws
@@ -1436,6 +1524,18 @@ def training_diagnostics(
             "flow_rows": len(split["flow_indices"]),
             "ratio_rows": len(split["ratio_indices"]),
             "q_phi_heldout_nll": q_phi_nll,
+            "rP_validation_split": ",".join(
+                sorted(
+                    {
+                        str(
+                            pack.get("history", {}).get(
+                                "split_strategy", "unknown"
+                            )
+                        )
+                        for pack in model.r_p_ensemble
+                    }
+                )
+            ),
             "rP_validation_bce": float(
                 np.mean([_validation_score(pack) for pack in model.r_p_ensemble])
             ),
@@ -1443,22 +1543,139 @@ def training_diagnostics(
         }
         if model.has_hnde:
             row["q_eta_heldout_nll"] = -float(
-                np.mean(spline_flow_log_prob(model.q_eta, x))
+                np.mean(
+                    spline_flow_log_prob(
+                        model.q_eta,
+                        x,
+                        context=z,
+                    )
+                )
             )
             seed_everything(int(seed) + 20_000 + model_index)
-            x_reference = sample_spline_flow(model.q_eta, n_check)
-            log_r_l = ratio_classifier_ensemble_logit(
+            x_reference = sample_spline_flow(
+                model.q_eta,
+                1,
+                context=z,
+            )[:, 0, :]
+            c2st = conditional_flow_c2st(
+                z,
+                x,
+                x_reference,
+                seed=int(seed) + 21_000 + model_index,
+            )
+            row.update({f"q_eta_{key}": value for key, value in c2st.items()})
+            raw_log_r_l = ratio_classifier_ensemble_logit(
                 model.r_l_ensemble,
                 np.column_stack([z, x_reference]),
+            )
+            log_r_l = raw_log_r_l - conditional_log_normalizer(
+                model.hnde_log_normalizer,
+                z,
+            )
+            row["rC_validation_split"] = ",".join(
+                sorted(
+                    {
+                        str(
+                            pack.get("history", {}).get(
+                                "split_strategy", "unknown"
+                            )
+                        )
+                        for pack in model.r_l_ensemble
+                    }
+                )
             )
             row["rL_validation_bce"] = float(
                 np.mean([_validation_score(pack) for pack in model.r_l_ensemble])
             )
-            row["E_qeta_rL"] = float(
-                np.exp(logsumexp(log_r_l) - np.log(n_check))
+            row["E_qeta_rC_corrected_mixture"] = float(
+                np.exp(logsumexp(log_r_l) - np.log(len(log_r_l)))
+            )
+            n_normalization_context = min(128, len(z))
+            normalization_indices = rng.choice(
+                len(z),
+                n_normalization_context,
+                replace=False,
+            )
+            normalization = conditional_normalization_diagnostics(
+                model.q_eta,
+                model.r_l_ensemble,
+                model.hnde_log_normalizer,
+                z[normalization_indices],
+                n_reference=64,
+                seed=int(seed) + 22_000 + model_index,
+            )
+            row["raw_Z_mean"] = float(normalization["raw_Z"].mean())
+            row["raw_Z_max_abs_error"] = float(
+                np.max(np.abs(normalization["raw_Z"] - 1.0))
+            )
+            row["corrected_Z_mean"] = float(
+                normalization["corrected_Z"].mean()
+            )
+            row["corrected_Z_max_abs_error"] = float(
+                np.max(np.abs(normalization["corrected_Z"] - 1.0))
             )
         rows.append(row)
     return pd.DataFrame(rows)
+
+
+def benchmark_ratio_tail_diagnostics(
+    models: HybridBenchmarkModel | Sequence[HybridBenchmarkModel],
+    bank: SimulationBank,
+    *,
+    max_rows_per_fold: int = 10_000,
+    seed: int = 1,
+) -> pd.DataFrame:
+    """Report member-wise ratio tails on denominator-distribution draws."""
+
+    if isinstance(models, HybridBenchmarkModel):
+        models = [models]
+    rows = []
+    for model_index, model in enumerate(models):
+        split = split_simulation_bank(
+            bank,
+            seed=model.split_seed,
+            fold=model.fold,
+            n_folds=model.n_folds,
+        )
+        rng = np.random.default_rng(int(seed) + 1000 * model_index)
+        n_check = min(int(max_rows_per_fold), len(split["ratio_indices"]))
+        chosen = rng.choice(len(split["ratio_indices"]), n_check, replace=False)
+        x = split["x_ratio"][chosen]
+        z = model.transform.forward(split["theta_ratio"][chosen])
+        z_negative = _sample_defensive_latent_matched(
+            model.q_phi,
+            model.task,
+            model.transform,
+            x,
+            epsilon=model.defensive_epsilon,
+            seed=int(seed) + 10_000 + model_index,
+        )
+        rows.append(
+            ratio_member_tail_diagnostics(
+                model.r_p_ensemble,
+                np.column_stack([z_negative, x]),
+                path="hNPE posterior residual",
+                fold=model.fold,
+            )
+        )
+        if model.has_hnde:
+            seed_everything(int(seed) + 20_000 + model_index)
+            x_reference = sample_spline_flow(
+                model.q_eta,
+                1,
+                context=z,
+            )[:, 0, :]
+            rows.append(
+                ratio_member_tail_diagnostics(
+                    model.r_l_ensemble,
+                    np.column_stack([z, x_reference]),
+                    path="conditional hNDE residual",
+                    fold=model.fold,
+                )
+            )
+    if not rows:
+        return pd.DataFrame()
+    return pd.concat(rows, ignore_index=True)
 
 
 def simulation_based_calibration_diagnostics(
@@ -1545,11 +1762,20 @@ def simulation_based_calibration_diagnostics(
                 np.log1p(-model.defensive_epsilon) + log_q_phi,
                 np.log(model.defensive_epsilon) + log_prior,
             )
-            log_r_l = ratio_classifier_ensemble_logit(
+            log_r_l = conditional_residual_log_ratio(
                 model.r_l_ensemble,
-                inputs,
+                model.hnde_log_normalizer,
+                z_flat,
+                x_flat,
             ).reshape(n_cases, int(n_proposal))
-            log_weights_l = log_prior + log_r_l - log_q_defensive
+            log_q_eta = spline_flow_log_prob(
+                model.q_eta,
+                x_flat,
+                context=z_flat,
+            ).reshape(n_cases, int(n_proposal))
+            log_weights_l = (
+                log_prior + log_q_eta + log_r_l - log_q_defensive
+            )
             weights_l = np.exp(
                 log_weights_l
                 - logsumexp(log_weights_l, axis=1, keepdims=True)

@@ -553,8 +553,17 @@ def train_ratio_classifier(
     device: torch.device,
     seed: int,
     load_if_available: bool = True,
+    paired_group_ids: np.ndarray | None = None,
 ) -> dict[str, Any]:
-    """Train a balanced neural classifier whose logit estimates log p/q."""
+    """Train a balanced neural classifier whose logit estimates log p/q.
+
+    ``paired_group_ids`` is used by the dual hNPE--hNDE exercises.  Each
+    positive/negative row pair is generated from one simulator index and must
+    remain on the same side of the train/validation boundary.  Splitting the
+    concatenated class rows independently leaks the shared parameter or
+    observation into validation and can make a memorizing network appear to
+    generalize.
+    """
     checkpoint = _flow_checkpoint(checkpoint)
     if load_if_available and checkpoint.exists():
         print(f"Loading ratio classifier from {checkpoint}")
@@ -563,27 +572,72 @@ def train_ratio_classifier(
     negative = _as_2d_float32(negative, "negative")
     if positive.shape[1] != negative.shape[1]:
         raise ValueError("positive and negative must have the same columns.")
-    n_per_class = min(len(positive), len(negative))
+    if paired_group_ids is not None:
+        paired_group_ids = np.asarray(paired_group_ids)
+        if len(positive) != len(negative):
+            raise ValueError(
+                "paired_group_ids requires one negative row per positive row."
+            )
+        if paired_group_ids.ndim != 1 or len(paired_group_ids) != len(positive):
+            raise ValueError(
+                "paired_group_ids must contain one one-dimensional id per "
+                "positive/negative row pair."
+            )
+        n_per_class = len(positive)
+    else:
+        n_per_class = min(len(positive), len(negative))
     if n_per_class < 4:
         raise ValueError("At least four rows per class are required.")
     rng = np.random.default_rng(seed)
-    positive = positive[rng.choice(len(positive), n_per_class, replace=False)]
-    negative = negative[rng.choice(len(negative), n_per_class, replace=False)]
+    if paired_group_ids is None:
+        positive = positive[rng.choice(len(positive), n_per_class, replace=False)]
+        negative = negative[rng.choice(len(negative), n_per_class, replace=False)]
     values = np.concatenate([positive, negative], axis=0)
     labels = np.concatenate(
         [np.ones(n_per_class), np.zeros(n_per_class)]
     ).astype(np.float32)
-    scaler = ArrayStandardizer.fit(values)
-    values = scaler.transform(values)
 
-    order = rng.permutation(len(values))
     validation_fraction = float(training_config.get("validation_fraction", 0.2))
-    n_validation = min(
-        len(values) - 1,
-        max(2, int(round(validation_fraction * len(values)))),
-    )
-    validation_indices = order[:n_validation]
-    training_indices = order[n_validation:]
+    if not 0.0 < validation_fraction < 1.0:
+        raise ValueError("validation_fraction must be between zero and one.")
+    split_strategy = "independent_rows"
+    n_training_groups = None
+    n_validation_groups = None
+    if paired_group_ids is None:
+        order = rng.permutation(len(values))
+        n_validation = min(
+            len(values) - 1,
+            max(2, int(round(validation_fraction * len(values)))),
+        )
+        validation_indices = order[:n_validation]
+        training_indices = order[n_validation:]
+    else:
+        unique_groups = np.unique(paired_group_ids)
+        if len(unique_groups) < 2:
+            raise ValueError("At least two distinct paired groups are required.")
+        group_order = unique_groups[rng.permutation(len(unique_groups))]
+        n_validation_groups = min(
+            len(group_order) - 1,
+            max(1, int(round(validation_fraction * len(group_order)))),
+        )
+        validation_groups = group_order[:n_validation_groups]
+        training_groups = group_order[n_validation_groups:]
+        row_groups = np.concatenate([paired_group_ids, paired_group_ids])
+        validation_mask = np.isin(row_groups, validation_groups)
+        training_mask = np.isin(row_groups, training_groups)
+        if np.any(validation_mask & training_mask):
+            raise RuntimeError("Paired group split unexpectedly overlaps.")
+        if not np.all(validation_mask | training_mask):
+            raise RuntimeError("Paired group split lost classifier rows.")
+        validation_indices = np.flatnonzero(validation_mask)
+        training_indices = np.flatnonzero(training_mask)
+        split_strategy = "paired_groups"
+        n_training_groups = int(len(training_groups))
+        n_validation_groups = int(len(validation_groups))
+    # Fit preprocessing on training rows only.  This is a much smaller effect
+    # than paired-row leakage, but keeps the validation boundary fully honest.
+    scaler = ArrayStandardizer.fit(values[training_indices])
+    values = scaler.transform(values)
     values_tensor = torch.tensor(values, dtype=torch.float32)
     labels_tensor = torch.tensor(labels, dtype=torch.float32)
     training_dataset = TensorDataset(
@@ -640,8 +694,18 @@ def train_ratio_classifier(
     best_validation = math.inf
     best_state = None
     stale_epochs = 0
-    history = {"train": [], "validation": [], "learning_rate": []}
-    print(f"Training balanced ratio classifier on {n_per_class:,} rows per class")
+    history = {
+        "train": [],
+        "validation": [],
+        "learning_rate": [],
+        "split_strategy": split_strategy,
+        "n_training_groups": n_training_groups,
+        "n_validation_groups": n_validation_groups,
+    }
+    print(
+        f"Training balanced ratio classifier on {n_per_class:,} rows per class "
+        f"with {split_strategy} validation"
+    )
 
     for epoch in range(1, n_epochs + 1):
         model.train()
