@@ -67,13 +67,17 @@ browser.
   scale nuisance, reports the residual nuisance displacement from zero, and
   exports every completed figure to self-contained scripts in
   `exercise8_figures_scripts/`.
-- The Exercise 8 FNF variant loads only the Exercise 5 PRESEL checkpoint. It
-  trains separate selected-process nominal flows and invertible residual
-  deformations on the scale-up/down anchors, with all checkpoints isolated in
-  Exercise-8-FNF-specific directories. It validates the deformation against
-  the analytic selected density at trained and unseen nuisance values, checks
-  normalization without rescaling, and tests two-dimensional Asimov closure.
-  Its figures are exported to `exercise8_fnf_figures_scripts/`.
+- The Exercise 8 FNF variant reuses the Exercise 5 PRESEL, reference-flow, and
+  four-member signal/reference and background/reference checkpoints. It
+  reconstructs the saved ONNX ratio MLPs as exact frozen PyTorch layers so the
+  systematic residual can be differentiated with respect to its transformed
+  coordinates; no nominal flow or density ratio is retrained. Only the
+  invertible scale-deformation residuals are trained, in an
+  Exercise-8-FNF-specific directory. The notebook validates them against the
+  analytic selected density at trained and unseen nuisance values, checks
+  normalization without an alpha-dependent rescaling, and tests
+  two-dimensional Asimov closure. Its figures are exported to
+  `exercise8_fnf_figures_scripts/`.
 - Exercise 9 is self-contained and uses a small nonlinear Bayesian simulator
   with an explicit nuisance parameter. It trains a conditional spline NPE, a
   four-member posterior-residual ratio ensemble, and the dual spline hNDE

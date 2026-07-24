@@ -5,16 +5,23 @@ implements the input-systematic construction of
 
     Valsecchi, Donegà and Wallny, arXiv:2602.13184,
 
-adapted to the five-dimensional ML4HEP toy.  A frozen nominal normalizing flow
-``p_0(x)`` is composed with an invertible, nuisance-dependent residual map
-``T_alpha``:
+adapted to the five-dimensional ML4HEP toy.  The frozen nominal density is the
+Exercise 5 hNDE,
+
+    p_0(x) = p_ref(x) r_0(x) / Z_0,
+
+with the same reference flow and four-member process/reference ratio ensemble
+used by the nominal Exercise 8.  It is composed with an invertible,
+nuisance-dependent residual map ``T_alpha``:
 
     p(x | alpha) = p_0(T_alpha(x)) |det dT_alpha / dx|.
 
-The residual is exactly the identity at ``alpha = 0``.  Its autoregressive
-scale and shift are linear plus quadratic polynomials in ``alpha``.  The
-change-of-variables formula makes every nuisance value a normalized density;
-no alpha-dependent partition-function correction is used anywhere here.
+The one fixed nominal constant ``Z_0`` is inherited from the hNDE
+normalization.  The residual is exactly the identity at ``alpha = 0``.  Its
+autoregressive scale and shift are linear plus quadratic polynomials in
+``alpha``.  The change-of-variables formula then makes every nuisance value a
+normalized density; no alpha-dependent partition-function correction is used
+anywhere here.
 """
 
 from __future__ import annotations
@@ -28,6 +35,7 @@ import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.data import DataLoader, TensorDataset
 
 
@@ -317,24 +325,460 @@ class FactorizableResidualStack(nn.Module):
         return value, log_det
 
 
-class FactorizableSystematicFlow(nn.Module):
-    """Frozen nominal flow plus a trainable FNF systematic residual."""
+class _FrozenRatioMLP(nn.Module):
+    """Differentiable reconstruction of one saved Exercise 5 ONNX MLP."""
+
+    def __init__(self, linear_layers: Sequence[nn.Linear]) -> None:
+        super().__init__()
+        if len(linear_layers) < 2:
+            raise ValueError("A ratio MLP must contain at least two linear layers.")
+        self.linear_layers = nn.ModuleList(linear_layers)
+        for parameter in self.parameters():
+            parameter.requires_grad = False
+
+    def forward(self, values: torch.Tensor) -> torch.Tensor:
+        hidden = values
+        for layer in self.linear_layers[:-1]:
+            hidden = F.silu(layer(hidden))
+        return torch.sigmoid(self.linear_layers[-1](hidden)).reshape(-1)
+
+
+def _onnx_attribute(node: Any, name: str, default: Any) -> Any:
+    """Read one ONNX node attribute without importing ONNX at module import."""
+    from onnx.helper import get_attribute_value
+
+    for attribute in node.attribute:
+        if attribute.name == name:
+            return get_attribute_value(attribute)
+    return default
+
+
+def _torch_ratio_mlp_from_onnx(model_proto: Any) -> _FrozenRatioMLP:
+    """Reconstruct the workshop's SiLU MLP directly from its ONNX weights.
+
+    Exercise 5 exports ``DensityRatioLightning`` with one ONNX ``Gemm`` node
+    per linear layer.  Reconstructing those frozen layers in PyTorch preserves
+    gradients with respect to the input coordinates, which are required when
+    the FNF residual is trained.  No ratio network is retrained or distilled.
+    """
+    from onnx import numpy_helper
+
+    initializers = {
+        initializer.name: numpy_helper.to_array(initializer)
+        for initializer in model_proto.graph.initializer
+    }
+    linear_layers: list[nn.Linear] = []
+    gemm_nodes = [
+        node for node in model_proto.graph.node if node.op_type == "Gemm"
+    ]
+    for node in gemm_nodes:
+        if len(node.input) < 3:
+            raise ValueError("An Exercise 5 Gemm node is missing its bias.")
+        if node.input[1] not in initializers or node.input[2] not in initializers:
+            raise ValueError("An Exercise 5 Gemm parameter is not an initializer.")
+        if int(_onnx_attribute(node, "transA", 0)) != 0:
+            raise ValueError("Unsupported transposed data input in ratio ONNX graph.")
+
+        stored_weight = np.asarray(
+            initializers[node.input[1]], dtype=np.float32
+        )
+        stored_bias = np.asarray(
+            initializers[node.input[2]], dtype=np.float32
+        ).reshape(-1)
+        transposed_weight = int(_onnx_attribute(node, "transB", 0))
+        alpha = float(_onnx_attribute(node, "alpha", 1.0))
+        beta = float(_onnx_attribute(node, "beta", 1.0))
+        effective_weight = (
+            stored_weight if transposed_weight else stored_weight.T
+        )
+        effective_weight = alpha * effective_weight
+        effective_bias = beta * stored_bias
+
+        if effective_weight.ndim != 2:
+            raise ValueError("A ratio ONNX weight is not two-dimensional.")
+        if effective_weight.shape[0] != len(effective_bias):
+            raise ValueError("A ratio ONNX weight and bias are incompatible.")
+        layer = nn.Linear(
+            int(effective_weight.shape[1]),
+            int(effective_weight.shape[0]),
+        )
+        with torch.no_grad():
+            layer.weight.copy_(torch.from_numpy(effective_weight.copy()))
+            layer.bias.copy_(torch.from_numpy(effective_bias.copy()))
+        linear_layers.append(layer)
+
+    # Newer torch exporters may express Linear as MatMul followed by Add.
+    if not linear_layers:
+        consumers: dict[str, list[Any]] = {}
+        for candidate in model_proto.graph.node:
+            for input_name in candidate.input:
+                consumers.setdefault(input_name, []).append(candidate)
+        for node in model_proto.graph.node:
+            if node.op_type != "MatMul" or len(node.input) != 2:
+                continue
+            weight_name = next(
+                (name for name in node.input if name in initializers),
+                None,
+            )
+            if weight_name is None:
+                continue
+            add_candidates = [
+                candidate
+                for candidate in consumers.get(node.output[0], [])
+                if candidate.op_type == "Add"
+            ]
+            if len(add_candidates) != 1:
+                raise ValueError(
+                    "Could not identify the bias Add for a ratio MatMul node."
+                )
+            add_node = add_candidates[0]
+            bias_name = next(
+                (
+                    name
+                    for name in add_node.input
+                    if name in initializers and name != weight_name
+                ),
+                None,
+            )
+            if bias_name is None:
+                raise ValueError("A ratio MatMul layer is missing its bias.")
+            stored_weight = np.asarray(
+                initializers[weight_name], dtype=np.float32
+            )
+            effective_weight = stored_weight.T
+            effective_bias = np.asarray(
+                initializers[bias_name], dtype=np.float32
+            ).reshape(-1)
+            if effective_weight.shape[0] != len(effective_bias):
+                raise ValueError("A ratio MatMul weight and bias are incompatible.")
+            layer = nn.Linear(
+                int(effective_weight.shape[1]),
+                int(effective_weight.shape[0]),
+            )
+            with torch.no_grad():
+                layer.weight.copy_(torch.from_numpy(effective_weight.copy()))
+                layer.bias.copy_(torch.from_numpy(effective_bias.copy()))
+            linear_layers.append(layer)
+
+    if not linear_layers:
+        raise ValueError(
+            "No Gemm or MatMul-plus-Add layers were found in the ratio ONNX graph."
+        )
+    if not any(node.op_type == "Sigmoid" for node in model_proto.graph.node):
+        raise ValueError("The saved Exercise 5 ratio graph has no sigmoid output.")
+    return _FrozenRatioMLP(linear_layers)
+
+
+class _DifferentiableAffineScaler(nn.Module):
+    """Torch equivalent of the fitted Exercise 5 feature scaler."""
+
+    def __init__(self, scaler: Any, features: Sequence[str]) -> None:
+        super().__init__()
+        expected_features = list(features)
+        fitted = scaler
+        if hasattr(scaler, "named_transformers_"):
+            if "scaler" not in scaler.named_transformers_:
+                raise ValueError("The ratio ColumnTransformer has no 'scaler' step.")
+            fitted = scaler.named_transformers_["scaler"]
+            scaled_columns = None
+            for name, _, columns in scaler.transformers_:
+                if name == "scaler":
+                    scaled_columns = list(columns)
+                    break
+            if scaled_columns != expected_features:
+                raise ValueError(
+                    "The saved ratio scaler feature order differs from the "
+                    "Exercise 5 feature order."
+                )
+
+        if hasattr(fitted, "min_") and hasattr(fitted, "scale_"):
+            multiplier = np.asarray(fitted.scale_, dtype=np.float32)
+            offset = np.asarray(fitted.min_, dtype=np.float32)
+        elif hasattr(fitted, "mean_") and hasattr(fitted, "scale_"):
+            standard_deviation = np.asarray(fitted.scale_, dtype=np.float32)
+            multiplier = 1.0 / standard_deviation
+            offset = -np.asarray(fitted.mean_, dtype=np.float32) / standard_deviation
+        else:
+            raise TypeError(
+                "Only the affine MinMax/Standard scalers used by Exercise 5 "
+                "can be reconstructed differentiably."
+            )
+        if multiplier.shape != (len(expected_features),):
+            raise ValueError("The ratio scaler dimension does not match FEATURES.")
+        self.register_buffer("multiplier", torch.from_numpy(multiplier.copy()))
+        self.register_buffer("offset", torch.from_numpy(offset.copy()))
+
+    def forward(self, values: torch.Tensor) -> torch.Tensor:
+        return values * self.multiplier + self.offset
+
+
+class _FrozenRatioMember(nn.Module):
+    """One frozen scaler-plus-classifier member in density-ratio space."""
 
     def __init__(
         self,
-        base_flow_pack: Mapping[str, Any],
+        scaler: Any,
+        model_proto: Any,
+        features: Sequence[str],
+        *,
+        score_epsilon: float = 1.0e-9,
+        ratio_floor: float = 1.0e-12,
+    ) -> None:
+        super().__init__()
+        self.scaler = _DifferentiableAffineScaler(scaler, features)
+        self.network = _torch_ratio_mlp_from_onnx(model_proto)
+        self.score_epsilon = float(score_epsilon)
+        self.ratio_floor = float(ratio_floor)
+
+    def log_ratio(self, values: torch.Tensor) -> torch.Tensor:
+        score = self.network(self.scaler(values))
+        score = torch.clamp(score, 0.0, 1.0 - self.score_epsilon)
+        ratio = torch.clamp(
+            score / torch.clamp(1.0 - score, min=self.score_epsilon),
+            min=self.ratio_floor,
+        )
+        return torch.log(ratio)
+
+
+class HybridNominalDensity(nn.Module):
+    """Frozen Exercise 5 hNDE nominal density for one selected process."""
+
+    def __init__(
+        self,
+        reference_flow_pack: Mapping[str, Any],
+        ratio_packs: Sequence[Mapping[str, Any]],
+        *,
+        ratio_normalization: float,
+        features: Sequence[str],
+        reference_sample: np.ndarray | None = None,
+        reference_sample_ratio: np.ndarray | None = None,
+    ) -> None:
+        super().__init__()
+        self.features = list(features)
+        if self.features != list(reference_flow_pack["features"]):
+            raise ValueError("The hNDE and reference-flow feature orders differ.")
+        if not ratio_packs:
+            raise ValueError("At least one Exercise 5 ratio member is required.")
+        if not np.isfinite(ratio_normalization) or ratio_normalization <= 0.0:
+            raise ValueError("ratio_normalization must be finite and positive.")
+
+        self.reference_flow = reference_flow_pack["flow"]
+        for parameter in self.reference_flow.parameters():
+            parameter.requires_grad = False
+        self.reference_flow.eval()
+
+        reference_scaler = reference_flow_pack["scaler"]
+        self.register_buffer(
+            "reference_mean",
+            torch.as_tensor(reference_scaler.mean, dtype=torch.float32),
+        )
+        self.register_buffer(
+            "reference_std",
+            torch.as_tensor(reference_scaler.std, dtype=torch.float32),
+        )
+        self.register_buffer(
+            "reference_log_det",
+            torch.tensor(
+                reference_scaler.log_det_x_to_z_standardization,
+                dtype=torch.float32,
+            ),
+        )
+        self.register_buffer(
+            "log_ratio_normalization",
+            torch.tensor(math.log(float(ratio_normalization)), dtype=torch.float32),
+        )
+        self.ratio_members = nn.ModuleList(
+            [
+                _FrozenRatioMember(
+                    pack["scaler"],
+                    pack["model_proto"],
+                    self.features,
+                )
+                for pack in ratio_packs
+            ]
+        )
+        for parameter in self.parameters():
+            parameter.requires_grad = False
+
+        self._sampling_values_cpu: torch.Tensor | None = None
+        self._sampling_probabilities_cpu: torch.Tensor | None = None
+        if reference_sample is not None or reference_sample_ratio is not None:
+            if reference_sample is None or reference_sample_ratio is None:
+                raise ValueError(
+                    "reference_sample and reference_sample_ratio must be supplied "
+                    "together."
+                )
+            values = np.asarray(reference_sample, dtype=np.float32)
+            ratios = np.asarray(reference_sample_ratio, dtype=np.float64).reshape(-1)
+            if values.ndim != 2 or values.shape[1] != len(self.features):
+                raise ValueError("reference_sample has the wrong shape.")
+            if len(values) != len(ratios):
+                raise ValueError("reference sample values and ratios are misaligned.")
+            if not np.isfinite(ratios).all() or np.any(ratios < 0.0):
+                raise ValueError("reference_sample_ratio must be finite and nonnegative.")
+            ratio_sum = float(ratios.sum())
+            if ratio_sum <= 0.0:
+                raise ValueError("reference_sample_ratio has zero total weight.")
+            self._sampling_values_cpu = torch.from_numpy(values.copy())
+            self._sampling_probabilities_cpu = torch.from_numpy(
+                (ratios / ratio_sum).copy()
+            )
+
+    @property
+    def device(self) -> torch.device:
+        return self.reference_mean.device
+
+    def log_ratio_tensor(self, values: torch.Tensor) -> torch.Tensor:
+        member_log_ratios = torch.stack(
+            [member.log_ratio(values) for member in self.ratio_members],
+            dim=0,
+        )
+        return torch.logsumexp(member_log_ratios, dim=0) - math.log(
+            len(self.ratio_members)
+        )
+
+    def log_prob_tensor(self, values: torch.Tensor) -> torch.Tensor:
+        standardized = (values - self.reference_mean) / self.reference_std
+        reference_log_probability = (
+            self.reference_flow.log_prob(standardized)
+            + self.reference_log_det
+        )
+        return (
+            reference_log_probability
+            + self.log_ratio_tensor(values)
+            - self.log_ratio_normalization
+        )
+
+    @torch.no_grad()
+    def sample_tensor(self, n: int) -> torch.Tensor:
+        """Importance-resample the persisted Exercise 5 reference support."""
+        if (
+            self._sampling_values_cpu is None
+            or self._sampling_probabilities_cpu is None
+        ):
+            raise RuntimeError(
+                "This hNDE pack has no reference support for importance resampling."
+            )
+        indices = torch.multinomial(
+            self._sampling_probabilities_cpu,
+            int(n),
+            replacement=True,
+        )
+        return self._sampling_values_cpu[indices].to(self.device)
+
+
+def build_hybrid_nominal_density(
+    process_name: str,
+    *,
+    reference_flow_pack: Mapping[str, Any],
+    ratio_packs: Sequence[Mapping[str, Any]],
+    ratio_normalization: float,
+    features: Sequence[str],
+    reference_sample: np.ndarray,
+    reference_sample_ratio: np.ndarray,
+    device: torch.device,
+) -> dict[str, Any]:
+    """Build the frozen Exercise 5 hNDE used as the FNF nominal density."""
+    density = HybridNominalDensity(
+        reference_flow_pack,
+        ratio_packs,
+        ratio_normalization=ratio_normalization,
+        features=features,
+        reference_sample=reference_sample,
+        reference_sample_ratio=reference_sample_ratio,
+    ).to(device)
+    density.eval()
+    return {
+        "density": density,
+        "features": list(features),
+        "coordinate_scaler": reference_flow_pack["scaler"],
+        "identifier": (
+            f"exercise5_hnde_{process_name}_"
+            f"{len(ratio_packs)}members"
+        ),
+        "reference_flow_path": reference_flow_pack.get("path", ""),
+    }
+
+
+@torch.no_grad()
+def hybrid_nominal_log_prob_x(
+    density_pack: Mapping[str, Any],
+    x: pd.DataFrame | np.ndarray,
+    *,
+    batch_size: int = 65_536,
+) -> np.ndarray:
+    """Evaluate a frozen Exercise 5 hNDE in original feature coordinates."""
+    density: HybridNominalDensity = density_pack["density"]
+    features = list(density_pack["features"])
+    if isinstance(x, pd.DataFrame):
+        values = x[features].to_numpy(dtype=np.float32)
+    else:
+        values = np.asarray(x, dtype=np.float32)
+    density.eval()
+    chunks = []
+    for start in range(0, len(values), int(batch_size)):
+        stop = min(start + int(batch_size), len(values))
+        values_tensor = torch.as_tensor(
+            values[start:stop],
+            dtype=torch.float32,
+            device=density.device,
+        )
+        chunks.append(
+            density.log_prob_tensor(values_tensor).detach().cpu().numpy()
+        )
+    return np.concatenate(chunks) if chunks else np.empty(0, dtype=np.float32)
+
+
+@torch.no_grad()
+def hybrid_nominal_ratio_x(
+    density_pack: Mapping[str, Any],
+    x: pd.DataFrame | np.ndarray,
+    *,
+    batch_size: int = 65_536,
+) -> np.ndarray:
+    """Evaluate the differentiable copy of the Exercise 5 ratio ensemble."""
+    density: HybridNominalDensity = density_pack["density"]
+    features = list(density_pack["features"])
+    if isinstance(x, pd.DataFrame):
+        values = x[features].to_numpy(dtype=np.float32)
+    else:
+        values = np.asarray(x, dtype=np.float32)
+    density.eval()
+    chunks = []
+    for start in range(0, len(values), int(batch_size)):
+        stop = min(start + int(batch_size), len(values))
+        values_tensor = torch.as_tensor(
+            values[start:stop],
+            dtype=torch.float32,
+            device=density.device,
+        )
+        chunks.append(
+            torch.exp(density.log_ratio_tensor(values_tensor))
+            .detach()
+            .cpu()
+            .numpy()
+        )
+    return np.concatenate(chunks) if chunks else np.empty(0, dtype=np.float32)
+
+
+class FactorizableSystematicFlow(nn.Module):
+    """Frozen nominal hNDE plus a trainable FNF systematic residual."""
+
+    def __init__(
+        self,
+        base_density_pack: Mapping[str, Any],
         *,
         residual_config: Mapping[str, Any],
     ) -> None:
         super().__init__()
-        self.base_flow = base_flow_pack["flow"]
-        for parameter in self.base_flow.parameters():
+        self.base_density: HybridNominalDensity = base_density_pack["density"]
+        for parameter in self.base_density.parameters():
             parameter.requires_grad = False
-        self.base_flow.eval()
+        self.base_density.eval()
 
-        features = list(base_flow_pack["features"])
+        features = list(base_density_pack["features"])
         self.features = features
-        scaler = base_flow_pack["scaler"]
+        scaler = base_density_pack["coordinate_scaler"]
         self.register_buffer(
             "scaler_mean",
             torch.as_tensor(scaler.mean, dtype=torch.float32),
@@ -343,14 +787,6 @@ class FactorizableSystematicFlow(nn.Module):
             "scaler_std",
             torch.as_tensor(scaler.std, dtype=torch.float32),
         )
-        self.register_buffer(
-            "standardization_log_det",
-            torch.tensor(
-                scaler.log_det_x_to_z_standardization,
-                dtype=torch.float32,
-            ),
-        )
-
         config = dict(residual_config)
         self.residual_config = config
         self.residual = FactorizableResidualStack(
@@ -383,10 +819,10 @@ class FactorizableSystematicFlow(nn.Module):
         nominal_frame, residual_log_det = self.residual(
             standardized, alpha
         )
+        nominal_values = self._destandardize(nominal_frame)
         return (
-            self.base_flow.log_prob(nominal_frame)
+            self.base_density.log_prob_tensor(nominal_values)
             + residual_log_det
-            + self.standardization_log_det
         )
 
     @torch.no_grad()
@@ -396,7 +832,8 @@ class FactorizableSystematicFlow(nn.Module):
         alpha: float | np.ndarray | torch.Tensor,
     ) -> torch.Tensor:
         """Draw from ``p(x | alpha)`` in original feature coordinates."""
-        nominal_frame = self.base_flow.sample(int(n))
+        nominal_values = self.base_density.sample_tensor(int(n))
+        nominal_frame = self._standardize(nominal_values)
         observed_frame, _ = self.residual.inverse(nominal_frame, alpha)
         return self._destandardize(observed_frame)
 
@@ -415,12 +852,12 @@ def _torch_load(path: Path, device: torch.device) -> dict[str, Any]:
 def load_factorizable_systematic_flow(
     process_name: str,
     *,
-    base_flow_pack: Mapping[str, Any],
+    base_density_pack: Mapping[str, Any],
     model_dir: str | Path,
     device: torch.device,
     expected_features: Sequence[str] | None = None,
 ) -> dict[str, Any]:
-    """Load one residual checkpoint on top of its supplied nominal flow."""
+    """Load one residual checkpoint on top of its supplied nominal hNDE."""
     path = fnf_checkpoint_path(process_name, model_dir)
     checkpoint = _torch_load(path, device)
     features = list(checkpoint["features"])
@@ -429,16 +866,26 @@ def load_factorizable_systematic_flow(
             f"Checkpoint features {features} do not match "
             f"{list(expected_features)}."
         )
-    if features != list(base_flow_pack["features"]):
-        raise ValueError("The FNF and nominal-flow feature orders differ.")
+    if features != list(base_density_pack["features"]):
+        raise ValueError("The FNF and nominal-hNDE feature orders differ.")
+    checkpoint_identifier = checkpoint.get("base_density_identifier")
+    supplied_identifier = base_density_pack.get("identifier")
+    if (
+        checkpoint_identifier is not None
+        and supplied_identifier is not None
+        and checkpoint_identifier != supplied_identifier
+    ):
+        raise ValueError(
+            "The FNF checkpoint was trained with a different nominal density."
+        )
 
     model = FactorizableSystematicFlow(
-        base_flow_pack,
+        base_density_pack,
         residual_config=checkpoint["residual_config"],
     ).to(device)
     model.residual.load_state_dict(checkpoint["residual_state_dict"])
     model.eval()
-    model.base_flow.eval()
+    model.base_density.eval()
     return {
         "model": model,
         "features": features,
@@ -641,7 +1088,7 @@ def _make_weighted_loader(
 def train_factorizable_systematic_flow(
     process_name: str,
     *,
-    base_flow_pack: Mapping[str, Any],
+    base_density_pack: Mapping[str, Any],
     varied_samples: Mapping[float, pd.DataFrame],
     validation_samples: Mapping[float, pd.DataFrame] | None = None,
     features: Sequence[str],
@@ -658,7 +1105,7 @@ def train_factorizable_systematic_flow(
         print(f"Loading existing {process_name} FNF from {path}")
         return load_factorizable_systematic_flow(
             process_name,
-            base_flow_pack=base_flow_pack,
+            base_density_pack=base_density_pack,
             model_dir=model_dir,
             device=device,
             expected_features=features,
@@ -699,10 +1146,10 @@ def train_factorizable_systematic_flow(
     )
 
     model = FactorizableSystematicFlow(
-        base_flow_pack,
+        base_density_pack,
         residual_config=residual_config,
     ).to(device)
-    model.base_flow.eval()
+    model.base_density.eval()
     trainable = [
         parameter for parameter in model.parameters() if parameter.requires_grad
     ]
@@ -734,7 +1181,7 @@ def train_factorizable_systematic_flow(
     )
     for epoch in range(1, n_epochs + 1):
         model.train()
-        model.base_flow.eval()
+        model.base_density.eval()
         train_numerator = 0.0
         train_denominator = 0.0
         for x_batch, alpha_batch, weight_batch in train_loader:
@@ -755,7 +1202,7 @@ def train_factorizable_systematic_flow(
             train_denominator += float(weight_batch.sum().detach().cpu())
 
         model.eval()
-        model.base_flow.eval()
+        model.base_density.eval()
         validation_numerator = 0.0
         validation_denominator = 0.0
         with torch.no_grad():
@@ -800,7 +1247,7 @@ def train_factorizable_systematic_flow(
     if best_state is not None:
         model.residual.load_state_dict(best_state)
     model.eval()
-    model.base_flow.eval()
+    model.base_density.eval()
     path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(
         {
@@ -809,7 +1256,12 @@ def train_factorizable_systematic_flow(
             "residual_config": residual_config,
             "training_config": training_config,
             "history": history,
-            "base_flow_path": str(base_flow_pack.get("path", "")),
+            "base_density_identifier": str(
+                base_density_pack.get("identifier", "")
+            ),
+            "reference_flow_path": str(
+                base_density_pack.get("reference_flow_path", "")
+            ),
         },
         path,
     )
@@ -1091,8 +1543,8 @@ class FNFExtendedLikelihood:
 
         self.signal_model.eval()
         self.background_model.eval()
-        self.signal_model.base_flow.eval()
-        self.background_model.base_flow.eval()
+        self.signal_model.base_density.eval()
+        self.background_model.base_density.eval()
 
     @staticmethod
     def _yield_tensor(
@@ -1166,13 +1618,64 @@ class FNFExtendedLikelihood:
     def model_grad(
         self, parameters: Sequence[float] | np.ndarray
     ) -> np.ndarray:
-        """Automatic-differentiation gradient for Minuit and score checks."""
+        """Memory-bounded automatic-differentiation gradient for Minuit.
+
+        The Exercise 5 hNDE contains four large ratio members per process.
+        Accumulating every event batch into one autograd graph would retain all
+        intermediate activations.  Differentiate the rate/constraint term once
+        and each event batch separately instead.
+        """
         values = torch.tensor(
             np.asarray(parameters, dtype=np.float64),
             dtype=torch.float64,
             device=self.device,
             requires_grad=True,
         )
-        objective = self._nll_tensor(values)
-        gradient = torch.autograd.grad(objective, values)[0]
+        mu, alpha = values[0], values[1]
+        signal_yield = self._yield_tensor(alpha, self.signal_yields)
+        background_yield = self._yield_tensor(alpha, self.background_yields)
+        rate_and_constraint = 2.0 * (
+            mu * signal_yield + background_yield
+        ) + (alpha / self.alpha_constraint_sigma).square()
+        gradient = torch.autograd.grad(rate_and_constraint, values)[0]
+
+        for start in range(0, len(self.events), self.batch_size):
+            stop = min(start + self.batch_size, len(self.events))
+            event_batch = self.events[start:stop]
+            weight_batch = self.weights[start:stop]
+
+            # Recompute the small coefficient graph for each batch so no
+            # retained graph is needed across the loop.
+            batch_mu, batch_alpha = values[0], values[1]
+            batch_signal_yield = self._yield_tensor(
+                batch_alpha, self.signal_yields
+            )
+            batch_background_yield = self._yield_tensor(
+                batch_alpha, self.background_yields
+            )
+            signal_coefficient = torch.clamp(
+                batch_mu * batch_signal_yield,
+                min=torch.finfo(values.dtype).tiny,
+            )
+            background_coefficient = torch.clamp(
+                batch_background_yield,
+                min=torch.finfo(values.dtype).tiny,
+            )
+            signal_log_density = self.signal_model.log_prob_tensor(
+                event_batch, batch_alpha
+            ).to(torch.float64)
+            background_log_density = self.background_model.log_prob_tensor(
+                event_batch, batch_alpha
+            ).to(torch.float64)
+            log_intensity = torch.logaddexp(
+                torch.log(signal_coefficient) + signal_log_density,
+                torch.log(background_coefficient) + background_log_density,
+            )
+            event_objective = -2.0 * torch.sum(
+                weight_batch * log_intensity
+            )
+            gradient = gradient + torch.autograd.grad(
+                event_objective, values
+            )[0]
+
         return gradient.detach().cpu().numpy().astype(np.float64)
