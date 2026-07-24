@@ -30,6 +30,7 @@ browser.
 | Exercise 6 — Neural importance-sampled Asimov data | [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/iris-hep/nsbi-lhc-toolkit/blob/ml4hep_school_tutorial/workshops/ml4hep_tifr_colab/Exercise_6_NeuralImportanceSampling_Asimov.ipynb) |
 | Exercise 7 — Asimov closure and misspecification | [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/iris-hep/nsbi-lhc-toolkit/blob/ml4hep_school_tutorial/workshops/ml4hep_tifr_colab/Exercise_7_Asimov_Misspecification_Coverage.ipynb) |
 | Exercise 8 — Semi-parametric systematics | [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/rafaellopesdesa/nsbi-lhc-toolkit/blob/ml4hep_school_tutorial/workshops/ml4hep_tifr_colab/Exercise_8_SemiParametric_Systematics.ipynb) |
+| Exercise 8 (FNF) — Normalization-preserving systematics | [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/rafaellopesdesa/nsbi-lhc-toolkit/blob/ml4hep_school_tutorial/workshops/ml4hep_tifr_colab/Exercise_8_SemiParametric_Systematics_FNF.ipynb) |
 | Exercise 9 — Dual hNPE--hNDE | [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/rafaellopesdesa/nsbi-lhc-toolkit/blob/ml4hep_school_tutorial/workshops/ml4hep_tifr_colab/Exercise_9_Hybrid_NPE_NDE.ipynb) |
 | Exercise 10 — `sbibm` hybrid benchmark | [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/rafaellopesdesa/nsbi-lhc-toolkit/blob/ml4hep_school_tutorial/workshops/ml4hep_tifr_colab/Exercise_10_SBIBM_Hybrid_Benchmark.ipynb) |
 
@@ -66,6 +67,13 @@ browser.
   scale nuisance, reports the residual nuisance displacement from zero, and
   exports every completed figure to self-contained scripts in
   `exercise8_figures_scripts/`.
+- The Exercise 8 FNF variant loads only the Exercise 5 PRESEL checkpoint. It
+  trains separate selected-process nominal flows and invertible residual
+  deformations on the scale-up/down anchors, with all checkpoints isolated in
+  Exercise-8-FNF-specific directories. It validates the deformation against
+  the analytic selected density at trained and unseen nuisance values, checks
+  normalization without rescaling, and tests two-dimensional Asimov closure.
+  Its figures are exported to `exercise8_fnf_figures_scripts/`.
 - Exercise 9 is self-contained and uses a small nonlinear Bayesian simulator
   with an explicit nuisance parameter. It trains a conditional spline NPE, a
   four-member posterior-residual ratio ensemble, and the dual spline hNDE
