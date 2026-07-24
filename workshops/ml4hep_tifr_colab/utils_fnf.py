@@ -548,10 +548,7 @@ class HybridNominalDensity(nn.Module):
         reference_flow_pack: Mapping[str, Any],
         ratio_packs: Sequence[Mapping[str, Any]],
         *,
-        ratio_normalization: float,
         features: Sequence[str],
-        reference_sample: np.ndarray | None = None,
-        reference_sample_ratio: np.ndarray | None = None,
     ) -> None:
         super().__init__()
         self.features = list(features)
@@ -559,8 +556,6 @@ class HybridNominalDensity(nn.Module):
             raise ValueError("The hNDE and reference-flow feature orders differ.")
         if not ratio_packs:
             raise ValueError("At least one Exercise 5 ratio member is required.")
-        if not np.isfinite(ratio_normalization) or ratio_normalization <= 0.0:
-            raise ValueError("ratio_normalization must be finite and positive.")
 
         self.reference_flow = reference_flow_pack["flow"]
         for parameter in self.reference_flow.parameters():
@@ -585,7 +580,7 @@ class HybridNominalDensity(nn.Module):
         )
         self.register_buffer(
             "log_ratio_normalization",
-            torch.tensor(math.log(float(ratio_normalization)), dtype=torch.float32),
+            torch.tensor(0.0, dtype=torch.float32),
         )
         self.ratio_members = nn.ModuleList(
             [
@@ -602,31 +597,20 @@ class HybridNominalDensity(nn.Module):
 
         self._sampling_values_cpu: torch.Tensor | None = None
         self._sampling_probabilities_cpu: torch.Tensor | None = None
-        if reference_sample is not None or reference_sample_ratio is not None:
-            if reference_sample is None or reference_sample_ratio is None:
-                raise ValueError(
-                    "reference_sample and reference_sample_ratio must be supplied "
-                    "together."
-                )
-            values = np.asarray(reference_sample, dtype=np.float32)
-            ratios = np.asarray(reference_sample_ratio, dtype=np.float64).reshape(-1)
-            if values.ndim != 2 or values.shape[1] != len(self.features):
-                raise ValueError("reference_sample has the wrong shape.")
-            if len(values) != len(ratios):
-                raise ValueError("reference sample values and ratios are misaligned.")
-            if not np.isfinite(ratios).all() or np.any(ratios < 0.0):
-                raise ValueError("reference_sample_ratio must be finite and nonnegative.")
-            ratio_sum = float(ratios.sum())
-            if ratio_sum <= 0.0:
-                raise ValueError("reference_sample_ratio has zero total weight.")
-            self._sampling_values_cpu = torch.from_numpy(values.copy())
-            self._sampling_probabilities_cpu = torch.from_numpy(
-                (ratios / ratio_sum).copy()
-            )
 
     @property
     def device(self) -> torch.device:
         return self.reference_mean.device
+
+    def member_scores_tensor(self, values: torch.Tensor) -> torch.Tensor:
+        """Return the native classifier score from every frozen member."""
+        return torch.stack(
+            [
+                member.network(member.scaler(values))
+                for member in self.ratio_members
+            ],
+            dim=0,
+        )
 
     def log_ratio_tensor(self, values: torch.Tensor) -> torch.Tensor:
         member_log_ratios = torch.stack(
@@ -636,6 +620,44 @@ class HybridNominalDensity(nn.Module):
         return torch.logsumexp(member_log_ratios, dim=0) - math.log(
             len(self.ratio_members)
         )
+
+    def configure_reference_support(
+        self,
+        reference_sample: np.ndarray,
+        raw_ratio: np.ndarray,
+    ) -> tuple[float, np.ndarray]:
+        """Normalize and retain one self-consistent reference support.
+
+        ``raw_ratio`` must be evaluated with this differentiable ensemble.
+        Using the same numerical implementation for the normalization,
+        importance-resampling weights, and density evaluation avoids an
+        otherwise unnecessary ONNX/PyTorch backend mismatch in saturated
+        classifier tails.
+        """
+        values = np.asarray(reference_sample, dtype=np.float32)
+        ratios = np.asarray(raw_ratio, dtype=np.float64).reshape(-1)
+        if values.ndim != 2 or values.shape[1] != len(self.features):
+            raise ValueError("reference_sample has the wrong shape.")
+        if len(values) != len(ratios):
+            raise ValueError("reference sample values and ratios are misaligned.")
+        if not np.isfinite(ratios).all() or np.any(ratios < 0.0):
+            raise ValueError("raw_ratio must be finite and nonnegative.")
+
+        normalization = float(ratios.mean())
+        if not np.isfinite(normalization) or normalization <= 0.0:
+            raise ValueError("The ratio normalization must be finite and positive.")
+        normalized_ratio = ratios / normalization
+        ratio_sum = float(normalized_ratio.sum())
+        if ratio_sum <= 0.0:
+            raise ValueError("reference_sample_ratio has zero total weight.")
+
+        with torch.no_grad():
+            self.log_ratio_normalization.fill_(math.log(normalization))
+        self._sampling_values_cpu = torch.from_numpy(values.copy())
+        self._sampling_probabilities_cpu = torch.from_numpy(
+            (normalized_ratio / ratio_sum).copy()
+        )
+        return normalization, normalized_ratio
 
     def log_prob_tensor(self, values: torch.Tensor) -> torch.Tensor:
         standardized = (values - self.reference_mean) / self.reference_std
@@ -672,23 +694,19 @@ def build_hybrid_nominal_density(
     *,
     reference_flow_pack: Mapping[str, Any],
     ratio_packs: Sequence[Mapping[str, Any]],
-    ratio_normalization: float,
     features: Sequence[str],
     reference_sample: np.ndarray,
-    reference_sample_ratio: np.ndarray,
     device: torch.device,
+    batch_size: int = 65_536,
 ) -> dict[str, Any]:
-    """Build the frozen Exercise 5 hNDE used as the FNF nominal density."""
+    """Build and self-normalize the frozen Exercise 5 hNDE for FNF."""
     density = HybridNominalDensity(
         reference_flow_pack,
         ratio_packs,
-        ratio_normalization=ratio_normalization,
         features=features,
-        reference_sample=reference_sample,
-        reference_sample_ratio=reference_sample_ratio,
     ).to(device)
     density.eval()
-    return {
+    density_pack = {
         "density": density,
         "features": list(features),
         "coordinate_scaler": reference_flow_pack["scaler"],
@@ -698,6 +716,18 @@ def build_hybrid_nominal_density(
         ),
         "reference_flow_path": reference_flow_pack.get("path", ""),
     }
+    raw_ratio = hybrid_nominal_ratio_x(
+        density_pack,
+        reference_sample,
+        batch_size=batch_size,
+    ).astype(np.float64)
+    normalization, normalized_ratio = density.configure_reference_support(
+        reference_sample,
+        raw_ratio,
+    )
+    density_pack["ratio_normalization"] = normalization
+    density_pack["reference_sample_ratio"] = normalized_ratio
+    return density_pack
 
 
 @torch.no_grad()
@@ -759,6 +789,40 @@ def hybrid_nominal_ratio_x(
             .numpy()
         )
     return np.concatenate(chunks) if chunks else np.empty(0, dtype=np.float32)
+
+
+@torch.no_grad()
+def hybrid_nominal_member_scores_x(
+    density_pack: Mapping[str, Any],
+    x: pd.DataFrame | np.ndarray,
+    *,
+    batch_size: int = 65_536,
+) -> np.ndarray:
+    """Evaluate every reconstructed member in native classifier-score space."""
+    density: HybridNominalDensity = density_pack["density"]
+    features = list(density_pack["features"])
+    if isinstance(x, pd.DataFrame):
+        values = x[features].to_numpy(dtype=np.float32)
+    else:
+        values = np.asarray(x, dtype=np.float32)
+    density.eval()
+    chunks = []
+    for start in range(0, len(values), int(batch_size)):
+        stop = min(start + int(batch_size), len(values))
+        values_tensor = torch.as_tensor(
+            values[start:stop],
+            dtype=torch.float32,
+            device=density.device,
+        )
+        chunks.append(
+            density.member_scores_tensor(values_tensor)
+            .detach()
+            .cpu()
+            .numpy()
+        )
+    if not chunks:
+        return np.empty((len(density.ratio_members), 0), dtype=np.float32)
+    return np.concatenate(chunks, axis=1)
 
 
 class FactorizableSystematicFlow(nn.Module):
