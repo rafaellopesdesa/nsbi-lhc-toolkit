@@ -168,7 +168,7 @@ class PolynomialAutoregressiveResidual(nn.Module):
         coefficients = self.coefficient_networks[dimension](x_previous)
         alpha_linear = alpha[:, 0]
         alpha_quadratic = (
-            self.quadratic_damping * alpha_linear.square()
+            self.quadratic_damping * alpha_linear**2.0
         )
 
         raw_log_scale = (
@@ -1423,7 +1423,7 @@ def analytic_reconstructed_mixture_density(
     if multiplier <= 0.0:
         raise ValueError("The detector-response multiplier must be positive.")
     response = np.diag(multiplier * response_scale)
-    resolution_covariance = np.diag(resolution.square())
+    resolution_covariance = np.diag(resolution**2.0)
 
     fractions = np.asarray(
         [component[0] for component in components], dtype=np.float64
@@ -1548,7 +1548,7 @@ def log_quadratic_yield(
     linear = 0.5 * (log_up - log_down)
     quadratic = 0.5 * (log_up + log_down)
     return nominal * np.exp(
-        linear * alpha_array + quadratic * alpha_array.square()
+        linear * alpha_array + quadratic * alpha_array**2.0
     )
 
 
@@ -1630,7 +1630,7 @@ class FNFExtendedLikelihood:
         )
         linear = 0.5 * (log_up - log_down)
         quadratic = 0.5 * (log_up + log_down)
-        return nominal * torch.exp(linear * alpha + quadratic * alpha.square())
+        return nominal * torch.exp(linear * alpha + quadratic * alpha**2.0)
 
     def _nll_tensor(self, parameters: torch.Tensor) -> torch.Tensor:
         if parameters.shape != (2,):
@@ -1666,7 +1666,7 @@ class FNFExtendedLikelihood:
             )
             event_term = event_term + torch.sum(weight_batch * log_intensity)
 
-        constraint = (alpha / self.alpha_constraint_sigma).square()
+        constraint = (alpha / self.alpha_constraint_sigma) ** 2.0
         return 2.0 * (expected_yield.to(torch.float64) - event_term) + constraint
 
     def model(self, parameters: Sequence[float] | np.ndarray) -> float:
@@ -1700,7 +1700,7 @@ class FNFExtendedLikelihood:
         background_yield = self._yield_tensor(alpha, self.background_yields)
         rate_and_constraint = 2.0 * (
             mu * signal_yield + background_yield
-        ) + (alpha / self.alpha_constraint_sigma).square()
+        ) + (alpha / self.alpha_constraint_sigma) ** 2.0
         gradient = torch.autograd.grad(rate_and_constraint, values)[0]
 
         for start in range(0, len(self.events), self.batch_size):
