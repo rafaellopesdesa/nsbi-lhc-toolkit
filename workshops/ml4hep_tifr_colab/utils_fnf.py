@@ -1558,7 +1558,17 @@ class FNFExtendedLikelihood:
     The shape terms are normalized by their invertible flow definitions.  The
     independently measured selected yields are interpolated through
     :func:`log_quadratic_yield`.  No HistFactory point-wise shape interpolation
-    and no nuisance-dependent partition correction enter this likelihood.
+    enters this likelihood.
+
+    The numerical Asimov integral is evaluated on a finite sample from the
+    reference density.  Therefore the mixture shape ratio is self-normalized
+    on that integration support,
+
+    ``R(x; mu, alpha) / mean_ref[R(x; mu, alpha)]``.
+
+    This is the finite-sample implementation of the exact identity
+    ``E_ref[R] = 1``.  It is one global expectation for each parameter point,
+    not a fitted process-density correction or a pointwise normalization.
     """
 
     def __init__(
@@ -1568,6 +1578,8 @@ class FNFExtendedLikelihood:
         background_fnf: Mapping[str, Any],
         events: np.ndarray,
         weights: np.ndarray,
+        signal_reference_ratio: np.ndarray,
+        background_reference_ratio: np.ndarray,
         signal_yields: Mapping[str, float],
         background_yields: Mapping[str, float],
         alpha_constraint_sigma: float = 1.0,
@@ -1591,6 +1603,32 @@ class FNFExtendedLikelihood:
         self.weights = torch.as_tensor(
             event_weights, dtype=torch.float64, device=self.device
         )
+        self.total_weight = torch.sum(self.weights)
+
+        signal_ratio = np.asarray(
+            signal_reference_ratio, dtype=np.float64
+        ).reshape(-1)
+        background_ratio = np.asarray(
+            background_reference_ratio, dtype=np.float64
+        ).reshape(-1)
+        for name, ratio in [
+            ("signal_reference_ratio", signal_ratio),
+            ("background_reference_ratio", background_ratio),
+        ]:
+            if len(ratio) != len(values):
+                raise ValueError(f"{name} is misaligned with events.")
+            if not np.isfinite(ratio).all() or np.any(ratio <= 0.0):
+                raise ValueError(f"{name} must be finite and strictly positive.")
+        self.signal_reference_log_ratio = torch.as_tensor(
+            np.log(signal_ratio),
+            dtype=torch.float64,
+            device=self.device,
+        )
+        self.background_reference_log_ratio = torch.as_tensor(
+            np.log(background_ratio),
+            dtype=torch.float64,
+            device=self.device,
+        )
         self.signal_yields = {
             key: float(signal_yields[key]) for key in ["down", "nominal", "up"]
         }
@@ -1609,6 +1647,26 @@ class FNFExtendedLikelihood:
         self.background_model.eval()
         self.signal_model.base_density.eval()
         self.background_model.base_density.eval()
+        with torch.no_grad():
+            signal_nominal = []
+            background_nominal = []
+            for start in range(0, len(self.events), self.batch_size):
+                stop = min(start + self.batch_size, len(self.events))
+                event_batch = self.events[start:stop]
+                signal_nominal.append(
+                    self.signal_model.log_prob_tensor(event_batch, 0.0)
+                    .detach()
+                    .to(torch.float64)
+                )
+                background_nominal.append(
+                    self.background_model.log_prob_tensor(event_batch, 0.0)
+                    .detach()
+                    .to(torch.float64)
+                )
+            self.signal_nominal_log_density = torch.cat(signal_nominal)
+            self.background_nominal_log_density = torch.cat(
+                background_nominal
+            )
 
     @staticmethod
     def _yield_tensor(
@@ -1632,6 +1690,81 @@ class FNFExtendedLikelihood:
         quadratic = 0.5 * (log_up + log_down)
         return nominal * torch.exp(linear * alpha + quadratic * alpha**2.0)
 
+    def _batch_log_intensity_ratio(
+        self,
+        start: int,
+        stop: int,
+        *,
+        mu: torch.Tensor,
+        alpha: torch.Tensor,
+        signal_yield: torch.Tensor,
+        background_yield: torch.Tensor,
+    ) -> torch.Tensor:
+        """Return ``log(lambda(x; mu, alpha) / p_ref(x))`` on one batch."""
+        event_batch = self.events[start:stop]
+        signal_log_density = self.signal_model.log_prob_tensor(
+            event_batch, alpha
+        ).to(torch.float64)
+        background_log_density = self.background_model.log_prob_tensor(
+            event_batch, alpha
+        ).to(torch.float64)
+        signal_log_ratio = (
+            self.signal_reference_log_ratio[start:stop]
+            + signal_log_density
+            - self.signal_nominal_log_density[start:stop]
+        )
+        background_log_ratio = (
+            self.background_reference_log_ratio[start:stop]
+            + background_log_density
+            - self.background_nominal_log_density[start:stop]
+        )
+
+        signal_coefficient = torch.clamp(
+            mu * signal_yield, min=torch.finfo(mu.dtype).tiny
+        )
+        background_coefficient = torch.clamp(
+            background_yield, min=torch.finfo(mu.dtype).tiny
+        )
+        return torch.logaddexp(
+            torch.log(signal_coefficient) + signal_log_ratio,
+            torch.log(background_coefficient) + background_log_ratio,
+        )
+
+    @torch.no_grad()
+    def _log_mixture_ratio_normalization(
+        self, parameters: torch.Tensor
+    ) -> torch.Tensor:
+        """Estimate ``log E_ref[R(x; mu, alpha)]`` on this support."""
+        mu, alpha = parameters[0], parameters[1]
+        signal_yield = self._yield_tensor(alpha, self.signal_yields)
+        background_yield = self._yield_tensor(alpha, self.background_yields)
+        expected_yield = mu * signal_yield + background_yield
+        log_expected_yield = torch.log(
+            torch.clamp(
+                expected_yield,
+                min=torch.finfo(parameters.dtype).tiny,
+            )
+        )
+        log_ratio_sum = torch.tensor(
+            -torch.inf, dtype=torch.float64, device=self.device
+        )
+        for start in range(0, len(self.events), self.batch_size):
+            stop = min(start + self.batch_size, len(self.events))
+            log_intensity_ratio = self._batch_log_intensity_ratio(
+                start,
+                stop,
+                mu=mu,
+                alpha=alpha,
+                signal_yield=signal_yield,
+                background_yield=background_yield,
+            )
+            batch_log_sum = torch.logsumexp(
+                log_intensity_ratio - log_expected_yield,
+                dim=0,
+            )
+            log_ratio_sum = torch.logaddexp(log_ratio_sum, batch_log_sum)
+        return log_ratio_sum - math.log(len(self.events))
+
     def _nll_tensor(self, parameters: torch.Tensor) -> torch.Tensor:
         if parameters.shape != (2,):
             raise ValueError("Expected parameters [mu, alpha].")
@@ -1639,35 +1772,49 @@ class FNFExtendedLikelihood:
         signal_yield = self._yield_tensor(alpha, self.signal_yields)
         background_yield = self._yield_tensor(alpha, self.background_yields)
         expected_yield = mu * signal_yield + background_yield
-
-        # The logarithm is evaluated only inside the physical Minuit bound.
-        # A tiny floor keeps diagnostic calls at mu=0 finite; it has no
-        # numerical effect near the Asimov point mu=1.
-        signal_coefficient = torch.clamp(
-            mu * signal_yield, min=torch.finfo(parameters.dtype).tiny
-        )
-        background_coefficient = torch.clamp(
-            background_yield, min=torch.finfo(parameters.dtype).tiny
+        log_expected_yield = torch.log(
+            torch.clamp(
+                expected_yield,
+                min=torch.finfo(parameters.dtype).tiny,
+            )
         )
         event_term = torch.zeros((), dtype=torch.float64, device=self.device)
+        log_ratio_sum = torch.tensor(
+            -torch.inf, dtype=torch.float64, device=self.device
+        )
         for start in range(0, len(self.events), self.batch_size):
             stop = min(start + self.batch_size, len(self.events))
-            event_batch = self.events[start:stop]
             weight_batch = self.weights[start:stop]
-            signal_log_density = self.signal_model.log_prob_tensor(
-                event_batch, alpha
-            ).to(torch.float64)
-            background_log_density = self.background_model.log_prob_tensor(
-                event_batch, alpha
-            ).to(torch.float64)
-            log_intensity = torch.logaddexp(
-                torch.log(signal_coefficient) + signal_log_density,
-                torch.log(background_coefficient) + background_log_density,
+            log_intensity_ratio = self._batch_log_intensity_ratio(
+                start,
+                stop,
+                mu=mu,
+                alpha=alpha,
+                signal_yield=signal_yield,
+                background_yield=background_yield,
             )
-            event_term = event_term + torch.sum(weight_batch * log_intensity)
+            event_term = event_term + torch.sum(
+                weight_batch * log_intensity_ratio
+            )
+            batch_log_sum = torch.logsumexp(
+                log_intensity_ratio - log_expected_yield,
+                dim=0,
+            )
+            log_ratio_sum = torch.logaddexp(log_ratio_sum, batch_log_sum)
 
+        log_mixture_normalization = (
+            log_ratio_sum - math.log(len(self.events))
+        )
         constraint = (alpha / self.alpha_constraint_sigma) ** 2.0
-        return 2.0 * (expected_yield.to(torch.float64) - event_term) + constraint
+        return (
+            2.0
+            * (
+                expected_yield.to(torch.float64)
+                - event_term
+                + self.total_weight * log_mixture_normalization
+            )
+            + constraint
+        )
 
     def model(self, parameters: Sequence[float] | np.ndarray) -> float:
         """Minuit-compatible array-call objective."""
@@ -1678,6 +1825,21 @@ class FNFExtendedLikelihood:
         )
         with torch.no_grad():
             return float(self._nll_tensor(values).detach().cpu())
+
+    def mixture_ratio_normalization(
+        self, parameters: Sequence[float] | np.ndarray
+    ) -> float:
+        """Return the finite-support estimate of ``E_ref[R]``."""
+        values = torch.as_tensor(
+            np.asarray(parameters, dtype=np.float64),
+            dtype=torch.float64,
+            device=self.device,
+        )
+        return float(
+            torch.exp(self._log_mixture_ratio_normalization(values))
+            .detach()
+            .cpu()
+        )
 
     def model_grad(
         self, parameters: Sequence[float] | np.ndarray
@@ -1702,14 +1864,18 @@ class FNFExtendedLikelihood:
             mu * signal_yield + background_yield
         ) + (alpha / self.alpha_constraint_sigma) ** 2.0
         gradient = torch.autograd.grad(rate_and_constraint, values)[0]
+        with torch.no_grad():
+            log_mixture_normalization = (
+                self._log_mixture_ratio_normalization(values)
+            )
+            log_ratio_sum = (
+                log_mixture_normalization + math.log(len(self.events))
+            )
 
         for start in range(0, len(self.events), self.batch_size):
             stop = min(start + self.batch_size, len(self.events))
-            event_batch = self.events[start:stop]
             weight_batch = self.weights[start:stop]
 
-            # Recompute the small coefficient graph for each batch so no
-            # retained graph is needed across the loop.
             batch_mu, batch_alpha = values[0], values[1]
             batch_signal_yield = self._yield_tensor(
                 batch_alpha, self.signal_yields
@@ -1717,29 +1883,44 @@ class FNFExtendedLikelihood:
             batch_background_yield = self._yield_tensor(
                 batch_alpha, self.background_yields
             )
-            signal_coefficient = torch.clamp(
-                batch_mu * batch_signal_yield,
-                min=torch.finfo(values.dtype).tiny,
+            batch_expected_yield = (
+                batch_mu * batch_signal_yield + batch_background_yield
             )
-            background_coefficient = torch.clamp(
-                batch_background_yield,
-                min=torch.finfo(values.dtype).tiny,
+            batch_log_expected_yield = torch.log(
+                torch.clamp(
+                    batch_expected_yield,
+                    min=torch.finfo(values.dtype).tiny,
+                )
             )
-            signal_log_density = self.signal_model.log_prob_tensor(
-                event_batch, batch_alpha
-            ).to(torch.float64)
-            background_log_density = self.background_model.log_prob_tensor(
-                event_batch, batch_alpha
-            ).to(torch.float64)
-            log_intensity = torch.logaddexp(
-                torch.log(signal_coefficient) + signal_log_density,
-                torch.log(background_coefficient) + background_log_density,
+            log_intensity_ratio = self._batch_log_intensity_ratio(
+                start,
+                stop,
+                mu=batch_mu,
+                alpha=batch_alpha,
+                signal_yield=batch_signal_yield,
+                background_yield=batch_background_yield,
             )
             event_objective = -2.0 * torch.sum(
-                weight_batch * log_intensity
+                weight_batch * log_intensity_ratio
+            )
+
+            # Differentiate log(mean R) without retaining all event batches:
+            # the detached coefficients are the global softmax weights of
+            # log R, so this surrogate has exactly the required gradient.
+            log_shape_ratio = (
+                log_intensity_ratio - batch_log_expected_yield
+            )
+            normalization_weight = torch.exp(
+                log_shape_ratio.detach() - log_ratio_sum
+            )
+            normalization_objective = (
+                2.0
+                * self.total_weight
+                * torch.sum(normalization_weight * log_shape_ratio)
             )
             gradient = gradient + torch.autograd.grad(
-                event_objective, values
+                event_objective + normalization_objective,
+                values,
             )[0]
 
         return gradient.detach().cpu().numpy().astype(np.float64)
