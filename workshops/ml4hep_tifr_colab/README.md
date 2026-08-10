@@ -1,11 +1,12 @@
 # ML4HEP-TIFR NSBI tutorial — Google Colab edition
 
 These are the **Colab-ready tutorial notebooks**. Exercises 1--4 mirror the
-original ML4HEP-TIFR sequence, while Exercises 5--10 extend the tutorial with
+original ML4HEP-TIFR sequence, while Exercises 5--11 extend the tutorial with
 hybrid neural ratio estimation, efficient Asimov sampling, model
 misspecification, semi-parametric systematic uncertainties, and dual hybrid
 Bayesian posterior/likelihood estimation, followed by external `sbibm`
-benchmarking. Each notebook includes:
+benchmarking and a simulator-calibrated hybrid Neyman construction. Each
+notebook includes:
 
 1. exactly one **"Open in Colab"** badge, and
 2. a **setup cell** near the beginning that installs the required dependencies,
@@ -33,6 +34,7 @@ browser.
 | Exercise 8 (FNF) — Normalization-preserving systematics | [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/rafaellopesdesa/nsbi-lhc-toolkit/blob/ml4hep_school_tutorial/workshops/ml4hep_tifr_colab/Exercise_8_SemiParametric_Systematics_FNF.ipynb) |
 | Exercise 9 — Dual hNPE--hNDE | [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/rafaellopesdesa/nsbi-lhc-toolkit/blob/ml4hep_school_tutorial/workshops/ml4hep_tifr_colab/Exercise_9_Hybrid_NPE_NDE.ipynb) |
 | Exercise 10 — `sbibm` hybrid benchmark | [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/rafaellopesdesa/nsbi-lhc-toolkit/blob/ml4hep_school_tutorial/workshops/ml4hep_tifr_colab/Exercise_10_SBIBM_Hybrid_Benchmark.ipynb) |
+| Exercise 11 — Hybrid Neyman construction | [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/rafaellopesdesa/nsbi-lhc-toolkit/blob/ml4hep_school_tutorial/workshops/ml4hep_tifr_colab/Exercise_11_Hybrid_Neyman_Construction.ipynb) |
 
 ## Notes for running on Colab
 
@@ -48,11 +50,11 @@ browser.
 - Dataset sizes are configured near the top of each setup cell. Lower them, or
   lower `number_of_epochs` / `N_TRAIN` in the training cells, for a quicker
   pass; raise them for less Monte-Carlo noise in the fit.
-- **Every notebook is self-contained except `Exercise_2_3`**, which *loads* the
-  density-ratio models trained by `Exercise_2_2a` and `Exercise_2_2b`. Because
-  each Colab notebook is a fresh runtime, either run 2.2a and 2.2b in the same
-  runtime first, or set `USE_DRIVE = True` in the setup cell of all three so the
-  trained `models_*/` folders persist to your Google Drive.
+- Most notebooks are self-contained. `Exercise_2_3` *loads* the density-ratio
+  models trained by `Exercise_2_2a` and `Exercise_2_2b`; Exercises 6--8 and 11
+  reuse outputs from Exercise 5 as described below. Because each Colab notebook
+  is a fresh runtime, run prerequisite notebooks first and set
+  `USE_DRIVE = True` so their trained models persist to Google Drive.
 - Exercises 6 and 7 load the expensive PRESEL, reference-flow, and ratio
   checkpoints produced by Exercise 5. Run Exercise 5 first and keep
   `USE_DRIVE = True` in all three notebooks so those checkpoints persist.
@@ -97,3 +99,14 @@ browser.
   is intentionally a long GPU run; `quick` performs a one-observation
   diagnostic at a 10,000-simulation budget. SIR and Lotka--Volterra additionally
   require the Julia/diffeqtorch backend and are not default Colab targets.
+- Exercise 11 loads the frozen Exercise 5 PRESEL, reference-flow, and
+  four-member density-ratio checkpoints, together with the held-out density
+  arrays saved by Exercise 5. It generates resumable, compressed
+  pseudo-experiment ensembles; trains a conditional quadratic-spline model for
+  the profile-likelihood-ratio statistic; adds hNDE and simulator residual
+  corrections; and audits the resulting 95% critical-value curve on an
+  independent simulator split following LF2I. The default full run uses
+  500,000 hNDE toys, 100,000 simulator-calibration toys, and a separate
+  100,000-toy audit; set `FAST_MODE = True` for a structural first pass. Run
+  Exercise 5 through its hybrid-density validation first and keep
+  `USE_DRIVE = True` so all required checkpoints and arrays persist.

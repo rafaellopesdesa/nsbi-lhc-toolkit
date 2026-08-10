@@ -1,4 +1,4 @@
-"""Small hNPE/hNDE training helpers for Exercise 9.
+"""Small hNPE/hNDE and conditional-flow helpers for the workshop exercises.
 
 The two density estimators in the exercise use the same rational-quadratic
 spline coupling construction as ``utils_nf.py``.  This module adds the one
@@ -82,11 +82,15 @@ def _build_quadratic_spline(
         from nflows.transforms.coupling import (
             PiecewiseRationalQuadraticCouplingTransform,
         )
+        from nflows.transforms.autoregressive import (
+            MaskedPiecewiseRationalQuadraticAutoregressiveTransform,
+        )
         from nflows.transforms.permutations import ReversePermutation
         from nflows.utils.torchutils import create_alternating_binary_mask
     except ImportError as exc:
         raise ImportError(
-            "Exercise 9 requires nflows. Install it with `pip install nflows`."
+            "The conditional-flow exercises require nflows. Install it with "
+            "`pip install nflows`."
         ) from exc
 
     def make_net(in_features: int, out_features: int) -> nn.Module:
@@ -103,22 +107,46 @@ def _build_quadratic_spline(
 
     transforms = []
     for layer_index in range(n_coupling_layers):
-        mask = create_alternating_binary_mask(
-            features=n_features,
-            even=(layer_index % 2 == 0),
-        )
-        transforms.append(
-            PiecewiseRationalQuadraticCouplingTransform(
-                mask=mask,
-                transform_net_create_fn=make_net,
-                num_bins=spline_num_bins,
-                tails="linear",
-                tail_bound=spline_tail_bound,
-                apply_unconditional_transform=False,
+        if n_features == 1:
+            # A coupling transform needs at least two target coordinates: one
+            # coordinate is held fixed while another is transformed.  With a
+            # scalar target, alternating coupling masks otherwise create
+            # identity layers.  The one-dimensional autoregressive transform
+            # is the exact analogue in the same rational-quadratic-spline
+            # family and can be conditioned on the supplied context.
+            transforms.append(
+                MaskedPiecewiseRationalQuadraticAutoregressiveTransform(
+                    features=1,
+                    hidden_features=hidden_features,
+                    context_features=(context_features or None),
+                    num_bins=spline_num_bins,
+                    tails="linear",
+                    tail_bound=spline_tail_bound,
+                    num_blocks=hidden_layers,
+                    activation=F.relu,
+                    dropout_probability=dropout_probability,
+                    use_batch_norm=False,
+                    use_residual_blocks=True,
+                    random_mask=False,
+                )
             )
-        )
-        if layer_index + 1 < n_coupling_layers:
-            transforms.append(ReversePermutation(features=n_features))
+        else:
+            mask = create_alternating_binary_mask(
+                features=n_features,
+                even=(layer_index % 2 == 0),
+            )
+            transforms.append(
+                PiecewiseRationalQuadraticCouplingTransform(
+                    mask=mask,
+                    transform_net_create_fn=make_net,
+                    num_bins=spline_num_bins,
+                    tails="linear",
+                    tail_bound=spline_tail_bound,
+                    apply_unconditional_transform=False,
+                )
+            )
+            if layer_index + 1 < n_coupling_layers:
+                transforms.append(ReversePermutation(features=n_features))
 
     return Flow(
         transform=CompositeTransform(transforms),
@@ -554,6 +582,8 @@ def train_ratio_classifier(
     seed: int,
     load_if_available: bool = True,
     paired_group_ids: np.ndarray | None = None,
+    positive_weights: np.ndarray | None = None,
+    negative_weights: np.ndarray | None = None,
 ) -> dict[str, Any]:
     """Train a balanced neural classifier whose logit estimates log p/q.
 
@@ -562,16 +592,46 @@ def train_ratio_classifier(
     remain on the same side of the train/validation boundary.  Splitting the
     concatenated class rows independently leaks the shared parameter or
     observation into validation and can make a memorizing network appear to
-    generalize.
+    generalize.  Optional class weights implement importance-weighted BCE.
+    They are normalized separately within each class and split so the
+    effective classifier prior remains exactly balanced.  At least one row in
+    each class must retain positive weight in both training and validation.
     """
     checkpoint = _flow_checkpoint(checkpoint)
     if load_if_available and checkpoint.exists():
         print(f"Loading ratio classifier from {checkpoint}")
         return load_ratio_classifier(checkpoint, device)
+    importance_weights_supplied = (
+        positive_weights is not None or negative_weights is not None
+    )
     positive = _as_2d_float32(positive, "positive")
     negative = _as_2d_float32(negative, "negative")
     if positive.shape[1] != negative.shape[1]:
         raise ValueError("positive and negative must have the same columns.")
+
+    def validate_class_weights(
+        values: np.ndarray | None,
+        n_rows: int,
+        name: str,
+    ) -> np.ndarray:
+        if values is None:
+            return np.ones(n_rows, dtype=np.float64)
+        values = np.asarray(values, dtype=np.float64).reshape(-1)
+        if len(values) != n_rows:
+            raise ValueError(f"{name} must contain one value per class row.")
+        if not np.isfinite(values).all() or np.any(values < 0.0):
+            raise ValueError(f"{name} must be finite and non-negative.")
+        if not float(values.sum()) > 0.0:
+            raise ValueError(f"{name} must have positive total weight.")
+        return values
+
+    positive_weights = validate_class_weights(
+        positive_weights, len(positive), "positive_weights"
+    )
+    negative_weights = validate_class_weights(
+        negative_weights, len(negative), "negative_weights"
+    )
+
     if paired_group_ids is not None:
         paired_group_ids = np.asarray(paired_group_ids)
         if len(positive) != len(negative):
@@ -590,12 +650,23 @@ def train_ratio_classifier(
         raise ValueError("At least four rows per class are required.")
     rng = np.random.default_rng(seed)
     if paired_group_ids is None:
-        positive = positive[rng.choice(len(positive), n_per_class, replace=False)]
-        negative = negative[rng.choice(len(negative), n_per_class, replace=False)]
+        positive_indices = rng.choice(
+            len(positive), n_per_class, replace=False
+        )
+        negative_indices = rng.choice(
+            len(negative), n_per_class, replace=False
+        )
+        positive = positive[positive_indices]
+        negative = negative[negative_indices]
+        positive_weights = positive_weights[positive_indices]
+        negative_weights = negative_weights[negative_indices]
     values = np.concatenate([positive, negative], axis=0)
     labels = np.concatenate(
         [np.ones(n_per_class), np.zeros(n_per_class)]
     ).astype(np.float32)
+    raw_weights = np.concatenate(
+        [positive_weights, negative_weights]
+    ).astype(np.float64)
 
     validation_fraction = float(training_config.get("validation_fraction", 0.2))
     if not 0.0 < validation_fraction < 1.0:
@@ -640,11 +711,49 @@ def train_ratio_classifier(
     values = scaler.transform(values)
     values_tensor = torch.tensor(values, dtype=torch.float32)
     labels_tensor = torch.tensor(labels, dtype=torch.float32)
+
+    def balanced_split_weights(
+        indices: np.ndarray, split_name: str
+    ) -> np.ndarray:
+        split_labels = labels[indices]
+        split_weights = raw_weights[indices].copy()
+        for class_label in (0.0, 1.0):
+            class_mask = split_labels == class_label
+            class_sum = float(split_weights[class_mask].sum())
+            if not class_sum > 0.0:
+                raise ValueError(
+                    f"{split_name} has no positive weight for class "
+                    f"{int(class_label)}."
+                )
+            # Each class contributes half of the split loss.  The overall
+            # mean weight is one, keeping loss scales comparable to ordinary
+            # balanced BCE.
+            split_weights[class_mask] *= (
+                0.5 * len(indices) / class_sum
+            )
+        return split_weights.astype(np.float32)
+
+    training_weights = balanced_split_weights(
+        training_indices, "training split"
+    )
+    validation_weights = balanced_split_weights(
+        validation_indices, "validation split"
+    )
+    training_weights_tensor = torch.tensor(
+        training_weights, dtype=torch.float32
+    )
+    validation_weights_tensor = torch.tensor(
+        validation_weights, dtype=torch.float32
+    )
     training_dataset = TensorDataset(
-        values_tensor[training_indices], labels_tensor[training_indices]
+        values_tensor[training_indices],
+        labels_tensor[training_indices],
+        training_weights_tensor,
     )
     validation_dataset = TensorDataset(
-        values_tensor[validation_indices], labels_tensor[validation_indices]
+        values_tensor[validation_indices],
+        labels_tensor[validation_indices],
+        validation_weights_tensor,
     )
     generator = torch.Generator().manual_seed(int(seed))
     training_loader = DataLoader(
@@ -701,6 +810,11 @@ def train_ratio_classifier(
         "split_strategy": split_strategy,
         "n_training_groups": n_training_groups,
         "n_validation_groups": n_validation_groups,
+        "weighted_bce": importance_weights_supplied,
+        "nonuniform_weights": bool(
+            not np.allclose(positive_weights, 1.0)
+            or not np.allclose(negative_weights, 1.0)
+        ),
     }
     print(
         f"Training balanced ratio classifier on {n_per_class:,} rows per class "
@@ -710,12 +824,14 @@ def train_ratio_classifier(
     for epoch in range(1, n_epochs + 1):
         model.train()
         train_losses = []
-        for values_batch, labels_batch in training_loader:
+        for values_batch, labels_batch, weights_batch in training_loader:
             values_batch = values_batch.to(device)
             labels_batch = labels_batch.to(device)
-            loss = F.binary_cross_entropy_with_logits(
-                model(values_batch), labels_batch
+            weights_batch = weights_batch.to(device)
+            event_loss = F.binary_cross_entropy_with_logits(
+                model(values_batch), labels_batch, reduction="none"
             )
+            loss = torch.mean(weights_batch * event_loss)
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), gradient_clip)
@@ -723,17 +839,24 @@ def train_ratio_classifier(
             train_losses.append(float(loss.detach().cpu()))
 
         model.eval()
-        validation_losses = []
+        validation_loss_numerator = 0.0
+        validation_weight_sum = 0.0
         with torch.no_grad():
-            for values_batch, labels_batch in validation_loader:
+            for values_batch, labels_batch, weights_batch in validation_loader:
                 values_batch = values_batch.to(device)
                 labels_batch = labels_batch.to(device)
-                loss = F.binary_cross_entropy_with_logits(
-                    model(values_batch), labels_batch
+                weights_batch = weights_batch.to(device)
+                event_loss = F.binary_cross_entropy_with_logits(
+                    model(values_batch), labels_batch, reduction="none"
                 )
-                validation_losses.append(float(loss.detach().cpu()))
+                validation_loss_numerator += float(
+                    torch.sum(weights_batch * event_loss).detach().cpu()
+                )
+                validation_weight_sum += float(
+                    torch.sum(weights_batch).detach().cpu()
+                )
         train_loss = float(np.mean(train_losses))
-        validation_loss = float(np.mean(validation_losses))
+        validation_loss = validation_loss_numerator / validation_weight_sum
         learning_rate = float(optimizer.param_groups[0]["lr"])
         history["train"].append(train_loss)
         history["validation"].append(validation_loss)
