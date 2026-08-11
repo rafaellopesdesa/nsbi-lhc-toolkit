@@ -526,12 +526,13 @@ def collect_preselected_eval_rows(
         batch_size=batch_size,
     ):
         batch = _prepare_stream_batch(batch, features)
-        eval_mask = _stream_split_masks(
+        masks = _stream_split_masks(
             row_indices,
             presel_fraction=presel_fraction,
             flow_train_fraction=flow_train_fraction,
             seed=split_seed,
-        )["eval"]
+        )
+        eval_mask = masks["eval"]
         stats["partition_events"] += int(eval_mask.sum())
         stats["partition_weight"] += float(
             batch.loc[eval_mask, "weight"].sum()
@@ -539,20 +540,27 @@ def collect_preselected_eval_rows(
         if not np.any(eval_mask):
             continue
 
-        eval_positions = np.flatnonzero(eval_mask)
+        # Reproduce collect_preselected_parquet exactly: Exercise 5 evaluated
+        # PRESEL on the union of the flow-training and evaluation partitions
+        # in each parquet batch, then selected the evaluation rows.  Evaluating
+        # only the much smaller eval subset can change CUDA/ONNX matrix-kernel
+        # shapes and move borderline float32 scores across the hard cut.
+        relevant = masks["flow_train"] | eval_mask
+        relevant_positions = np.flatnonzero(relevant)
         ratio = np.asarray(
-            ratio_predictor(batch.loc[eval_mask, list(features)]),
+            ratio_predictor(batch.loc[relevant, list(features)]),
             dtype=np.float64,
         ).reshape(-1)
-        if len(ratio) != len(eval_positions):
+        if len(ratio) != len(relevant_positions):
             raise ValueError("ratio_predictor returned the wrong number of rows.")
-        passed = np.nan_to_num(
+        passes = np.zeros(len(batch), dtype=bool)
+        passes[relevant_positions] = np.nan_to_num(
             ratio,
             nan=-np.inf,
             posinf=np.inf,
             neginf=-np.inf,
         ) >= float(ratio_cut)
-        selected_positions = eval_positions[passed]
+        selected_positions = np.flatnonzero(eval_mask & passes)
         if len(selected_positions) == 0:
             continue
 
