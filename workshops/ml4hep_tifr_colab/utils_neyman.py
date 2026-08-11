@@ -1,12 +1,14 @@
 """Utilities for the amortized Neyman-construction tutorial (Exercise 11).
 
 The helpers in this module keep the notebook focused on the statistical
-construction.  They provide five pieces of infrastructure:
+construction.  They provide six pieces of infrastructure:
 
 * the one-dimensional likelihood-ratio compression used in Exercise 5;
 * resumable, batch-wise pseudo-experiment generation;
 * reconstruction of pooled and split simulator templates from Exercise 5's
   held-out density-evaluation arrays;
+* bounded-memory, resumable simulator-template streaming with exact nested
+  selected-event checkpoints;
 * numerical conditional-density and conditional-PIT primitives; and
 * an LF2I-style Bernoulli coverage auditor trained with ordinary BCE.
 
@@ -21,6 +23,8 @@ import copy
 import hashlib
 import json
 import math
+import os
+import time
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
@@ -161,6 +165,7 @@ def run_cached_toy_ensemble(
     ],
     fixed_mu: float | None = None,
     fit_fingerprint: str = "unspecified_v1",
+    fit_runtime_fingerprint: str = "unspecified_runtime_v1",
     generation_mu_transform: Callable[[np.ndarray], np.ndarray] | None = None,
     test_mu_transform: Callable[[np.ndarray], np.ndarray] | None = None,
     generation_mu_fingerprint: str = "identity_v1",
@@ -174,7 +179,9 @@ def run_cached_toy_ensemble(
     physical Neyman parameter.  Optional transforms may separately change the
     parameter used to generate a surrogate toy and the likelihood coordinate
     used in the statistic numerator.  Their fingerprints are part of the
-    cache provenance. Count matrices exist only for one batch and are never
+    cache provenance. A partial shard set requires an exact fit-runtime
+    fingerprint match, while a complete immutable shard set may be loaded on
+    another runtime. Count matrices exist only for one batch and are never
     written to disk.
     """
 
@@ -186,6 +193,9 @@ def run_cached_toy_ensemble(
     batch_size = int(batch_size)
     if n_toys < 1 or batch_size < 1:
         raise ValueError("n_toys and batch_size must be positive.")
+    fit_runtime_fingerprint = str(fit_runtime_fingerprint)
+    if not fit_runtime_fingerprint:
+        raise ValueError("fit_runtime_fingerprint must be non-empty.")
     signal_probability = np.asarray(signal_probability, dtype=np.float64)
     background_probability = np.asarray(
         background_probability, dtype=np.float64
@@ -228,7 +238,7 @@ def run_cached_toy_ensemble(
         )
 
     manifest = {
-        "version": 5,
+        "version": 6,
         "n_toys": n_toys,
         "batch_size": batch_size,
         "seed": int(seed),
@@ -241,24 +251,41 @@ def run_cached_toy_ensemble(
         ),
         "likelihood_fingerprint": _array_fingerprint(likelihood_q),
         "fit_fingerprint": str(fit_fingerprint),
+        "fit_runtime_fingerprint": fit_runtime_fingerprint,
         "has_generation_mu_transform": generation_mu_transform is not None,
         "has_test_mu_transform": test_mu_transform is not None,
         "generation_mu_fingerprint": str(generation_mu_fingerprint),
         "test_mu_fingerprint": str(test_mu_fingerprint),
     }
     manifest_path = cache_dir / "manifest.json"
+    n_batches = int(math.ceil(n_toys / batch_size))
     if manifest_path.exists():
         existing = json.loads(manifest_path.read_text())
-        if existing != manifest:
+        stable_existing = dict(existing)
+        stable_expected = dict(manifest)
+        recorded_runtime = stable_existing.pop(
+            "fit_runtime_fingerprint", None
+        )
+        stable_expected.pop("fit_runtime_fingerprint", None)
+        if stable_existing != stable_expected:
             raise RuntimeError(
                 f"Toy cache {cache_dir} was made with a different "
                 "configuration. Remove that versioned directory or choose "
                 "a new RUN_TAG."
             )
+        complete = all(
+            (shard_dir / f"batch_{index:05d}.npz").exists()
+            for index in range(n_batches)
+        )
+        if recorded_runtime != fit_runtime_fingerprint and not complete:
+            raise RuntimeError(
+                f"The partial toy cache {cache_dir} was created with a "
+                "different JAX/runtime fingerprint. Resume it on a matching "
+                "runtime or choose a new versioned cache."
+            )
     else:
         manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True))
 
-    n_batches = int(math.ceil(n_toys / batch_size))
     for batch_index in range(n_batches):
         start = batch_index * batch_size
         stop = min(n_toys, start + batch_size)
@@ -323,6 +350,9 @@ def run_cached_toy_ensemble(
             "n_events": counts.sum(axis=1).astype(np.int32),
             "fitted_score": np.asarray(fitted_score, dtype=np.float32),
         }
+        payload["payload_fingerprint"] = np.asarray(
+            _array_fingerprint(*(payload[name] for name in sorted(payload)))
+        )
         temporary_path = shard_path.with_suffix(".tmp.npz")
         np.savez_compressed(temporary_path, **payload)
         temporary_path.replace(shard_path)
@@ -343,9 +373,56 @@ def run_cached_toy_ensemble(
         ]
     }
     for batch_index in range(n_batches):
-        with np.load(shard_dir / f"batch_{batch_index:05d}.npz") as shard:
+        start = batch_index * batch_size
+        stop = min(n_toys, start + batch_size)
+        expected_rows = stop - start
+        with np.load(
+            shard_dir / f"batch_{batch_index:05d}.npz",
+            allow_pickle=False,
+        ) as shard:
+            required = set(chunks) | {"payload_fingerprint"}
+            missing = required - set(shard.files)
+            if missing:
+                raise RuntimeError(
+                    f"Toy shard {batch_index} is missing {sorted(missing)}."
+                )
+            values = {
+                name: np.asarray(shard[name])
+                for name in chunks
+            }
+            bad_shapes = {
+                name: value.shape
+                for name, value in values.items()
+                if value.shape != (expected_rows,)
+            }
+            if bad_shapes:
+                raise RuntimeError(
+                    f"Toy shard {batch_index} has invalid shapes: {bad_shapes}."
+                )
+            observed_fingerprint = str(
+                np.asarray(shard["payload_fingerprint"]).item()
+            )
+            expected_fingerprint = _array_fingerprint(
+                *(values[name] for name in sorted(values))
+            )
+            if observed_fingerprint != expected_fingerprint:
+                raise RuntimeError(
+                    f"Toy shard {batch_index} failed its content fingerprint."
+                )
+            if (
+                not all(np.isfinite(values[name]).all() for name in [
+                    "mu", "generation_mu", "test_mu", "mu_hat", "t_mu",
+                    "fitted_score",
+                ])
+                or np.any(values["n_events"] < 0)
+                or np.any(values["template_index"] < 0)
+                or np.any(values["template_index"] >= len(signal_probability))
+            ):
+                raise RuntimeError(
+                    f"Toy shard {batch_index} contains invalid values."
+                )
             for name in chunks:
-                chunks[name].append(np.asarray(shard[name]))
+                chunks[name].append(values[name])
     result = {
         name: np.concatenate(parts)[:n_toys]
         for name, parts in chunks.items()
@@ -522,6 +599,612 @@ def simulator_templates_from_exercise5(
             templates[f"{subset_name}_{process}_probability"] = probability
             templates[f"{subset_name}_{process}_events"] = len(subset_indices)
     return templates
+
+
+_STREAMED_TEMPLATE_CACHE_VERSION = 2
+
+
+def _streamed_template_manifest(
+    *,
+    process: str,
+    selected_checkpoints: np.ndarray,
+    batch_size: int,
+    seed: int,
+    feature_names: Sequence[str],
+    feature_edges: np.ndarray,
+    log_q_edges: np.ndarray,
+    presel_ratio_cut: float,
+    recipe_fingerprint: str,
+) -> dict[str, Any]:
+    """Return the exact provenance contract for a streamed template cache."""
+
+    return {
+        "cache_version": _STREAMED_TEMPLATE_CACHE_VERSION,
+        "process": str(process),
+        "selected_checkpoints": [
+            int(value) for value in np.asarray(selected_checkpoints).reshape(-1)
+        ],
+        "batch_size": int(batch_size),
+        "seed": int(seed),
+        "feature_names": [str(name) for name in feature_names],
+        "feature_edges_fingerprint": _array_fingerprint(feature_edges),
+        "log_q_edges_fingerprint": _array_fingerprint(log_q_edges),
+        "presel_ratio_cut": float(presel_ratio_cut),
+        "recipe_fingerprint": str(recipe_fingerprint),
+    }
+
+
+def _streamed_template_state_fingerprint(
+    manifest_json: str,
+    *,
+    runtime_fingerprint: str,
+    selected_events: int,
+    generated_events: int,
+    passing_events: int,
+    next_batch_index: int,
+    n_completed_checkpoints: int,
+    current_q_counts: np.ndarray,
+    current_feature_counts: np.ndarray,
+    checkpoint_q_counts: np.ndarray,
+    checkpoint_feature_counts: np.ndarray,
+) -> str:
+    digest = hashlib.sha256(str(manifest_json).encode("utf-8"))
+    digest.update(str(runtime_fingerprint).encode("utf-8"))
+    for value in (
+        selected_events,
+        generated_events,
+        passing_events,
+        next_batch_index,
+        n_completed_checkpoints,
+    ):
+        digest.update(np.asarray(int(value), dtype=np.int64).tobytes())
+    for values in (
+        current_q_counts,
+        current_feature_counts,
+        checkpoint_q_counts,
+        checkpoint_feature_counts,
+    ):
+        values = np.ascontiguousarray(np.asarray(values, dtype=np.int64))
+        digest.update(str(values.shape).encode("utf-8"))
+        digest.update(values.view(np.uint8))
+    return digest.hexdigest()
+
+
+def _validate_streamed_template_state(
+    saved: Mapping[str, Any],
+    *,
+    expected_manifest_json: str,
+    selected_checkpoints: np.ndarray,
+    n_features: int,
+    n_feature_bins: int,
+    n_q_bins: int,
+) -> dict[str, Any]:
+    """Validate a complete or resumable streamed-template state."""
+
+    required = {
+        "manifest_json",
+        "runtime_fingerprint",
+        "selected_events",
+        "generated_events",
+        "passing_events",
+        "next_batch_index",
+        "n_completed_checkpoints",
+        "current_q_counts",
+        "current_feature_counts",
+        "checkpoint_q_counts",
+        "checkpoint_feature_counts",
+        "state_fingerprint",
+    }
+    missing = required - set(saved.keys())
+    if missing:
+        raise RuntimeError(
+            "The streamed-template cache is incomplete: "
+            f"missing {sorted(missing)}."
+        )
+    manifest_json = str(np.asarray(saved["manifest_json"]).item())
+    if manifest_json != expected_manifest_json:
+        raise RuntimeError(
+            "The streamed-template cache has different provenance. Choose a "
+            "new versioned cache path or remove only this incompatible cache."
+        )
+    runtime_fingerprint = str(
+        np.asarray(saved["runtime_fingerprint"]).item()
+    )
+    if not runtime_fingerprint:
+        raise RuntimeError(
+            "The streamed-template cache has an empty runtime fingerprint."
+        )
+
+    scalar_names = [
+        "selected_events",
+        "generated_events",
+        "passing_events",
+        "next_batch_index",
+        "n_completed_checkpoints",
+    ]
+    scalar_values = {}
+    for name in scalar_names:
+        values = np.asarray(saved[name])
+        if values.shape != () or values.dtype != np.dtype(np.int64):
+            raise RuntimeError(
+                f"The streamed-template cache field {name!r} is not an "
+                "int64 scalar."
+            )
+        scalar_values[name] = int(values.item())
+    selected_events = scalar_values["selected_events"]
+    generated_events = scalar_values["generated_events"]
+    passing_events = scalar_values["passing_events"]
+    next_batch_index = scalar_values["next_batch_index"]
+    n_completed = scalar_values["n_completed_checkpoints"]
+
+    def int64_array(name: str) -> np.ndarray:
+        values = np.asarray(saved[name])
+        if values.dtype != np.dtype(np.int64):
+            raise RuntimeError(
+                f"The streamed-template cache field {name!r} is not int64."
+            )
+        return values
+
+    current_q = int64_array("current_q_counts")
+    current_feature = int64_array("current_feature_counts")
+    checkpoint_q = int64_array("checkpoint_q_counts")
+    checkpoint_feature = int64_array("checkpoint_feature_counts")
+    checkpoints = np.asarray(selected_checkpoints, dtype=np.int64)
+
+    expected_shapes = {
+        "current_q_counts": (n_q_bins,),
+        "current_feature_counts": (n_features, n_feature_bins),
+        "checkpoint_q_counts": (len(checkpoints), n_q_bins),
+        "checkpoint_feature_counts": (
+            len(checkpoints), n_features, n_feature_bins
+        ),
+    }
+    observed_shapes = {
+        "current_q_counts": current_q.shape,
+        "current_feature_counts": current_feature.shape,
+        "checkpoint_q_counts": checkpoint_q.shape,
+        "checkpoint_feature_counts": checkpoint_feature.shape,
+    }
+    mismatched_shapes = {
+        name: (observed_shapes[name], shape)
+        for name, shape in expected_shapes.items()
+        if observed_shapes[name] != shape
+    }
+    if mismatched_shapes:
+        raise RuntimeError(
+            "The streamed-template cache has invalid array shapes: "
+            f"{mismatched_shapes}."
+        )
+    if (
+        selected_events < 0
+        or generated_events < 0
+        or passing_events < selected_events
+        or passing_events > generated_events
+        or next_batch_index < 0
+        or not 0 <= n_completed <= len(checkpoints)
+        or np.any(current_q < 0)
+        or np.any(current_feature < 0)
+        or np.any(checkpoint_q < 0)
+        or np.any(checkpoint_feature < 0)
+    ):
+        raise RuntimeError("The streamed-template cache has invalid counters.")
+    manifest_batch_size = int(json.loads(manifest_json)["batch_size"])
+    if generated_events != next_batch_index * manifest_batch_size:
+        raise RuntimeError(
+            "The streamed-template generated count is inconsistent with its "
+            "completed raw batches."
+        )
+    if int(current_q.sum()) != selected_events:
+        raise RuntimeError("The current q histogram lost selected events.")
+    if not np.all(current_feature.sum(axis=1) == selected_events):
+        raise RuntimeError("A current feature histogram lost selected events.")
+    for index in range(n_completed):
+        target = int(checkpoints[index])
+        if int(checkpoint_q[index].sum()) != target:
+            raise RuntimeError("A completed q checkpoint has the wrong size.")
+        if not np.all(checkpoint_feature[index].sum(axis=1) == target):
+            raise RuntimeError(
+                "A completed feature checkpoint has the wrong size."
+            )
+    if n_completed > 1:
+        if np.any(np.diff(checkpoint_q[:n_completed], axis=0) < 0) or np.any(
+            np.diff(checkpoint_feature[:n_completed], axis=0) < 0
+        ):
+            raise RuntimeError(
+                "Nested streamed-template checkpoints are not monotone."
+            )
+    if n_completed and int(checkpoints[n_completed - 1]) == selected_events:
+        if not np.array_equal(
+            checkpoint_q[n_completed - 1], current_q
+        ) or not np.array_equal(
+            checkpoint_feature[n_completed - 1], current_feature
+        ):
+            raise RuntimeError(
+                "The latest streamed checkpoint differs from the running state."
+            )
+    if n_completed < len(checkpoints):
+        if np.any(checkpoint_q[n_completed:]) or np.any(
+            checkpoint_feature[n_completed:]
+        ):
+            raise RuntimeError(
+                "An incomplete streamed checkpoint contains nonzero counts."
+            )
+    expected_completed = int(np.searchsorted(
+        checkpoints, selected_events, side="right"
+    ))
+    if expected_completed != n_completed:
+        raise RuntimeError(
+            "The streamed-template checkpoint counter is inconsistent."
+        )
+
+    observed_fingerprint = str(np.asarray(saved["state_fingerprint"]).item())
+    expected_fingerprint = _streamed_template_state_fingerprint(
+        manifest_json,
+        runtime_fingerprint=runtime_fingerprint,
+        selected_events=selected_events,
+        generated_events=generated_events,
+        passing_events=passing_events,
+        next_batch_index=next_batch_index,
+        n_completed_checkpoints=n_completed,
+        current_q_counts=current_q,
+        current_feature_counts=current_feature,
+        checkpoint_q_counts=checkpoint_q,
+        checkpoint_feature_counts=checkpoint_feature,
+    )
+    if observed_fingerprint != expected_fingerprint:
+        raise RuntimeError(
+            "The streamed-template cache failed its content fingerprint."
+        )
+    return {
+        "manifest_json": manifest_json,
+        "runtime_fingerprint": runtime_fingerprint,
+        "selected_events": selected_events,
+        "generated_events": generated_events,
+        "passing_events": passing_events,
+        "next_batch_index": next_batch_index,
+        "n_completed_checkpoints": n_completed,
+        "current_q_counts": current_q,
+        "current_feature_counts": current_feature,
+        "checkpoint_q_counts": checkpoint_q,
+        "checkpoint_feature_counts": checkpoint_feature,
+        "state_fingerprint": observed_fingerprint,
+    }
+
+
+def _save_streamed_template_state(
+    cache_path: Path,
+    *,
+    state: Mapping[str, Any],
+) -> None:
+    """Atomically save a small resumable state on local or Drive storage."""
+
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    payload = dict(state)
+    payload["state_fingerprint"] = _streamed_template_state_fingerprint(
+        str(payload["manifest_json"]),
+        runtime_fingerprint=str(payload["runtime_fingerprint"]),
+        selected_events=int(payload["selected_events"]),
+        generated_events=int(payload["generated_events"]),
+        passing_events=int(payload["passing_events"]),
+        next_batch_index=int(payload["next_batch_index"]),
+        n_completed_checkpoints=int(payload["n_completed_checkpoints"]),
+        current_q_counts=payload["current_q_counts"],
+        current_feature_counts=payload["current_feature_counts"],
+        checkpoint_q_counts=payload["checkpoint_q_counts"],
+        checkpoint_feature_counts=payload["checkpoint_feature_counts"],
+    )
+    temporary = cache_path.with_suffix(cache_path.suffix + ".tmp.npz")
+    np.savez_compressed(temporary, **payload)
+    os.replace(temporary, cache_path)
+
+
+def load_streamed_simulator_template(
+    *,
+    cache_path: str | Path,
+    process: str,
+    selected_checkpoints: Sequence[int],
+    batch_size: int,
+    seed: int,
+    feature_names: Sequence[str],
+    feature_edges: np.ndarray,
+    log_q_edges: np.ndarray,
+    presel_ratio_cut: float,
+    recipe_fingerprint: str,
+    expose_counts: bool = True,
+) -> dict[str, Any]:
+    """Validate and load a complete streamed simulator template.
+
+    With ``expose_counts=False`` only provenance and scalar counters are
+    returned.  Exercise 11 uses that mode to certify its independently seeded
+    audit cache without inspecting the audit law before freezing the method.
+    """
+
+    cache_path = Path(cache_path)
+    checkpoints = np.asarray(selected_checkpoints, dtype=np.int64).reshape(-1)
+    edges = np.asarray(feature_edges, dtype=np.float64)
+    q_edges = np.asarray(log_q_edges, dtype=np.float64).reshape(-1)
+    if not cache_path.exists():
+        raise FileNotFoundError(cache_path)
+    if edges.ndim != 2 or len(feature_names) != edges.shape[0]:
+        raise ValueError("feature_edges must have one row per feature name.")
+    manifest = _streamed_template_manifest(
+        process=process,
+        selected_checkpoints=checkpoints,
+        batch_size=batch_size,
+        seed=seed,
+        feature_names=feature_names,
+        feature_edges=edges,
+        log_q_edges=q_edges,
+        presel_ratio_cut=presel_ratio_cut,
+        recipe_fingerprint=recipe_fingerprint,
+    )
+    manifest_json = json.dumps(manifest, sort_keys=True, separators=(",", ":"))
+    with np.load(cache_path, allow_pickle=False) as saved:
+        state = _validate_streamed_template_state(
+            saved,
+            expected_manifest_json=manifest_json,
+            selected_checkpoints=checkpoints,
+            n_features=len(feature_names),
+            n_feature_bins=edges.shape[1] - 1,
+            n_q_bins=len(q_edges) - 1,
+        )
+    if state["selected_events"] != int(checkpoints[-1]):
+        raise RuntimeError(
+            f"The streamed {process} template is only partially complete: "
+            f"{state['selected_events']:,}/{int(checkpoints[-1]):,}."
+        )
+    result = {
+        "cache_path": cache_path,
+        "process": str(process),
+        "selected_checkpoints": checkpoints,
+        "selected_events": state["selected_events"],
+        "generated_events": state["generated_events"],
+        "passing_events": state["passing_events"],
+        "acceptance": state["passing_events"] / state["generated_events"],
+        "runtime_fingerprint": state["runtime_fingerprint"],
+        "fingerprint": state["state_fingerprint"],
+    }
+    if expose_counts:
+        result.update({
+            "q_counts": state["checkpoint_q_counts"],
+            "feature_counts": state["checkpoint_feature_counts"],
+        })
+    return result
+
+
+def run_streamed_simulator_template(
+    *,
+    cache_path: str | Path,
+    process: str,
+    selected_checkpoints: Sequence[int],
+    batch_size: int,
+    seed: int,
+    feature_names: Sequence[str],
+    feature_edges: np.ndarray,
+    log_q_edges: np.ndarray,
+    sample_batch: Callable[[int, np.random.Generator], np.ndarray],
+    preselection_ratio: Callable[[np.ndarray], np.ndarray],
+    log_q_evaluator: Callable[[np.ndarray], np.ndarray],
+    presel_ratio_cut: float,
+    recipe_fingerprint: str,
+    runtime_fingerprint: str,
+    save_every_batches: int = 10,
+    progress_every_batches: int = 10,
+    expose_counts: bool = True,
+) -> dict[str, Any]:
+    """Stream an exact-size post-selection simulator template to a cache.
+
+    Raw feature batches and selected events are discarded immediately after
+    their q and feature histograms are updated.  Milestones are nested prefixes
+    of one deterministic selected-event stream.  Every raw batch has an
+    independent seed derived from ``(seed, batch_index)``; an interrupted run
+    can therefore resume from the last atomic summary without saving mutable
+    RNG state or duplicating events. A partial cache additionally requires an
+    exact runtime fingerprint match. A complete immutable cache may be loaded
+    on a different runtime; its recorded runtime remains part of its content
+    commitment and is returned to the caller.
+    """
+
+    cache_path = Path(cache_path)
+    checkpoints = np.asarray(selected_checkpoints, dtype=np.int64).reshape(-1)
+    feature_names = [str(name) for name in feature_names]
+    edges = np.asarray(feature_edges, dtype=np.float64)
+    q_edges = np.asarray(log_q_edges, dtype=np.float64).reshape(-1)
+    batch_size = int(batch_size)
+    save_every_batches = int(save_every_batches)
+    progress_every_batches = int(progress_every_batches)
+    runtime_fingerprint = str(runtime_fingerprint)
+    if (
+        len(checkpoints) < 1
+        or np.any(checkpoints <= 0)
+        or np.any(np.diff(checkpoints) <= 0)
+    ):
+        raise ValueError("selected_checkpoints must be positive and increasing.")
+    if batch_size < 1 or save_every_batches < 1 or progress_every_batches < 1:
+        raise ValueError("Batch and reporting intervals must be positive.")
+    if not runtime_fingerprint:
+        raise ValueError("runtime_fingerprint must be non-empty.")
+    if edges.ndim != 2 or edges.shape[0] != len(feature_names):
+        raise ValueError("feature_edges must have one row per feature name.")
+    if edges.shape[1] < 3 or not np.all(np.diff(edges, axis=1) > 0.0):
+        raise ValueError("Every feature edge row must be strictly increasing.")
+    if len(q_edges) < 3 or not np.all(np.diff(q_edges) > 0.0):
+        raise ValueError("log_q_edges must be strictly increasing.")
+    manifest = _streamed_template_manifest(
+        process=process,
+        selected_checkpoints=checkpoints,
+        batch_size=batch_size,
+        seed=seed,
+        feature_names=feature_names,
+        feature_edges=edges,
+        log_q_edges=q_edges,
+        presel_ratio_cut=presel_ratio_cut,
+        recipe_fingerprint=recipe_fingerprint,
+    )
+    manifest_json = json.dumps(manifest, sort_keys=True, separators=(",", ":"))
+    n_features = len(feature_names)
+    n_feature_bins = edges.shape[1] - 1
+    n_q_bins = len(q_edges) - 1
+
+    if cache_path.exists():
+        with np.load(cache_path, allow_pickle=False) as saved:
+            state = _validate_streamed_template_state(
+                saved,
+                expected_manifest_json=manifest_json,
+                selected_checkpoints=checkpoints,
+                n_features=n_features,
+                n_feature_bins=n_feature_bins,
+                n_q_bins=n_q_bins,
+            )
+        print(
+            f"Resuming streamed {process} template at "
+            f"{state['selected_events']:,}/{int(checkpoints[-1]):,} selected "
+            f"events ({state['generated_events']:,} generated)."
+        )
+        if (
+            state["selected_events"] < int(checkpoints[-1])
+            and state["runtime_fingerprint"] != runtime_fingerprint
+        ):
+            raise RuntimeError(
+                f"The partial streamed {process} template was created with "
+                "different inference/runtime numerics. Resume on a matching "
+                "runtime or start a new versioned cache."
+            )
+    else:
+        state = {
+            "manifest_json": manifest_json,
+            "runtime_fingerprint": runtime_fingerprint,
+            "selected_events": 0,
+            "generated_events": 0,
+            "passing_events": 0,
+            "next_batch_index": 0,
+            "n_completed_checkpoints": 0,
+            "current_q_counts": np.zeros(n_q_bins, dtype=np.int64),
+            "current_feature_counts": np.zeros(
+                (n_features, n_feature_bins), dtype=np.int64
+            ),
+            "checkpoint_q_counts": np.zeros(
+                (len(checkpoints), n_q_bins), dtype=np.int64
+            ),
+            "checkpoint_feature_counts": np.zeros(
+                (len(checkpoints), n_features, n_feature_bins), dtype=np.int64
+            ),
+        }
+        _save_streamed_template_state(cache_path, state=state)
+
+    target = int(checkpoints[-1])
+    started = time.monotonic()
+    selected_at_start = int(state["selected_events"])
+    while int(state["selected_events"]) < target:
+        batch_index = int(state["next_batch_index"])
+        completed_checkpoint_this_batch = False
+        rng = np.random.default_rng(
+            np.random.SeedSequence([int(seed), batch_index])
+        )
+        values = np.asarray(sample_batch(batch_size, rng), dtype=np.float32)
+        if values.shape != (batch_size, n_features):
+            raise RuntimeError(
+                f"sample_batch returned {values.shape}, expected "
+                f"{(batch_size, n_features)}."
+            )
+        presel = np.asarray(
+            preselection_ratio(values), dtype=np.float64
+        ).reshape(-1)
+        if len(presel) != batch_size:
+            raise RuntimeError("preselection_ratio returned the wrong length.")
+        passes = np.isfinite(presel) & (presel >= float(presel_ratio_cut))
+        passing_values = values[passes]
+        state["generated_events"] = int(state["generated_events"]) + batch_size
+        state["passing_events"] = int(state["passing_events"]) + len(
+            passing_values
+        )
+        remaining = target - int(state["selected_events"])
+        if len(passing_values) > remaining:
+            passing_values = passing_values[:remaining]
+        if len(passing_values):
+            log_q = np.asarray(
+                log_q_evaluator(passing_values), dtype=np.float64
+            ).reshape(-1)
+            if len(log_q) != len(passing_values) or not np.isfinite(log_q).all():
+                raise RuntimeError("log_q_evaluator returned invalid values.")
+
+            offset = 0
+            while offset < len(passing_values):
+                checkpoint_index = int(state["n_completed_checkpoints"])
+                checkpoint_target = int(checkpoints[checkpoint_index])
+                take = min(
+                    len(passing_values) - offset,
+                    checkpoint_target - int(state["selected_events"]),
+                )
+                stop = offset + take
+                q_segment = log_q[offset:stop]
+                feature_segment = passing_values[offset:stop]
+                state["current_q_counts"] += np.histogram(
+                    q_segment, bins=q_edges
+                )[0].astype(np.int64)
+                for feature_index in range(n_features):
+                    state["current_feature_counts"][feature_index] += np.histogram(
+                        feature_segment[:, feature_index],
+                        bins=edges[feature_index],
+                    )[0].astype(np.int64)
+                state["selected_events"] = int(state["selected_events"]) + take
+                offset = stop
+                if int(state["selected_events"]) == checkpoint_target:
+                    state["checkpoint_q_counts"][checkpoint_index] = state[
+                        "current_q_counts"
+                    ]
+                    state["checkpoint_feature_counts"][checkpoint_index] = state[
+                        "current_feature_counts"
+                    ]
+                    state["n_completed_checkpoints"] = checkpoint_index + 1
+                    completed_checkpoint_this_batch = True
+                    print(
+                        f"  {process}: completed nested selected-event "
+                        f"checkpoint {checkpoint_target:,}."
+                    )
+        state["next_batch_index"] = batch_index + 1
+        should_report = (
+            state["next_batch_index"] % progress_every_batches == 0
+            or int(state["selected_events"]) == target
+        )
+        should_save = (
+            state["next_batch_index"] % save_every_batches == 0
+            or completed_checkpoint_this_batch
+            or should_report
+        )
+        if should_save:
+            _save_streamed_template_state(cache_path, state=state)
+        if should_report:
+            elapsed = max(time.monotonic() - started, 1.0e-9)
+            new_selected = int(state["selected_events"]) - selected_at_start
+            rate = new_selected / elapsed
+            remaining_seconds = (
+                (target - int(state["selected_events"])) / rate
+                if rate > 0.0 else math.inf
+            )
+            print(
+                f"  {process}: {int(state['selected_events']):,}/{target:,} "
+                f"selected from {int(state['generated_events']):,} generated; "
+                f"acceptance={int(state['passing_events']) / int(state['generated_events']):.3%}; "
+                f"session rate={rate:,.0f} selected/s; "
+                f"ETA={remaining_seconds / 60.0:,.1f} min."
+            )
+        del values, presel, passes, passing_values
+
+    _save_streamed_template_state(cache_path, state=state)
+    return load_streamed_simulator_template(
+        cache_path=cache_path,
+        process=process,
+        selected_checkpoints=checkpoints,
+        batch_size=batch_size,
+        seed=seed,
+        feature_names=feature_names,
+        feature_edges=edges,
+        log_q_edges=q_edges,
+        presel_ratio_cut=presel_ratio_cut,
+        recipe_fingerprint=recipe_fingerprint,
+        expose_counts=expose_counts,
+    )
 
 
 def sample_truncated_spline_flow(
