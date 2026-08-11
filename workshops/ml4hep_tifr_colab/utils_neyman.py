@@ -161,13 +161,21 @@ def run_cached_toy_ensemble(
     ],
     fixed_mu: float | None = None,
     fit_fingerprint: str = "unspecified_v1",
+    generation_mu_transform: Callable[[np.ndarray], np.ndarray] | None = None,
+    test_mu_transform: Callable[[np.ndarray], np.ndarray] | None = None,
+    generation_mu_fingerprint: str = "identity_v1",
+    test_mu_fingerprint: str = "identity_v1",
 ) -> dict[str, np.ndarray]:
     """Generate and fit Poisson toys in resumable, deterministic shards.
 
     ``fit_batch`` receives ``(counts, test_mu)`` and returns
     ``(mu_hat, t_mu, fitted_score)``.  ``fit_fingerprint`` must be bumped when
-    its numerical definition changes. Count matrices exist only for one batch
-    and are never written to disk.
+    its numerical definition changes.  The stored ``mu`` is always the
+    physical Neyman parameter.  Optional transforms may separately change the
+    parameter used to generate a surrogate toy and the likelihood coordinate
+    used in the statistic numerator.  Their fingerprints are part of the
+    cache provenance. Count matrices exist only for one batch and are never
+    written to disk.
     """
 
     cache_dir = Path(cache_dir)
@@ -183,17 +191,44 @@ def run_cached_toy_ensemble(
         background_probability, dtype=np.float64
     )
     likelihood_q = np.asarray(likelihood_q, dtype=np.float64)
+    if signal_probability.ndim == 1:
+        signal_probability = signal_probability[None, :]
+    if background_probability.ndim == 1:
+        background_probability = background_probability[None, :]
     if signal_probability.shape != background_probability.shape:
         raise ValueError("Signal/background probabilities must have equal shape.")
-    if likelihood_q.shape != signal_probability.shape:
+    if signal_probability.ndim != 2:
+        raise ValueError("Template probabilities must be one- or two-dimensional.")
+    if likelihood_q.shape != signal_probability.shape[1:]:
         raise ValueError("likelihood_q must match the template binning.")
-    if not np.isclose(signal_probability.sum(), 1.0):
-        raise ValueError("Signal probabilities must sum to one.")
-    if not np.isclose(background_probability.sum(), 1.0):
-        raise ValueError("Background probabilities must sum to one.")
+    if (
+        not np.isfinite(signal_probability).all()
+        or not np.isfinite(background_probability).all()
+        or np.any(signal_probability < 0.0)
+        or np.any(background_probability < 0.0)
+    ):
+        raise ValueError("Template probabilities must be finite and non-negative.")
+    if not np.allclose(signal_probability.sum(axis=1), 1.0):
+        raise ValueError("Every signal template must sum to one.")
+    if not np.allclose(background_probability.sum(axis=1), 1.0):
+        raise ValueError("Every background template must sum to one.")
+    if generation_mu_transform is not None and str(
+        generation_mu_fingerprint
+    ) == "identity_v1":
+        raise ValueError(
+            "A non-identity generation_mu_transform needs an explicit "
+            "generation_mu_fingerprint."
+        )
+    if test_mu_transform is not None and str(
+        test_mu_fingerprint
+    ) == "identity_v1":
+        raise ValueError(
+            "A non-identity test_mu_transform needs an explicit "
+            "test_mu_fingerprint."
+        )
 
     manifest = {
-        "version": 3,
+        "version": 5,
         "n_toys": n_toys,
         "batch_size": batch_size,
         "seed": int(seed),
@@ -206,6 +241,10 @@ def run_cached_toy_ensemble(
         ),
         "likelihood_fingerprint": _array_fingerprint(likelihood_q),
         "fit_fingerprint": str(fit_fingerprint),
+        "has_generation_mu_transform": generation_mu_transform is not None,
+        "has_test_mu_transform": test_mu_transform is not None,
+        "generation_mu_fingerprint": str(generation_mu_fingerprint),
+        "test_mu_fingerprint": str(test_mu_fingerprint),
     }
     manifest_path = cache_dir / "manifest.json"
     if manifest_path.exists():
@@ -235,14 +274,50 @@ def run_cached_toy_ensemble(
             )
         else:
             mu = np.full(stop - start, float(fixed_mu), dtype=np.float64)
+        generation_mu = (
+            mu
+            if generation_mu_transform is None
+            else np.asarray(generation_mu_transform(mu), dtype=np.float64)
+        )
+        test_mu = (
+            mu
+            if test_mu_transform is None
+            else np.asarray(test_mu_transform(mu), dtype=np.float64)
+        )
+        generation_mu = np.broadcast_to(
+            generation_mu, mu.shape
+        ).astype(np.float64, copy=False)
+        test_mu = np.broadcast_to(test_mu, mu.shape).astype(
+            np.float64, copy=False
+        )
+        if (
+            not np.isfinite(generation_mu).all()
+            or np.any(generation_mu < 0.0)
+            or not np.isfinite(test_mu).all()
+            or np.any(test_mu < 0.0)
+        ):
+            raise ValueError(
+                "Generation and tested likelihood coordinates must be "
+                "finite and non-negative."
+            )
+        template_index = rng.integers(
+            0, len(signal_probability), size=stop - start
+        )
+        batch_signal_probability = signal_probability[template_index]
+        batch_background_probability = background_probability[template_index]
         poisson_mean = (
-            mu[:, None] * float(lam_signal) * signal_probability[None, :]
-            + float(lam_background) * background_probability[None, :]
+            generation_mu[:, None]
+            * float(lam_signal)
+            * batch_signal_probability
+            + float(lam_background) * batch_background_probability
         )
         counts = rng.poisson(poisson_mean)
-        mu_hat, t_mu, fitted_score = fit_batch(counts, mu)
+        mu_hat, t_mu, fitted_score = fit_batch(counts, test_mu)
         payload = {
             "mu": mu.astype(np.float32),
+            "generation_mu": generation_mu.astype(np.float32),
+            "test_mu": test_mu.astype(np.float32),
+            "template_index": template_index.astype(np.int32),
             "mu_hat": np.asarray(mu_hat, dtype=np.float32),
             "t_mu": np.asarray(t_mu, dtype=np.float32),
             "n_events": counts.sum(axis=1).astype(np.int32),
@@ -256,7 +331,16 @@ def run_cached_toy_ensemble(
 
     chunks: dict[str, list[np.ndarray]] = {
         name: []
-        for name in ["mu", "mu_hat", "t_mu", "n_events", "fitted_score"]
+        for name in [
+            "mu",
+            "generation_mu",
+            "test_mu",
+            "template_index",
+            "mu_hat",
+            "t_mu",
+            "n_events",
+            "fitted_score",
+        ]
     }
     for batch_index in range(n_batches):
         with np.load(shard_dir / f"batch_{batch_index:05d}.npz") as shard:
@@ -406,11 +490,15 @@ def simulator_templates_from_exercise5(
         "log_q_scale_correction": log_q_scale_correction,
     }
     for process, indices in slices.items():
+        pooled_counts = np.histogram(
+            log_q[indices], bins=edges
+        )[0].astype(np.int64)
         pooled_probability = np.histogram(
             log_q[indices], bins=edges, weights=weights[indices]
         )[0].astype(np.float64)
         pooled_probability += float(probability_floor)
         pooled_probability /= pooled_probability.sum()
+        templates[f"pooled_{process}_counts"] = pooled_counts
         templates[f"pooled_{process}_probability"] = pooled_probability
 
         order = indices[rng.permutation(len(indices))]
@@ -420,6 +508,9 @@ def simulator_templates_from_exercise5(
             "audit": order[split:],
         }
         for subset_name, subset_indices in subsets.items():
+            counts = np.histogram(
+                log_q[subset_indices], bins=edges
+            )[0].astype(np.int64)
             probability = np.histogram(
                 log_q[subset_indices],
                 bins=edges,
@@ -427,6 +518,7 @@ def simulator_templates_from_exercise5(
             )[0].astype(np.float64)
             probability += float(probability_floor)
             probability /= probability.sum()
+            templates[f"{subset_name}_{process}_counts"] = counts
             templates[f"{subset_name}_{process}_probability"] = probability
             templates[f"{subset_name}_{process}_events"] = len(subset_indices)
     return templates

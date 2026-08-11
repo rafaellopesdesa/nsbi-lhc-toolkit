@@ -64,6 +64,20 @@ def _hash_rows(row_indices: np.ndarray, seed: int) -> np.ndarray:
     return _splitmix64(seeded_indices)
 
 
+def deterministic_row_priority(
+    row_indices: np.ndarray,
+    seed: int,
+) -> np.ndarray:
+    """Return the deterministic priority used by streamed reservoirs.
+
+    This public wrapper is useful when a later exercise must reconstruct the
+    complement of an earlier bounded reservoir without changing the original
+    row-level split or random-priority definition.
+    """
+
+    return _hash_rows(np.asarray(row_indices, dtype=np.uint64), int(seed))
+
+
 def _stream_split_masks(
     row_indices: np.ndarray,
     *,
@@ -474,6 +488,87 @@ def collect_preselected_parquet(
     for split in samples:
         stats[split]["retained_events"] = len(samples[split])
     return samples, stats
+
+
+def collect_preselected_eval_rows(
+    parquet_path: str | Path,
+    *,
+    features: Sequence[str],
+    ratio_predictor: Callable[[pd.DataFrame], np.ndarray],
+    ratio_cut: float,
+    batch_size: int,
+    presel_fraction: float,
+    flow_train_fraction: float,
+    split_seed: int,
+) -> tuple[pd.DataFrame, dict[str, float | int]]:
+    """Collect every PRESEL-passing row in the deterministic eval split.
+
+    Unlike :func:`collect_preselected_parquet`, this helper deliberately does
+    not cap the retained evaluation rows.  It also records each original
+    parquet row index, allowing a bounded priority reservoir used by an
+    earlier exercise to be reconstructed exactly and its disjoint complement
+    to be reserved for a genuinely event-level audit.
+    """
+
+    if ratio_cut < 0.0:
+        raise ValueError("ratio_cut must be non-negative.")
+    columns = [*features, "weight"]
+    chunks: list[pd.DataFrame] = []
+    stats: dict[str, float | int] = {
+        "partition_events": 0,
+        "partition_weight": 0.0,
+        "selected_events": 0,
+        "selected_weight": 0.0,
+    }
+    for row_indices, batch in _iter_parquet_batches(
+        parquet_path,
+        columns=columns,
+        batch_size=batch_size,
+    ):
+        batch = _prepare_stream_batch(batch, features)
+        eval_mask = _stream_split_masks(
+            row_indices,
+            presel_fraction=presel_fraction,
+            flow_train_fraction=flow_train_fraction,
+            seed=split_seed,
+        )["eval"]
+        stats["partition_events"] += int(eval_mask.sum())
+        stats["partition_weight"] += float(
+            batch.loc[eval_mask, "weight"].sum()
+        )
+        if not np.any(eval_mask):
+            continue
+
+        eval_positions = np.flatnonzero(eval_mask)
+        ratio = np.asarray(
+            ratio_predictor(batch.loc[eval_mask, list(features)]),
+            dtype=np.float64,
+        ).reshape(-1)
+        if len(ratio) != len(eval_positions):
+            raise ValueError("ratio_predictor returned the wrong number of rows.")
+        passed = np.nan_to_num(
+            ratio,
+            nan=-np.inf,
+            posinf=np.inf,
+            neginf=-np.inf,
+        ) >= float(ratio_cut)
+        selected_positions = eval_positions[passed]
+        if len(selected_positions) == 0:
+            continue
+
+        selected = batch.iloc[selected_positions][columns].copy()
+        selected["_row_index"] = row_indices[selected_positions]
+        chunks.append(selected)
+        stats["selected_events"] += len(selected)
+        stats["selected_weight"] += float(selected["weight"].sum())
+
+    if chunks:
+        result = pd.concat(chunks, ignore_index=True, copy=False)
+    else:
+        result = pd.DataFrame(columns=[*columns, "_row_index"])
+    if len(result) != int(stats["selected_events"]):
+        raise RuntimeError("The streamed evaluation-row count is inconsistent.")
+    return result, stats
 
 
 def _canonical_flow_type(flow_type: str) -> str:
