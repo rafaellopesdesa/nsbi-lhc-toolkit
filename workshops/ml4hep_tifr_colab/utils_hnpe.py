@@ -221,6 +221,7 @@ def load_spline_flow(
         "config": config,
         "checkpoint": checkpoint,
         "history": saved.get("history", {}),
+        "training_fingerprint": saved.get("training_fingerprint"),
     }
 
 
@@ -234,10 +235,19 @@ def train_spline_flow(
     device: torch.device,
     seed: int,
     load_if_available: bool = True,
+    verify_checkpoint_data: bool = False,
 ) -> dict[str, Any]:
-    """Train an unconditional or conditional quadratic-spline flow."""
+    """Train an unconditional or conditional quadratic-spline flow.
+
+    With ``verify_checkpoint_data=True``, a reusable checkpoint is bound to
+    the exact target/context rows, seed, architecture, and training settings.
+    """
     checkpoint = _flow_checkpoint(checkpoint)
-    if load_if_available and checkpoint.exists():
+    if (
+        load_if_available
+        and checkpoint.exists()
+        and not verify_checkpoint_data
+    ):
         print(f"Loading spline flow from {checkpoint}")
         return load_spline_flow(checkpoint, device)
 
@@ -252,6 +262,46 @@ def train_spline_flow(
     config = dict(model_config)
     config["n_features"] = int(target.shape[1])
     config["context_features"] = 0 if context is None else int(context.shape[1])
+    training_fingerprint = None
+    if verify_checkpoint_data:
+        fingerprint_context = (
+            np.asarray(context)
+            if context is not None
+            else np.empty((len(target), 0), dtype=np.float32)
+        )
+        fingerprint_configuration = json.dumps(
+            {
+                "model_config": dict(model_config),
+                "training_config": dict(training_config),
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        )
+        training_fingerprint = _array_fingerprint(
+            target,
+            fingerprint_context,
+            np.asarray([seed], dtype=np.int64),
+            np.asarray([fingerprint_configuration]),
+        )
+        if load_if_available and checkpoint.exists():
+            loaded = load_spline_flow(checkpoint, device)
+            if loaded.get("training_fingerprint") != training_fingerprint:
+                raise RuntimeError(
+                    f"Checkpoint {checkpoint} was trained on different flow "
+                    "rows. Bump the run tag or remove that checkpoint "
+                    "explicitly."
+                )
+            if loaded["config"] != config:
+                raise RuntimeError(
+                    f"Checkpoint {checkpoint} has a different flow "
+                    "architecture. Bump the run tag."
+                )
+            print(
+                "Loaded spline flow with matching data fingerprint from "
+                f"{checkpoint}"
+            )
+            return loaded
     target_scaler = ArrayStandardizer.fit(target)
     target_scaled = target_scaler.transform(target)
     context_scaler = None
@@ -375,6 +425,7 @@ def train_spline_flow(
             "context_mean": None if context_scaler is None else context_scaler.mean,
             "context_std": None if context_scaler is None else context_scaler.std,
             "history": history,
+            "training_fingerprint": training_fingerprint,
         },
         checkpoint,
     )
