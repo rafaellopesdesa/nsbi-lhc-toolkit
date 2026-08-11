@@ -5,9 +5,9 @@ construction.  They provide five pieces of infrastructure:
 
 * the one-dimensional likelihood-ratio compression used in Exercise 5;
 * resumable, batch-wise pseudo-experiment generation;
-* reconstruction of two disjoint simulator templates from Exercise 5's
+* reconstruction of pooled and split simulator templates from Exercise 5's
   held-out density-evaluation arrays;
-* numerical conditional-density primitives and quantiles; and
+* numerical conditional-density and conditional-PIT primitives; and
 * an LF2I-style Bernoulli coverage auditor trained with ordinary BCE.
 
 No helper changes the fitted likelihood.  Simulator toys may use different
@@ -280,14 +280,18 @@ def simulator_templates_from_exercise5(
     lam_signal: float,
     lam_background: float,
     seed: int,
+    source_ratio_normalization: Mapping[str, float] | None = None,
+    target_ratio_normalization: Mapping[str, float] | None = None,
     probability_floor: float = 1.0e-15,
 ) -> dict[str, Any]:
-    """Split Exercise 5's held-out simulator arrays into calibration/audit.
+    """Build pooled and diagnostic split templates from Exercise 5 arrays.
 
     Exercise 5 concatenates background evaluation rows followed by signal
     evaluation rows.  The generator assigns one constant event weight per
     process, so the unique contiguous weight change recovers that boundary
-    without assuming a fixed reservoir size.
+    without assuming a fixed reservoir size.  The optional normalization
+    mappings transport ratios saved under Exercise 5's finite reference draw
+    to the normalization used by the frozen Exercise 11 likelihood.
     """
 
     weights = np.load(weights_path).astype(np.float64, copy=False).reshape(-1)
@@ -344,10 +348,47 @@ def simulator_templates_from_exercise5(
             f"post-selection yields: {yield_closure}. Check the PRESEL state."
         )
 
+    if (source_ratio_normalization is None) != (
+        target_ratio_normalization is None
+    ):
+        raise ValueError(
+            "source_ratio_normalization and target_ratio_normalization "
+            "must be supplied together."
+        )
+    log_q_scale_correction = 0.0
+    if source_ratio_normalization is not None:
+        normalization_values = {}
+        for mapping_name, mapping in [
+            ("source", source_ratio_normalization),
+            ("target", target_ratio_normalization),
+        ]:
+            for process in ("signal", "background"):
+                try:
+                    value = float(mapping[process])
+                except (KeyError, TypeError) as error:
+                    raise ValueError(
+                        f"{mapping_name}_ratio_normalization needs positive "
+                        "signal/background entries."
+                    ) from error
+                if not np.isfinite(value) or value <= 0.0:
+                    raise ValueError(
+                        f"Invalid {mapping_name} normalization for {process}."
+                    )
+                normalization_values[(mapping_name, process)] = value
+        # The saved arrays contain raw_ratio / source_normalization.  Convert
+        # them to raw_ratio / target_normalization before forming q_s / q_b.
+        log_q_scale_correction = (
+            math.log(normalization_values[("source", "signal")])
+            - math.log(normalization_values[("target", "signal")])
+            - math.log(normalization_values[("source", "background")])
+            + math.log(normalization_values[("target", "background")])
+        )
+
     log_q = (
         np.log(float(lam_signal) / float(lam_background))
         + np.log(ratio_signal)
         - np.log(ratio_background)
+        + log_q_scale_correction
     )
     edges = np.asarray(log_q_edges, dtype=np.float64)
     rng = np.random.default_rng(int(seed))
@@ -362,8 +403,16 @@ def simulator_templates_from_exercise5(
         "signal_weight_sum": signal_weight_sum,
         "background_yield_closure": yield_closure["background"],
         "signal_yield_closure": yield_closure["signal"],
+        "log_q_scale_correction": log_q_scale_correction,
     }
     for process, indices in slices.items():
+        pooled_probability = np.histogram(
+            log_q[indices], bins=edges, weights=weights[indices]
+        )[0].astype(np.float64)
+        pooled_probability += float(probability_floor)
+        pooled_probability /= pooled_probability.sum()
+        templates[f"pooled_{process}_probability"] = pooled_probability
+
         order = indices[rng.permutation(len(indices))]
         split = len(order) // 2
         subsets = {
@@ -521,6 +570,222 @@ def conditional_quantiles(
         ],
         dtype=np.float64,
     )
+
+
+def conditional_row_quantiles(
+    cdf: np.ndarray,
+    coordinate_grid: np.ndarray,
+    probabilities: np.ndarray,
+) -> np.ndarray:
+    """Invert each conditional CDF at row-dependent probabilities.
+
+    ``probabilities`` may have shape ``(n_rows,)`` or ``(n_rows, n_levels)``.
+    This is useful after a calibration map supplies a different probability
+    level for every parameter point.
+    """
+
+    cdf = np.asarray(cdf, dtype=np.float64)
+    coordinate = np.asarray(coordinate_grid, dtype=np.float64).reshape(-1)
+    probabilities = np.asarray(probabilities, dtype=np.float64)
+    if cdf.ndim != 2 or cdf.shape[1] != len(coordinate):
+        raise ValueError("cdf shape does not match coordinate_grid.")
+    squeeze = probabilities.ndim == 1
+    if squeeze:
+        probabilities = probabilities[:, None]
+    if probabilities.ndim != 2 or probabilities.shape[0] != cdf.shape[0]:
+        raise ValueError(
+            "probabilities must have one row per conditional CDF."
+        )
+    if np.any((probabilities < 0.0) | (probabilities > 1.0)):
+        raise ValueError("Probabilities must lie in [0, 1].")
+    result = np.asarray(
+        [
+            [np.interp(probability, row, coordinate) for probability in levels]
+            for row, levels in zip(cdf, probabilities)
+        ],
+        dtype=np.float64,
+    )
+    return result[:, 0] if squeeze else result
+
+
+def conditional_cdf_values(
+    cdf: np.ndarray,
+    context_grid: np.ndarray,
+    coordinate_grid: np.ndarray,
+    context: np.ndarray,
+    coordinate: np.ndarray,
+) -> np.ndarray:
+    """Bilinearly interpolate a scalar-context conditional CDF.
+
+    Coordinates below or above the tabulated support return zero or one.
+    Context values must lie within the design grid.  The helper is vectorized
+    so it can transform large toy ensembles without a Python loop.
+    """
+
+    cdf = np.asarray(cdf, dtype=np.float64)
+    context_grid = np.asarray(context_grid, dtype=np.float64).reshape(-1)
+    coordinate_grid = np.asarray(
+        coordinate_grid, dtype=np.float64
+    ).reshape(-1)
+    context = np.asarray(context, dtype=np.float64).reshape(-1)
+    coordinate = np.asarray(coordinate, dtype=np.float64).reshape(-1)
+    if len(context) != len(coordinate):
+        raise ValueError("context and coordinate must have equal length.")
+    if cdf.shape != (len(context_grid), len(coordinate_grid)):
+        raise ValueError("cdf shape does not match the supplied grids.")
+    if len(context_grid) < 2 or len(coordinate_grid) < 2:
+        raise ValueError("Both interpolation grids require at least two points.")
+    if not np.all(np.diff(context_grid) > 0.0) or not np.all(
+        np.diff(coordinate_grid) > 0.0
+    ):
+        raise ValueError("Interpolation grids must be strictly increasing.")
+    tolerance = 1.0e-10 * max(1.0, np.max(np.abs(context_grid)))
+    if np.any(context < context_grid[0] - tolerance) or np.any(
+        context > context_grid[-1] + tolerance
+    ):
+        raise ValueError("Context values lie outside the conditional CDF grid.")
+
+    context_clipped = np.clip(context, context_grid[0], context_grid[-1])
+    context_index = np.searchsorted(
+        context_grid, context_clipped, side="right"
+    ) - 1
+    context_index = np.clip(context_index, 0, len(context_grid) - 2)
+    context_low = context_grid[context_index]
+    context_high = context_grid[context_index + 1]
+    context_fraction = (context_clipped - context_low) / (
+        context_high - context_low
+    )
+
+    coordinate_clipped = np.clip(
+        coordinate, coordinate_grid[0], coordinate_grid[-1]
+    )
+    coordinate_index = np.searchsorted(
+        coordinate_grid, coordinate_clipped, side="right"
+    ) - 1
+    coordinate_index = np.clip(
+        coordinate_index, 0, len(coordinate_grid) - 2
+    )
+    coordinate_low = coordinate_grid[coordinate_index]
+    coordinate_high = coordinate_grid[coordinate_index + 1]
+    coordinate_fraction = (coordinate_clipped - coordinate_low) / (
+        coordinate_high - coordinate_low
+    )
+
+    lower_context = (
+        (1.0 - coordinate_fraction)
+        * cdf[context_index, coordinate_index]
+        + coordinate_fraction * cdf[context_index, coordinate_index + 1]
+    )
+    upper_context = (
+        (1.0 - coordinate_fraction)
+        * cdf[context_index + 1, coordinate_index]
+        + coordinate_fraction
+        * cdf[context_index + 1, coordinate_index + 1]
+    )
+    result = (
+        (1.0 - context_fraction) * lower_context
+        + context_fraction * upper_context
+    )
+    result = np.where(coordinate < coordinate_grid[0], 0.0, result)
+    result = np.where(coordinate > coordinate_grid[-1], 1.0, result)
+    return np.clip(result, 0.0, 1.0)
+
+
+def conditional_ratio_grid(
+    ratio_ensemble: Sequence[Mapping[str, Any]],
+    context_values: np.ndarray,
+    coordinate_grid: np.ndarray,
+    *,
+    max_abs_log_ratio: float = 15.0,
+    batch_size: int = 65_536,
+) -> dict[str, np.ndarray]:
+    """Normalize classifier odds over one scalar coordinate.
+
+    The base measure is Lebesgue measure on ``coordinate_grid``.  In Exercise
+    11 this grid is ``[0, 1]``, so the base density is exactly Uniform(0, 1)
+    and the normalized odds estimate the simulator PIT density.
+
+    ``context_values`` may contain any number of parameter columns.  Only the
+    quadrature coordinate remains one-dimensional, which is the key scaling
+    advantage of calibration in PIT space.
+    """
+
+    context_values = np.asarray(context_values, dtype=np.float32)
+    if context_values.ndim == 1:
+        context_values = context_values[:, None]
+    coordinate = np.asarray(coordinate_grid, dtype=np.float64).reshape(-1)
+    if context_values.ndim != 2 or len(context_values) < 1:
+        raise ValueError("context_values must be a non-empty matrix.")
+    if len(coordinate) < 4 or not np.all(np.diff(coordinate) > 0.0):
+        raise ValueError(
+            "coordinate_grid needs at least four strictly increasing points."
+        )
+    n_context = len(context_values)
+    n_coordinate = len(coordinate)
+    repeated_context = np.repeat(context_values, n_coordinate, axis=0)
+    tiled_coordinate = np.tile(
+        coordinate.astype(np.float32), n_context
+    )[:, None]
+    ratio_input = np.column_stack([repeated_context, tiled_coordinate])
+    raw_log_ratio = ratio_classifier_ensemble_logit(
+        list(ratio_ensemble), ratio_input, batch_size=batch_size
+    ).astype(np.float64)
+    clip_fraction = float(
+        np.mean(np.abs(raw_log_ratio) > float(max_abs_log_ratio))
+    )
+    log_ratio_range = np.asarray(
+        [np.min(raw_log_ratio), np.max(raw_log_ratio)], dtype=np.float64
+    )
+    log_ratio = np.clip(
+        raw_log_ratio, -float(max_abs_log_ratio), float(max_abs_log_ratio)
+    ).reshape(n_context, n_coordinate)
+    row_maximum = np.max(log_ratio, axis=1, keepdims=True)
+    scaled_density = np.exp(log_ratio - row_maximum)
+    scaled_normalization = trapezoid(
+        scaled_density, x=coordinate, axis=1
+    )
+    if not np.isfinite(scaled_normalization).all() or np.any(
+        scaled_normalization <= 0.0
+    ):
+        raise FloatingPointError("Conditional ratio normalization failed.")
+    density = scaled_density / scaled_normalization[:, None]
+    cdf = cumulative_trapezoid(
+        density, x=coordinate, axis=1, initial=0.0
+    )
+    cdf /= cdf[:, -1, None]
+    return {
+        "density": density,
+        "cdf": cdf,
+        "log_normalization": (
+            row_maximum[:, 0] + np.log(scaled_normalization)
+        ),
+        "ratio_clip_fraction": clip_fraction,
+        "ratio_log_range": log_ratio_range,
+    }
+
+
+def conservative_empirical_quantile(
+    values: np.ndarray,
+    probability: float | Sequence[float],
+) -> np.ndarray:
+    """Finite-sample upper quantile for a Neyman acceptance cutoff.
+
+    For ``n`` calibration toys the one-indexed order is
+    ``ceil(probability * (n + 1))``, clipped to ``[1, n]``.  This is the
+    standard split-conformal/Neyman finite-sample choice.  Ties can make the
+    resulting non-randomized test conservative.
+    """
+
+    values = np.asarray(values, dtype=np.float64).reshape(-1)
+    probability = np.asarray(probability, dtype=np.float64)
+    if len(values) < 1 or not np.isfinite(values).all():
+        raise ValueError("values must be a non-empty finite array.")
+    if np.any((probability <= 0.0) | (probability >= 1.0)):
+        raise ValueError("probability must lie strictly in (0, 1).")
+    ordered = np.sort(values)
+    order = np.ceil(probability * (len(ordered) + 1)).astype(np.int64)
+    order = np.clip(order, 1, len(ordered))
+    return ordered[order - 1]
 
 
 def importance_effective_sample_size(weights: np.ndarray) -> float:

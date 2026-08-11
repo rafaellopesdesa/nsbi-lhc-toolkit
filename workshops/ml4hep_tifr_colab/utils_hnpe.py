@@ -13,6 +13,8 @@ notebook easier to read without hiding any statistical step.
 from __future__ import annotations
 
 import copy
+import hashlib
+import json
 import math
 from dataclasses import dataclass
 from pathlib import Path
@@ -60,6 +62,16 @@ def _as_2d_float32(values: np.ndarray, name: str) -> np.ndarray:
     if len(values) and not np.isfinite(values).all():
         raise ValueError(f"{name} contains non-finite values.")
     return values
+
+
+def _array_fingerprint(*arrays: np.ndarray) -> str:
+    digest = hashlib.sha256()
+    for values in arrays:
+        values = np.ascontiguousarray(np.asarray(values))
+        digest.update(str(values.dtype).encode("utf-8"))
+        digest.update(str(values.shape).encode("utf-8"))
+        digest.update(values.view(np.uint8))
+    return digest.hexdigest()
 
 
 def _build_quadratic_spline(
@@ -551,6 +563,7 @@ def load_ratio_classifier(
         "calibration_intercept": float(saved.get("calibration_intercept", 0.0)),
         "checkpoint": checkpoint,
         "history": saved.get("history", {}),
+        "training_fingerprint": saved.get("training_fingerprint"),
     }
 
 
@@ -566,6 +579,7 @@ def _save_ratio_classifier(pack: Mapping[str, Any]) -> None:
                 pack.get("calibration_intercept", 0.0)
             ),
             "history": pack.get("history", {}),
+            "training_fingerprint": pack.get("training_fingerprint"),
         },
         Path(pack["checkpoint"]),
     )
@@ -584,6 +598,7 @@ def train_ratio_classifier(
     paired_group_ids: np.ndarray | None = None,
     positive_weights: np.ndarray | None = None,
     negative_weights: np.ndarray | None = None,
+    verify_checkpoint_data: bool = False,
 ) -> dict[str, Any]:
     """Train a balanced neural classifier whose logit estimates log p/q.
 
@@ -596,9 +611,18 @@ def train_ratio_classifier(
     They are normalized separately within each class and split so the
     effective classifier prior remains exactly balanced.  At least one row in
     each class must retain positive weight in both training and validation.
+    ``verify_checkpoint_data`` makes a reusable checkpoint conditional on the
+    exact class arrays, pair ids, weights, seed, model architecture, and
+    training configuration.  It is intended for calibration stages whose
+    inputs can change while a checkpoint path remains the same; legacy
+    workshop checkpoints keep the faster path-only behavior by default.
     """
     checkpoint = _flow_checkpoint(checkpoint)
-    if load_if_available and checkpoint.exists():
+    if (
+        load_if_available
+        and checkpoint.exists()
+        and not verify_checkpoint_data
+    ):
         print(f"Loading ratio classifier from {checkpoint}")
         return load_ratio_classifier(checkpoint, device)
     importance_weights_supplied = (
@@ -648,6 +672,54 @@ def train_ratio_classifier(
         n_per_class = min(len(positive), len(negative))
     if n_per_class < 4:
         raise ValueError("At least four rows per class are required.")
+
+    training_fingerprint = None
+    if verify_checkpoint_data:
+        fingerprint_group_ids = (
+            np.asarray(paired_group_ids)
+            if paired_group_ids is not None
+            else np.empty(0, dtype=np.int64)
+        )
+        fingerprint_configuration = json.dumps(
+            {
+                "model_config": dict(model_config),
+                "training_config": dict(training_config),
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        )
+        training_fingerprint = _array_fingerprint(
+            positive,
+            negative,
+            positive_weights,
+            negative_weights,
+            fingerprint_group_ids,
+            np.asarray([seed], dtype=np.int64),
+            np.asarray([fingerprint_configuration]),
+        )
+        if load_if_available and checkpoint.exists():
+            loaded = load_ratio_classifier(checkpoint, device)
+            expected_config = dict(model_config)
+            expected_config["n_features"] = int(positive.shape[1])
+            if loaded.get("training_fingerprint") != training_fingerprint:
+                raise RuntimeError(
+                    f"Checkpoint {checkpoint} was trained on different "
+                    "classifier rows. Bump the calibration run tag or "
+                    "remove that checkpoint explicitly."
+                )
+            if loaded["config"] != expected_config:
+                raise RuntimeError(
+                    f"Checkpoint {checkpoint} has a different ratio-model "
+                    "architecture. Bump the calibration run tag or remove "
+                    "that checkpoint explicitly."
+                )
+            print(
+                "Loaded ratio classifier with matching data fingerprint "
+                f"from {checkpoint}"
+            )
+            return loaded
+
     rng = np.random.default_rng(seed)
     if paired_group_ids is None:
         positive_indices = rng.choice(
@@ -890,6 +962,7 @@ def train_ratio_classifier(
         "calibration_intercept": 0.0,
         "checkpoint": checkpoint,
         "history": history,
+        "training_fingerprint": training_fingerprint,
     }
     _save_ratio_classifier(pack)
     print(f"Saved ratio classifier to {checkpoint}")
