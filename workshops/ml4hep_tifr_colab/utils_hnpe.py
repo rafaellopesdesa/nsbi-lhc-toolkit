@@ -6,8 +6,9 @@ feature that the earlier exercises did not need: conditional density
 estimation for an NPE, together with a compact neural density-ratio estimator.
 
 The functions intentionally accept and return NumPy arrays.  Keeping the
-PyTorch and ``nflows`` details here makes the Bayesian identities in the
-notebook easier to read without hiding any statistical step.
+PyTorch and ``nflows`` details here makes the statistical identities in the
+notebooks easier to read without hiding any step.  Scalar flows also expose
+their analytic CDF and inverse-CDF through the standard-normal base.
 """
 
 from __future__ import annotations
@@ -24,6 +25,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from scipy.special import ndtr, ndtri
 from torch.utils.data import DataLoader, TensorDataset
 
 
@@ -84,8 +86,13 @@ def _build_quadratic_spline(
     spline_num_bins: int,
     spline_tail_bound: float,
     dropout_probability: float,
+    identity_initialization: bool = False,
 ) -> nn.Module:
     """Build the workshop rational-quadratic spline coupling flow."""
+    if identity_initialization and int(n_features) != 1:
+        raise ValueError(
+            "identity_initialization is implemented only for scalar flows."
+        )
     try:
         from nflows.distributions.normal import StandardNormal
         from nflows.flows.base import Flow
@@ -126,22 +133,36 @@ def _build_quadratic_spline(
             # identity layers.  The one-dimensional autoregressive transform
             # is the exact analogue in the same rational-quadratic-spline
             # family and can be conditioned on the supplied context.
-            transforms.append(
-                MaskedPiecewiseRationalQuadraticAutoregressiveTransform(
-                    features=1,
-                    hidden_features=hidden_features,
-                    context_features=(context_features or None),
-                    num_bins=spline_num_bins,
-                    tails="linear",
-                    tail_bound=spline_tail_bound,
-                    num_blocks=hidden_layers,
-                    activation=F.relu,
-                    dropout_probability=dropout_probability,
-                    use_batch_norm=False,
-                    use_residual_blocks=True,
-                    random_mask=False,
-                )
+            transform = MaskedPiecewiseRationalQuadraticAutoregressiveTransform(
+                features=1,
+                hidden_features=hidden_features,
+                context_features=(context_features or None),
+                num_bins=spline_num_bins,
+                tails="linear",
+                tail_bound=spline_tail_bound,
+                num_blocks=hidden_layers,
+                activation=F.relu,
+                dropout_probability=dropout_probability,
+                use_batch_norm=False,
+                use_residual_blocks=True,
+                random_mask=False,
             )
+            if identity_initialization:
+                # Equal bin widths/heights and unit derivatives make the RQS
+                # exactly the identity.  nflows pads the two linear-tail
+                # endpoint derivatives internally, so only K-1 interior
+                # derivative logits occur in the MADE output.
+                final_layer = transform.autoregressive_net.final_layer
+                derivative_logit = math.log(
+                    math.expm1(1.0 - transform.min_derivative)
+                )
+                with torch.no_grad():
+                    final_layer.weight.zero_()
+                    final_layer.bias.zero_()
+                    final_layer.bias[2 * spline_num_bins :].fill_(
+                        derivative_logit
+                    )
+            transforms.append(transform)
         else:
             mask = create_alternating_binary_mask(
                 features=n_features,
@@ -191,6 +212,9 @@ def _build_flow_from_config(
         spline_num_bins=int(config["spline_num_bins"]),
         spline_tail_bound=float(config["spline_tail_bound"]),
         dropout_probability=float(config.get("dropout_probability", 0.0)),
+        identity_initialization=bool(
+            config.get("identity_initialization", False)
+        ),
     )
     return flow.to(device)
 
@@ -241,6 +265,10 @@ def train_spline_flow(
 
     With ``verify_checkpoint_data=True``, a reusable checkpoint is bound to
     the exact target/context rows, seed, architecture, and training settings.
+    ``standardize_target=False`` keeps an already natural target coordinate
+    unchanged.  For a scalar linear-tail RQS, ``identity_initialization=True``
+    makes the initial transport exact identity; paired with the training flag
+    ``retain_initial_model=True``, that model remains a validation fallback.
     """
     checkpoint = _flow_checkpoint(checkpoint)
     if (
@@ -302,7 +330,13 @@ def train_spline_flow(
                 f"{checkpoint}"
             )
             return loaded
-    target_scaler = ArrayStandardizer.fit(target)
+    if bool(config.get("standardize_target", True)):
+        target_scaler = ArrayStandardizer.fit(target)
+    else:
+        target_scaler = ArrayStandardizer(
+            mean=np.zeros(target.shape[1], dtype=np.float32),
+            std=np.ones(target.shape[1], dtype=np.float32),
+        )
     target_scaled = target_scaler.transform(target)
     context_scaler = None
     if context is not None:
@@ -363,10 +397,41 @@ def train_spline_flow(
     n_epochs = int(training_config["n_epochs"])
     patience = int(training_config.get("patience", n_epochs))
     gradient_clip = float(training_config.get("gradient_clip", 5.0))
+    retain_initial_model = bool(
+        training_config.get("retain_initial_model", False)
+    )
+    minimum_validation_improvement = float(
+        training_config.get("minimum_validation_improvement", 1.0e-4)
+    )
+    if minimum_validation_improvement < 0.0:
+        raise ValueError("minimum_validation_improvement must be non-negative.")
     best_validation = math.inf
     best_state = None
     stale_epochs = 0
     history = {"train": [], "validation": []}
+
+    def validation_nll() -> float:
+        flow.eval()
+        losses = []
+        with torch.no_grad():
+            for batch in validation_loader:
+                target_batch = batch[0].to(device)
+                context_batch = batch[1].to(device) if len(batch) == 2 else None
+                loss = -flow.log_prob(
+                    target_batch, context=context_batch
+                ).mean()
+                losses.append(float(loss.detach().cpu()))
+        return float(np.mean(losses))
+
+    if retain_initial_model:
+        initial_validation = validation_nll()
+        best_validation = initial_validation
+        best_state = copy.deepcopy(flow.state_dict())
+        history["initial_validation"] = [initial_validation]
+        print(
+            "  retained initial flow as validation baseline: "
+            f"{initial_validation:.6f}"
+        )
 
     print(
         f"Training {'conditional' if context is not None else 'unconditional'} "
@@ -385,21 +450,13 @@ def train_spline_flow(
             optimizer.step()
             train_losses.append(float(loss.detach().cpu()))
 
-        flow.eval()
-        validation_losses = []
-        with torch.no_grad():
-            for batch in validation_loader:
-                target_batch = batch[0].to(device)
-                context_batch = batch[1].to(device) if len(batch) == 2 else None
-                loss = -flow.log_prob(target_batch, context=context_batch).mean()
-                validation_losses.append(float(loss.detach().cpu()))
         train_loss = float(np.mean(train_losses))
-        validation_loss = float(np.mean(validation_losses))
+        validation_loss = validation_nll()
         history["train"].append(train_loss)
         history["validation"].append(validation_loss)
         scheduler.step(validation_loss)
 
-        if validation_loss < best_validation - 1.0e-4:
+        if validation_loss < best_validation - minimum_validation_improvement:
             best_validation = validation_loss
             best_state = copy.deepcopy(flow.state_dict())
             stale_epochs = 0
@@ -416,6 +473,7 @@ def train_spline_flow(
     if best_state is not None:
         flow.load_state_dict(best_state)
     flow.eval()
+    history["selected_validation"] = [best_validation]
     torch.save(
         {
             "state_dict": flow.state_dict(),
@@ -477,6 +535,137 @@ def spline_flow_log_prob(
             target_tensor, context=context_tensor
         ).detach().cpu().numpy()
         chunks.append(log_probability + target_scaler.log_det_to_standard)
+    if not chunks:
+        return np.empty(0, dtype=np.float32)
+    return np.concatenate(chunks)
+
+
+@torch.no_grad()
+def scalar_spline_flow_cdf(
+    flow_pack: Mapping[str, Any],
+    target: np.ndarray,
+    *,
+    context: np.ndarray | None = None,
+    batch_size: int = 65_536,
+) -> np.ndarray:
+    """Evaluate the analytic CDF of a scalar standard-normal-base flow.
+
+    A one-dimensional rational-quadratic-spline flow is a monotone map from
+    its target coordinate to the standard-normal base coordinate.  If that
+    full data-to-base map is ``z = f(y; context)``, its conditional CDF is
+    simply ``Phi(z)``.  This helper includes the affine target and context
+    standardizers stored by :func:`train_spline_flow`.
+
+    The function is intentionally restricted to scalar targets.  In more
+    than one target dimension a normalizing flow still supplies a density,
+    but applying a component-wise base CDF would not be the joint CDF.
+    """
+
+    target = _as_2d_float32(target, "target")
+    if target.shape[1] != 1:
+        raise ValueError("scalar_spline_flow_cdf requires one target column.")
+    conditional = flow_pack["context_scaler"] is not None
+    if conditional:
+        if context is None:
+            raise ValueError("This flow requires context.")
+        context = _as_2d_float32(context, "context")
+        if len(context) != len(target):
+            raise ValueError("context must contain one row per target row.")
+    elif context is not None:
+        raise ValueError("This flow is unconditional; context must be None.")
+
+    flow = flow_pack["flow"]
+    device = next(flow.parameters()).device
+    target_scaler = flow_pack["target_scaler"]
+    context_scaler = flow_pack["context_scaler"]
+    flow.eval()
+    chunks = []
+    for start in range(0, len(target), int(batch_size)):
+        stop = start + int(batch_size)
+        target_tensor = torch.tensor(
+            target_scaler.transform(target[start:stop]),
+            dtype=torch.float32,
+            device=device,
+        )
+        context_tensor = None
+        if conditional:
+            context_tensor = torch.tensor(
+                context_scaler.transform(context[start:stop]),
+                dtype=torch.float32,
+                device=device,
+            )
+        base_coordinate = flow.transform_to_noise(
+            target_tensor, context=context_tensor
+        )
+        probability = ndtr(
+            base_coordinate[:, 0].detach().cpu().numpy().astype(np.float64)
+        )
+        chunks.append(probability)
+    if not chunks:
+        return np.empty(0, dtype=np.float32)
+    return np.concatenate(chunks)
+
+
+@torch.no_grad()
+def scalar_spline_flow_icdf(
+    flow_pack: Mapping[str, Any],
+    probability: np.ndarray,
+    *,
+    context: np.ndarray | None = None,
+    batch_size: int = 65_536,
+) -> np.ndarray:
+    """Analytically invert a scalar standard-normal-base flow CDF.
+
+    Probabilities are first mapped through ``Phi^{-1}``, then through the
+    inverse spline transport, and finally through the stored inverse target
+    standardization.  One context row is required per probability for a
+    conditional flow.
+    """
+
+    probability = np.asarray(probability, dtype=np.float64).reshape(-1)
+    if not np.isfinite(probability).all() or np.any(
+        (probability <= 0.0) | (probability >= 1.0)
+    ):
+        raise ValueError("probability must be finite and strictly in (0, 1).")
+    conditional = flow_pack["context_scaler"] is not None
+    if conditional:
+        if context is None:
+            raise ValueError("This flow requires context.")
+        context = _as_2d_float32(context, "context")
+        if len(context) != len(probability):
+            raise ValueError(
+                "context must contain one row per requested probability."
+            )
+    elif context is not None:
+        raise ValueError("This flow is unconditional; context must be None.")
+
+    flow = flow_pack["flow"]
+    device = next(flow.parameters()).device
+    target_scaler = flow_pack["target_scaler"]
+    context_scaler = flow_pack["context_scaler"]
+    flow.eval()
+    chunks = []
+    for start in range(0, len(probability), int(batch_size)):
+        stop = start + int(batch_size)
+        base_coordinate = torch.tensor(
+            ndtri(probability[start:stop])[:, None],
+            dtype=torch.float32,
+            device=device,
+        )
+        context_tensor = None
+        if conditional:
+            context_tensor = torch.tensor(
+                context_scaler.transform(context[start:stop]),
+                dtype=torch.float32,
+                device=device,
+            )
+        embedded_context = flow._embedding_net(context_tensor)
+        target_scaled, _ = flow._transform.inverse(
+            base_coordinate, context=embedded_context
+        )
+        chunks.append(
+            target_scaler.inverse(target_scaled.detach().cpu().numpy())[:, 0]
+        )
     if not chunks:
         return np.empty(0, dtype=np.float32)
     return np.concatenate(chunks)

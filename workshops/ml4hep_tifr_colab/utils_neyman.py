@@ -1642,6 +1642,12 @@ def load_coverage_auditor(
         "config": config,
         "history": saved.get("history", {}),
         "training_fingerprint": saved.get("training_fingerprint"),
+        "validation_indices": np.asarray(
+            saved.get("validation_indices", []), dtype=np.int64
+        ),
+        "test_indices": np.asarray(
+            saved.get("test_indices", []), dtype=np.int64
+        ),
         "checkpoint": checkpoint,
     }
 
@@ -1657,7 +1663,12 @@ def train_coverage_auditor(
     seed: int,
     load_if_available: bool = True,
 ) -> dict[str, Any]:
-    """Fit ``P(covered=1 | mu)`` with natural-frequency, unweighted BCE."""
+    """Fit ``P(covered=1 | mu)`` with natural-frequency, unweighted BCE.
+
+    Early stopping uses a validation split.  A second held-out test split is
+    stored in the checkpoint so the fitted curve can be compared with fixed
+    and constant predictors on rows that did not select the stopping epoch.
+    """
 
     checkpoint = Path(checkpoint)
     checkpoint.parent.mkdir(parents=True, exist_ok=True)
@@ -1667,14 +1678,29 @@ def train_coverage_auditor(
         raise ValueError("mu/covered must contain at least twenty matched rows.")
     if not np.isfinite(mu).all() or not np.isin(covered, [0.0, 1.0]).all():
         raise ValueError("mu must be finite and covered must be binary.")
-    training_fingerprint = _array_fingerprint(mu, covered)
+    fingerprint_configuration = json.dumps(
+        {
+            "model_config": dict(model_config),
+            "training_config": dict(training_config),
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    )
+    training_fingerprint = _array_fingerprint(
+        mu,
+        covered,
+        np.asarray([seed], dtype=np.int64),
+        np.asarray([fingerprint_configuration]),
+    )
     if load_if_available and checkpoint.exists():
         print(f"Loading coverage auditor from {checkpoint}")
         loaded = load_coverage_auditor(checkpoint, device)
         if loaded.get("training_fingerprint") != training_fingerprint:
             raise RuntimeError(
-                "The cached coverage auditor was trained on different audit "
-                "labels. Bump RUN_TAG or disable LOAD_IF_AVAILABLE."
+                "The cached coverage auditor used different rows, labels, "
+                "seed, or training settings. Use a new checkpoint path or "
+                "disable LOAD_IF_AVAILABLE."
             )
         configuration_mismatch = {
             name: (loaded["config"].get(name), expected)
@@ -1684,7 +1710,7 @@ def train_coverage_auditor(
         if configuration_mismatch:
             raise RuntimeError(
                 "The cached coverage auditor has a different architecture: "
-                f"{configuration_mismatch}. Bump RUN_TAG."
+                f"{configuration_mismatch}. Use a new checkpoint path."
             )
         return loaded
 
@@ -1693,14 +1719,26 @@ def train_coverage_auditor(
     validation_fraction = float(
         training_config.get("validation_fraction", 0.2)
     )
+    test_fraction = float(training_config.get("test_fraction", 0.2))
     if not 0.0 < validation_fraction < 1.0:
         raise ValueError("validation_fraction must be strictly between 0 and 1.")
+    if not 0.0 < test_fraction < 1.0:
+        raise ValueError("test_fraction must be strictly between 0 and 1.")
+    if validation_fraction + test_fraction >= 1.0:
+        raise ValueError(
+            "validation_fraction + test_fraction must be smaller than one."
+        )
     n_validation = min(
-        len(mu) - 1,
+        len(mu) - 2,
         max(1, int(round(validation_fraction * len(mu)))),
     )
+    n_test = min(
+        len(mu) - n_validation - 1,
+        max(1, int(round(test_fraction * len(mu)))),
+    )
     validation_indices = order[:n_validation]
-    training_indices = order[n_validation:]
+    test_indices = order[n_validation : n_validation + n_test]
+    training_indices = order[n_validation + n_test :]
     scaler = ArrayStandardizer.fit(mu[training_indices])
     mu_scaled = scaler.transform(mu)
     mu_tensor = torch.tensor(mu_scaled, dtype=torch.float32)
@@ -1802,6 +1840,13 @@ def train_coverage_auditor(
     if best_state is not None:
         model.load_state_dict(best_state)
     model.eval()
+    with torch.no_grad():
+        test_logits = model(mu_tensor[test_indices].to(device))
+        test_loss = float(F.binary_cross_entropy_with_logits(
+            test_logits,
+            covered_tensor[test_indices].to(device),
+        ).detach().cpu())
+    history["test"] = [test_loss]
     torch.save(
         {
             "state_dict": model.state_dict(),
@@ -1810,6 +1855,8 @@ def train_coverage_auditor(
             "std": scaler.std,
             "history": history,
             "training_fingerprint": training_fingerprint,
+            "validation_indices": validation_indices,
+            "test_indices": test_indices,
         },
         checkpoint,
     )
