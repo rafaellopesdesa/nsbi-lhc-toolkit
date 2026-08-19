@@ -133,25 +133,27 @@ def _build_quadratic_spline(
     *,
     n_features: int,
     context_features: int,
+    n_unbounded_affine_layers: int,
+    affine_hidden_features: int,
+    affine_hidden_layers: int,
+    use_layer_permutations: bool,
     n_coupling_layers: int,
     hidden_features: int,
     hidden_layers: int,
     spline_num_bins: int,
     spline_tail_bound: float,
     dropout_probability: float,
+    activation: str = "relu",
     identity_initialization: bool = False,
 ) -> nn.Module:
     """Build the workshop rational-quadratic spline coupling flow."""
-    if identity_initialization and int(n_features) != 1:
-        raise ValueError(
-            "identity_initialization is implemented only for scalar flows."
-        )
     try:
         from nflows.distributions.normal import StandardNormal
         from nflows.flows.base import Flow
         from nflows.nn.nets import ResidualNet
         from nflows.transforms.base import CompositeTransform
         from nflows.transforms.coupling import (
+            AffineCouplingTransform,
             PiecewiseRationalQuadraticCouplingTransform,
         )
         from nflows.transforms.autoregressive import (
@@ -165,6 +167,15 @@ def _build_quadratic_spline(
             "`pip install nflows`."
         ) from exc
 
+    activation_name = str(activation).lower()
+    activations = {"relu": F.relu, "silu": F.silu}
+    if activation_name not in activations:
+        raise ValueError(
+            "activation must be one of "
+            f"{sorted(activations)}; received {activation!r}."
+        )
+    activation_function = activations[activation_name]
+
     def make_net(in_features: int, out_features: int) -> nn.Module:
         return ResidualNet(
             in_features=in_features,
@@ -172,12 +183,72 @@ def _build_quadratic_spline(
             hidden_features=hidden_features,
             context_features=(context_features or None),
             num_blocks=hidden_layers,
-            activation=F.relu,
+            activation=activation_function,
             dropout_probability=dropout_probability,
             use_batch_norm=False,
         )
 
+    def make_affine_net(in_features: int, out_features: int) -> nn.Module:
+        return ResidualNet(
+            in_features=in_features,
+            out_features=out_features,
+            hidden_features=affine_hidden_features,
+            context_features=(context_features or None),
+            num_blocks=affine_hidden_layers,
+            activation=activation_function,
+            dropout_probability=dropout_probability,
+            use_batch_norm=False,
+        )
+
+    def initialize_affine_identity(transform: nn.Module) -> None:
+        """Initialize an nflows affine coupling close to the identity."""
+
+        final_layer = transform.transform_net.final_layer
+        n_transformed = int(final_layer.bias.numel() // 2)
+        # nflows uses scale=sigmoid(u+2)+1e-3.  This value gives scale=1.
+        scale_logit = math.log(0.999 / 0.001) - 2.0
+        with torch.no_grad():
+            final_layer.weight.zero_()
+            final_layer.bias.zero_()
+            final_layer.bias[n_transformed:].fill_(scale_logit)
+
+    def initialize_rqs_identity(transform: nn.Module) -> None:
+        """Initialize every coupling spline with equal bins and slope one."""
+
+        final_layer = transform.transform_net.final_layer
+        multiplier = 3 * spline_num_bins - 1
+        if final_layer.bias.numel() % multiplier:
+            raise RuntimeError("Unexpected nflows RQS coupling output shape.")
+        derivative_logit = math.log(
+            math.expm1(1.0 - transform.min_derivative)
+        )
+        with torch.no_grad():
+            final_layer.weight.zero_()
+            bias = final_layer.bias.view(-1, multiplier)
+            bias.zero_()
+            bias[:, 2 * spline_num_bins :].fill_(derivative_logit)
+
     transforms = []
+    if int(n_unbounded_affine_layers) and int(n_features) == 1:
+        raise ValueError(
+            "Unbounded affine coupling layers require at least two target "
+            "features. Keep n_unbounded_affine_layers=0 for scalar flows."
+        )
+    for layer_index in range(int(n_unbounded_affine_layers)):
+        mask = create_alternating_binary_mask(
+            features=n_features,
+            even=(layer_index % 2 == 0),
+        )
+        transform = AffineCouplingTransform(
+            mask=mask,
+            transform_net_create_fn=make_affine_net,
+        )
+        if identity_initialization:
+            initialize_affine_identity(transform)
+        transforms.append(transform)
+        if use_layer_permutations:
+            transforms.append(ReversePermutation(features=n_features))
+
     for layer_index in range(n_coupling_layers):
         if n_features == 1:
             # A coupling transform needs at least two target coordinates: one
@@ -194,7 +265,7 @@ def _build_quadratic_spline(
                 tails="linear",
                 tail_bound=spline_tail_bound,
                 num_blocks=hidden_layers,
-                activation=F.relu,
+                activation=activation_function,
                 dropout_probability=dropout_probability,
                 use_batch_norm=False,
                 use_residual_blocks=True,
@@ -221,17 +292,18 @@ def _build_quadratic_spline(
                 features=n_features,
                 even=(layer_index % 2 == 0),
             )
-            transforms.append(
-                PiecewiseRationalQuadraticCouplingTransform(
-                    mask=mask,
-                    transform_net_create_fn=make_net,
-                    num_bins=spline_num_bins,
-                    tails="linear",
-                    tail_bound=spline_tail_bound,
-                    apply_unconditional_transform=False,
-                )
+            transform = PiecewiseRationalQuadraticCouplingTransform(
+                mask=mask,
+                transform_net_create_fn=make_net,
+                num_bins=spline_num_bins,
+                tails="linear",
+                tail_bound=spline_tail_bound,
+                apply_unconditional_transform=False,
             )
-            if layer_index + 1 < n_coupling_layers:
+            if identity_initialization:
+                initialize_rqs_identity(transform)
+            transforms.append(transform)
+            if use_layer_permutations and layer_index + 1 < n_coupling_layers:
                 transforms.append(ReversePermutation(features=n_features))
 
     return Flow(
@@ -259,12 +331,29 @@ def _build_flow_from_config(
     flow = _build_quadratic_spline(
         n_features=int(config["n_features"]),
         context_features=int(config.get("context_features", 0)),
+        n_unbounded_affine_layers=int(
+            config.get("n_unbounded_affine_layers", 0)
+        ),
+        affine_hidden_features=int(
+            config.get("affine_hidden_features", config["hidden_features"])
+        ),
+        affine_hidden_layers=int(
+            config.get("affine_hidden_layers", config["hidden_layers"])
+        ),
+        # Historical workshop checkpoints used both alternating masks and
+        # reversals.  Keep that topology as the default so those state dicts
+        # remain loadable; newer architectures can disable the redundant
+        # permutations and obtain a pointwise-identity initialization.
+        use_layer_permutations=bool(
+            config.get("use_layer_permutations", True)
+        ),
         n_coupling_layers=int(config["n_coupling_layers"]),
         hidden_features=int(config["hidden_features"]),
         hidden_layers=int(config["hidden_layers"]),
         spline_num_bins=int(config["spline_num_bins"]),
         spline_tail_bound=float(config["spline_tail_bound"]),
         dropout_probability=float(config.get("dropout_probability", 0.0)),
+        activation=str(config.get("activation", "relu")),
         identity_initialization=bool(
             config.get("identity_initialization", False)
         ),
@@ -461,25 +550,29 @@ def train_spline_flow(
     best_validation = math.inf
     best_state = None
     stale_epochs = 0
-    history = {"train": [], "validation": []}
+    history = {"train": [], "validation": [], "learning_rate": []}
+    best_epoch = 0
 
     def validation_nll() -> float:
         flow.eval()
-        losses = []
+        loss_sum = 0.0
+        row_count = 0
         with torch.no_grad():
             for batch in validation_loader:
                 target_batch = batch[0].to(device)
                 context_batch = batch[1].to(device) if len(batch) == 2 else None
-                loss = -flow.log_prob(
+                losses = -flow.log_prob(
                     target_batch, context=context_batch
-                ).mean()
-                losses.append(float(loss.detach().cpu()))
-        return float(np.mean(losses))
+                )
+                loss_sum += float(losses.sum().detach().cpu())
+                row_count += int(len(target_batch))
+        return loss_sum / max(1, row_count)
 
     if retain_initial_model:
         initial_validation = validation_nll()
         best_validation = initial_validation
         best_state = copy.deepcopy(flow.state_dict())
+        best_epoch = 0
         history["initial_validation"] = [initial_validation]
         print(
             "  retained initial flow as validation baseline: "
@@ -492,7 +585,8 @@ def train_spline_flow(
     )
     for epoch in range(1, n_epochs + 1):
         flow.train()
-        train_losses = []
+        train_loss_sum = 0.0
+        train_row_count = 0
         for batch in training_loader:
             target_batch = batch[0].to(device)
             context_batch = batch[1].to(device) if len(batch) == 2 else None
@@ -501,17 +595,20 @@ def train_spline_flow(
             loss.backward()
             torch.nn.utils.clip_grad_norm_(flow.parameters(), gradient_clip)
             optimizer.step()
-            train_losses.append(float(loss.detach().cpu()))
+            train_loss_sum += float(loss.detach().cpu()) * len(target_batch)
+            train_row_count += int(len(target_batch))
 
-        train_loss = float(np.mean(train_losses))
+        train_loss = train_loss_sum / max(1, train_row_count)
         validation_loss = validation_nll()
         history["train"].append(train_loss)
         history["validation"].append(validation_loss)
+        history["learning_rate"].append(optimizer.param_groups[0]["lr"])
         scheduler.step(validation_loss)
 
         if validation_loss < best_validation - minimum_validation_improvement:
             best_validation = validation_loss
             best_state = copy.deepcopy(flow.state_dict())
+            best_epoch = epoch
             stale_epochs = 0
         else:
             stale_epochs += 1
@@ -527,6 +624,7 @@ def train_spline_flow(
         flow.load_state_dict(best_state)
     flow.eval()
     history["selected_validation"] = [best_validation]
+    history["selected_epoch"] = [best_epoch]
     torch.save(
         {
             "state_dict": flow.state_dict(),
