@@ -66,6 +66,59 @@ def _as_2d_float32(values: np.ndarray, name: str) -> np.ndarray:
     return values
 
 
+def _as_2d_floating(
+    values: np.ndarray, name: str, dtype: np.dtype,
+) -> np.ndarray:
+    """Validate a two-dimensional floating array without forcing float32."""
+
+    values = np.asarray(values, dtype=dtype)
+    if values.ndim != 2:
+        raise ValueError(f"{name} must be a two-dimensional array.")
+    if len(values) and not np.isfinite(values).all():
+        raise ValueError(f"{name} contains non-finite values.")
+    return values
+
+
+def _flow_evaluation_dtypes(flow: nn.Module) -> tuple[torch.dtype, np.dtype]:
+    """Return matching Torch/NumPy dtypes for scalar-flow evaluation."""
+
+    torch_dtype = next(flow.parameters()).dtype
+    if torch_dtype == torch.float32:
+        return torch_dtype, np.dtype(np.float32)
+    if torch_dtype == torch.float64:
+        return torch_dtype, np.dtype(np.float64)
+    raise TypeError(
+        "Scalar spline CDF evaluation supports float32 or float64 flows; "
+        f"received {torch_dtype}."
+    )
+
+
+def _standardizer_transform(
+    standardizer: ArrayStandardizer,
+    values: np.ndarray,
+    dtype: np.dtype,
+) -> np.ndarray:
+    """Apply a stored affine standardizer in a requested inference dtype."""
+
+    values = np.asarray(values, dtype=dtype)
+    mean = np.asarray(standardizer.mean, dtype=dtype)
+    std = np.asarray(standardizer.std, dtype=dtype)
+    return (values - mean) / std
+
+
+def _standardizer_inverse(
+    standardizer: ArrayStandardizer,
+    values: np.ndarray,
+    dtype: np.dtype,
+) -> np.ndarray:
+    """Invert a stored affine standardizer in a requested inference dtype."""
+
+    values = np.asarray(values, dtype=dtype)
+    mean = np.asarray(standardizer.mean, dtype=dtype)
+    std = np.asarray(standardizer.std, dtype=dtype)
+    return values * std + mean
+
+
 def _array_fingerprint(*arrays: np.ndarray) -> str:
     digest = hashlib.sha256()
     for values in arrays:
@@ -554,27 +607,30 @@ def scalar_spline_flow_cdf(
     its target coordinate to the standard-normal base coordinate.  If that
     full data-to-base map is ``z = f(y; context)``, its conditional CDF is
     simply ``Phi(z)``.  This helper includes the affine target and context
-    standardizers stored by :func:`train_spline_flow`.
+    standardizers stored by :func:`train_spline_flow`.  Evaluation follows
+    the flow parameter dtype, so promoting a fitted scalar flow to float64
+    also promotes its complete CDF path without refitting its standardizers.
 
     The function is intentionally restricted to scalar targets.  In more
     than one target dimension a normalizing flow still supplies a density,
     but applying a component-wise base CDF would not be the joint CDF.
     """
 
-    target = _as_2d_float32(target, "target")
+    flow = flow_pack["flow"]
+    torch_dtype, numpy_dtype = _flow_evaluation_dtypes(flow)
+    target = _as_2d_floating(target, "target", numpy_dtype)
     if target.shape[1] != 1:
         raise ValueError("scalar_spline_flow_cdf requires one target column.")
     conditional = flow_pack["context_scaler"] is not None
     if conditional:
         if context is None:
             raise ValueError("This flow requires context.")
-        context = _as_2d_float32(context, "context")
+        context = _as_2d_floating(context, "context", numpy_dtype)
         if len(context) != len(target):
             raise ValueError("context must contain one row per target row.")
     elif context is not None:
         raise ValueError("This flow is unconditional; context must be None.")
 
-    flow = flow_pack["flow"]
     device = next(flow.parameters()).device
     target_scaler = flow_pack["target_scaler"]
     context_scaler = flow_pack["context_scaler"]
@@ -583,15 +639,19 @@ def scalar_spline_flow_cdf(
     for start in range(0, len(target), int(batch_size)):
         stop = start + int(batch_size)
         target_tensor = torch.tensor(
-            target_scaler.transform(target[start:stop]),
-            dtype=torch.float32,
+            _standardizer_transform(
+                target_scaler, target[start:stop], numpy_dtype
+            ),
+            dtype=torch_dtype,
             device=device,
         )
         context_tensor = None
         if conditional:
             context_tensor = torch.tensor(
-                context_scaler.transform(context[start:stop]),
-                dtype=torch.float32,
+                _standardizer_transform(
+                    context_scaler, context[start:stop], numpy_dtype
+                ),
+                dtype=torch_dtype,
                 device=device,
             )
         base_coordinate = flow.transform_to_noise(
@@ -602,7 +662,7 @@ def scalar_spline_flow_cdf(
         )
         chunks.append(probability)
     if not chunks:
-        return np.empty(0, dtype=np.float32)
+        return np.empty(0, dtype=numpy_dtype)
     return np.concatenate(chunks)
 
 
@@ -619,7 +679,8 @@ def scalar_spline_flow_icdf(
     Probabilities are first mapped through ``Phi^{-1}``, then through the
     inverse spline transport, and finally through the stored inverse target
     standardization.  One context row is required per probability for a
-    conditional flow.
+    conditional flow.  As for :func:`scalar_spline_flow_cdf`, all arithmetic
+    follows the fitted flow's current float32 or float64 parameter dtype.
     """
 
     probability = np.asarray(probability, dtype=np.float64).reshape(-1)
@@ -627,11 +688,13 @@ def scalar_spline_flow_icdf(
         (probability <= 0.0) | (probability >= 1.0)
     ):
         raise ValueError("probability must be finite and strictly in (0, 1).")
+    flow = flow_pack["flow"]
+    torch_dtype, numpy_dtype = _flow_evaluation_dtypes(flow)
     conditional = flow_pack["context_scaler"] is not None
     if conditional:
         if context is None:
             raise ValueError("This flow requires context.")
-        context = _as_2d_float32(context, "context")
+        context = _as_2d_floating(context, "context", numpy_dtype)
         if len(context) != len(probability):
             raise ValueError(
                 "context must contain one row per requested probability."
@@ -639,7 +702,6 @@ def scalar_spline_flow_icdf(
     elif context is not None:
         raise ValueError("This flow is unconditional; context must be None.")
 
-    flow = flow_pack["flow"]
     device = next(flow.parameters()).device
     target_scaler = flow_pack["target_scaler"]
     context_scaler = flow_pack["context_scaler"]
@@ -649,14 +711,16 @@ def scalar_spline_flow_icdf(
         stop = start + int(batch_size)
         base_coordinate = torch.tensor(
             ndtri(probability[start:stop])[:, None],
-            dtype=torch.float32,
+            dtype=torch_dtype,
             device=device,
         )
         context_tensor = None
         if conditional:
             context_tensor = torch.tensor(
-                context_scaler.transform(context[start:stop]),
-                dtype=torch.float32,
+                _standardizer_transform(
+                    context_scaler, context[start:stop], numpy_dtype
+                ),
+                dtype=torch_dtype,
                 device=device,
             )
         embedded_context = flow._embedding_net(context_tensor)
@@ -664,10 +728,14 @@ def scalar_spline_flow_icdf(
             base_coordinate, context=embedded_context
         )
         chunks.append(
-            target_scaler.inverse(target_scaled.detach().cpu().numpy())[:, 0]
+            _standardizer_inverse(
+                target_scaler,
+                target_scaled.detach().cpu().numpy(),
+                numpy_dtype,
+            )[:, 0]
         )
     if not chunks:
-        return np.empty(0, dtype=np.float32)
+        return np.empty(0, dtype=numpy_dtype)
     return np.concatenate(chunks)
 
 
