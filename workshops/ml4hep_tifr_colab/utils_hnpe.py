@@ -19,14 +19,139 @@ import json
 import math
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from scipy.special import ndtr, ndtri
+from scipy.special import logsumexp, ndtr, ndtri
 from torch.utils.data import DataLoader, TensorDataset
+
+
+def install_nflows_rqs_float64_retry(
+    *, required_version: str = "0.14",
+):
+    """Install the audited finite-tensor inverse-RQS precision retry.
+
+    ``nflows==0.14`` can evaluate a nearly double inverse-spline root with a
+    tiny negative discriminant in float32.  The wrapped kernel retries only
+    that failed inverse call, with the same finite tensors in float64.  It
+    never clips, drops, or resamples a row, and a float64 failure remains
+    fatal.  Repeated installation is idempotent across the Exercise 9 guards.
+    """
+
+    import functools
+    import importlib
+    import inspect
+    from importlib.metadata import version
+    import warnings
+
+    installed_version = version("nflows")
+    if installed_version != str(required_version):
+        raise RuntimeError(
+            "The audited inverse-RQS guard requires "
+            f"nflows=={required_version}; found {installed_version}."
+        )
+    module = importlib.import_module(
+        "nflows.transforms.splines.rational_quadratic"
+    )
+    original = module.rational_quadratic_spline
+    existing_flags = (
+        "_hybrid_float64_retry",
+        "_exercise9_float64_retry",
+        "_ex9b_float64_retry",
+    )
+    if any(getattr(original, flag, False) for flag in existing_flags):
+        return original
+    signature = inspect.signature(original)
+
+    @functools.wraps(original)
+    def guarded(*args, **kwargs):
+        try:
+            return original(*args, **kwargs)
+        except AssertionError as error32:
+            bound = signature.bind(*args, **kwargs)
+            inputs = bound.arguments["inputs"]
+            inverse = bound.arguments.get(
+                "inverse", signature.parameters["inverse"].default
+            )
+            if not inverse or inputs.dtype != torch.float32:
+                raise
+            floating = [
+                value
+                for value in (*args, *kwargs.values())
+                if torch.is_tensor(value) and value.is_floating_point()
+            ]
+            if any(not bool(torch.isfinite(value).all()) for value in floating):
+                raise FloatingPointError(
+                    "Non-finite tensor reached the inverse RQS; refusing the "
+                    "precision retry."
+                ) from error32
+
+            def to_float64(value):
+                if torch.is_tensor(value) and value.is_floating_point():
+                    return value.to(dtype=torch.float64)
+                return value
+
+            try:
+                outputs64, logdet64 = original(
+                    *(to_float64(value) for value in args),
+                    **{
+                        name: to_float64(value)
+                        for name, value in kwargs.items()
+                    },
+                )
+            except AssertionError as error64:
+                raise RuntimeError(
+                    "The inverse-RQS discriminant also failed in float64; "
+                    "retrain this flow."
+                ) from error64
+            if not (
+                bool(torch.isfinite(outputs64).all())
+                and bool(torch.isfinite(logdet64).all())
+            ):
+                raise FloatingPointError(
+                    "The float64 inverse-RQS retry returned non-finite values."
+                ) from error32
+            guarded.retry_count += 1
+            if guarded.retry_count == 1:
+                warnings.warn(
+                    "nflows float32 inverse-RQS cancellation: retrying the "
+                    "same spline call in float64.",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+            outputs = outputs64.to(dtype=inputs.dtype)
+            logdet = logdet64.to(dtype=inputs.dtype)
+            if not (
+                bool(torch.isfinite(outputs).all())
+                and bool(torch.isfinite(logdet).all())
+            ):
+                raise FloatingPointError(
+                    "Casting the inverse-RQS retry back to float32 produced "
+                    "non-finite values."
+                ) from error32
+            return outputs, logdet
+
+    guarded._hybrid_float64_retry = True
+    guarded.retry_count = 0
+    guarded._float32_original = original
+    module.rational_quadratic_spline = guarded
+    importlib.import_module(
+        "nflows.transforms.splines"
+    ).rational_quadratic_spline = guarded
+    importlib.import_module(
+        "nflows.transforms.autoregressive"
+    ).rational_quadratic_spline = guarded
+    linear_tail = importlib.import_module(
+        "nflows.transforms.splines"
+    ).unconstrained_rational_quadratic_spline
+    if linear_tail.__globals__.get("rational_quadratic_spline") is not guarded:
+        raise RuntimeError(
+            "The nflows linear-tail inverse did not bind to the audited guard."
+        )
+    return guarded
 
 
 @dataclass
@@ -145,8 +270,16 @@ def _build_quadratic_spline(
     dropout_probability: float,
     activation: str = "relu",
     identity_initialization: bool = False,
+    linear_mixing: str = "none",
 ) -> nn.Module:
-    """Build the workshop rational-quadratic spline coupling flow."""
+    """Build the workshop rational-quadratic spline coupling flow.
+
+    ``linear_mixing="lu"`` inserts a learned invertible LU map after every
+    vector coupling.  It is an opt-in upgrade over Exercise 10's fixed
+    permutations, so historical workshop checkpoints remain loadable.
+    Scalar flows retain their monotone autoregressive construction: an LU map
+    in one dimension adds no useful coordinate mixing.
+    """
     try:
         from nflows.distributions.normal import StandardNormal
         from nflows.flows.base import Flow
@@ -160,6 +293,7 @@ def _build_quadratic_spline(
             MaskedPiecewiseRationalQuadraticAutoregressiveTransform,
         )
         from nflows.transforms.permutations import ReversePermutation
+        from nflows.transforms.lu import LULinear
         from nflows.utils.torchutils import create_alternating_binary_mask
     except ImportError as exc:
         raise ImportError(
@@ -175,6 +309,17 @@ def _build_quadratic_spline(
             f"{sorted(activations)}; received {activation!r}."
         )
     activation_function = activations[activation_name]
+    linear_mixing = str(linear_mixing).lower()
+    if linear_mixing not in {"none", "lu"}:
+        raise ValueError(
+            "linear_mixing must be 'none' or 'lu'; "
+            f"received {linear_mixing!r}."
+        )
+    if linear_mixing == "lu" and use_layer_permutations:
+        raise ValueError(
+            "Choose either learned LU mixing or fixed layer permutations, "
+            "not both."
+        )
 
     def make_net(in_features: int, out_features: int) -> nn.Module:
         return ResidualNet(
@@ -246,7 +391,9 @@ def _build_quadratic_spline(
         if identity_initialization:
             initialize_affine_identity(transform)
         transforms.append(transform)
-        if use_layer_permutations:
+        if linear_mixing == "lu":
+            transforms.append(LULinear(int(n_features), identity_init=True))
+        elif use_layer_permutations:
             transforms.append(ReversePermutation(features=n_features))
 
     for layer_index in range(n_coupling_layers):
@@ -303,7 +450,11 @@ def _build_quadratic_spline(
             if identity_initialization:
                 initialize_rqs_identity(transform)
             transforms.append(transform)
-            if use_layer_permutations and layer_index + 1 < n_coupling_layers:
+            if linear_mixing == "lu":
+                transforms.append(
+                    LULinear(int(n_features), identity_init=True)
+                )
+            elif use_layer_permutations and layer_index + 1 < n_coupling_layers:
                 transforms.append(ReversePermutation(features=n_features))
 
     return Flow(
@@ -357,6 +508,7 @@ def _build_flow_from_config(
         identity_initialization=bool(
             config.get("identity_initialization", False)
         ),
+        linear_mixing=str(config.get("linear_mixing", "none")),
     )
     return flow.to(device)
 
@@ -909,6 +1061,330 @@ def sample_spline_flow(
         )
         chunks.append(values)
     return np.concatenate(chunks, axis=0)
+
+
+def train_spline_flow_ensemble(
+    target: np.ndarray,
+    *,
+    context: np.ndarray | None,
+    checkpoint: str | Path,
+    ensemble_size: int,
+    model_config: Mapping[str, Any],
+    training_config: Mapping[str, Any],
+    device: torch.device,
+    seed: int,
+    load_if_available: bool = True,
+    verify_checkpoint_data: bool = False,
+) -> list[dict[str, Any]]:
+    """Train independent flow members representing an equal-weight mixture.
+
+    A member index is inserted before the checkpoint suffix.  Every member
+    retains :func:`train_spline_flow`'s exact data/config fingerprint while
+    receiving an independent initialization, data split, and shuffle seed.
+    The returned object is intentionally a plain list: mixture density and
+    sampling semantics are supplied by the explicit helpers below.
+    """
+
+    ensemble_size = int(ensemble_size)
+    if ensemble_size < 1:
+        raise ValueError("ensemble_size must be positive.")
+    checkpoint = Path(checkpoint)
+    suffix = checkpoint.suffix or ".pt"
+    stem = checkpoint.stem if checkpoint.suffix else checkpoint.name
+    parent = checkpoint.parent
+    members = []
+    for member_index in range(ensemble_size):
+        member_seed = int(seed) + 10_007 * member_index
+        torch.manual_seed(member_seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(member_seed)
+        member_checkpoint = parent / (
+            f"{stem}.member_{member_index:02d}{suffix}"
+        )
+        print(
+            f"Flow-mixture member {member_index + 1}/{ensemble_size}: "
+            f"{member_checkpoint}"
+        )
+        members.append(
+            train_spline_flow(
+                target,
+                context=context,
+                checkpoint=member_checkpoint,
+                model_config=model_config,
+                training_config=training_config,
+                device=device,
+                seed=member_seed,
+                load_if_available=load_if_available,
+                verify_checkpoint_data=verify_checkpoint_data,
+            )
+        )
+    return members
+
+
+def _validate_flow_ensemble(
+    flow_packs: Sequence[Mapping[str, Any]],
+) -> list[Mapping[str, Any]]:
+    members = list(flow_packs)
+    if not members:
+        raise ValueError("A flow ensemble must contain at least one member.")
+    target_dims = {
+        int(np.asarray(member["target_scaler"].mean).size)
+        for member in members
+    }
+    conditional = {
+        member["context_scaler"] is not None for member in members
+    }
+    context_dims = {
+        0
+        if member["context_scaler"] is None
+        else int(np.asarray(member["context_scaler"].mean).size)
+        for member in members
+    }
+    configurations = {
+        json.dumps(dict(member.get("config", {})), sort_keys=True, default=str)
+        for member in members
+    }
+    if (
+        len(target_dims) != 1
+        or len(conditional) != 1
+        or len(context_dims) != 1
+        or len(configurations) != 1
+    ):
+        raise ValueError(
+            "Every flow-mixture member must have matching target/context "
+            "dimensions and architecture configuration."
+        )
+    return members
+
+
+def spline_flow_ensemble_log_prob(
+    flow_packs: Sequence[Mapping[str, Any]],
+    target: np.ndarray,
+    *,
+    context: np.ndarray | None = None,
+    batch_size: int = 65_536,
+) -> np.ndarray:
+    """Evaluate the equal-weight mixture density in log space."""
+
+    members = _validate_flow_ensemble(flow_packs)
+    member_log_probabilities = np.stack(
+        [
+            spline_flow_log_prob(
+                member,
+                target,
+                context=context,
+                batch_size=batch_size,
+            )
+            for member in members
+        ],
+        axis=0,
+    )
+    return logsumexp(member_log_probabilities, axis=0) - math.log(len(members))
+
+
+def scalar_spline_flow_ensemble_cdf(
+    flow_packs: Sequence[Mapping[str, Any]],
+    target: np.ndarray,
+    *,
+    context: np.ndarray | None = None,
+    batch_size: int = 65_536,
+) -> np.ndarray:
+    """Evaluate the CDF of an equal-weight scalar-flow mixture."""
+
+    members = _validate_flow_ensemble(flow_packs)
+    probabilities = np.stack(
+        [
+            scalar_spline_flow_cdf(
+                member,
+                target,
+                context=context,
+                batch_size=batch_size,
+            )
+            for member in members
+        ],
+        axis=0,
+    )
+    return probabilities.mean(axis=0)
+
+
+def scalar_spline_flow_ensemble_icdf(
+    flow_packs: Sequence[Mapping[str, Any]],
+    probability: np.ndarray,
+    *,
+    context: np.ndarray | None = None,
+    batch_size: int = 65_536,
+    tolerance: float = 2.0e-7,
+    max_iterations: int = 80,
+) -> np.ndarray:
+    """Numerically invert an equal-weight scalar-flow mixture CDF.
+
+    A mixture of monotone flows has an analytic CDF but generally no closed
+    inverse.  Brackets are expanded using only the fitted flows, followed by
+    vectorized bisection.  This routine is intended for audits and quantiles;
+    ordinary draws should use :func:`sample_spline_flow_ensemble`.
+    """
+
+    members = _validate_flow_ensemble(flow_packs)
+    probability = np.asarray(probability, dtype=np.float64).reshape(-1)
+    if not np.isfinite(probability).all() or np.any(
+        (probability <= 0.0) | (probability >= 1.0)
+    ):
+        raise ValueError("probability must be finite and strictly in (0, 1).")
+    conditional = members[0]["context_scaler"] is not None
+    if conditional:
+        if context is None:
+            raise ValueError("This flow mixture requires context.")
+        context = _as_2d_float32(context, "context")
+        if len(context) != len(probability):
+            raise ValueError(
+                "context must contain one row per requested probability."
+            )
+    elif context is not None:
+        raise ValueError("This flow mixture is unconditional; context must be None.")
+
+    means = np.asarray(
+        [float(member["target_scaler"].mean[0]) for member in members]
+    )
+    scales = np.asarray(
+        [float(member["target_scaler"].std[0]) for member in members]
+    )
+    center = float(np.median(means))
+    radius = max(8.0, float(np.max(np.abs(means - center) + 12.0 * scales)))
+    lower = np.full(len(probability), center - radius, dtype=np.float64)
+    upper = np.full(len(probability), center + radius, dtype=np.float64)
+
+    def mixture_cdf(values: np.ndarray) -> np.ndarray:
+        return scalar_spline_flow_ensemble_cdf(
+            members,
+            np.asarray(values, dtype=np.float32)[:, None],
+            context=context,
+            batch_size=batch_size,
+        ).astype(np.float64)
+
+    for _ in range(16):
+        low_bad = mixture_cdf(lower) > probability
+        high_bad = mixture_cdf(upper) < probability
+        if not (np.any(low_bad) or np.any(high_bad)):
+            break
+        width = upper - lower
+        lower[low_bad] -= width[low_bad]
+        upper[high_bad] += width[high_bad]
+    else:
+        raise RuntimeError("Could not bracket every requested mixture quantile.")
+
+    for _ in range(int(max_iterations)):
+        midpoint = 0.5 * (lower + upper)
+        below = mixture_cdf(midpoint) < probability
+        lower[below] = midpoint[below]
+        upper[~below] = midpoint[~below]
+        if float(np.max(upper - lower, initial=0.0)) <= float(tolerance):
+            break
+    return 0.5 * (lower + upper)
+
+
+def sample_spline_flow_ensemble(
+    flow_packs: Sequence[Mapping[str, Any]],
+    n_samples: int,
+    *,
+    context: np.ndarray | None = None,
+    seed: int,
+    batch_size: int = 16_384,
+    allocation: str = "balanced",
+) -> np.ndarray:
+    """Draw from an equal-weight flow mixture.
+
+    ``allocation="balanced"`` randomizes member labels while making their
+    per-context counts differ by at most one.  Every individual draw has the
+    correct mixture marginal and conditional-moment banks get lower component
+    allocation noise, but draws within one context are not IID.
+
+    ``allocation="iid"`` uses independent uniform categorical labels.  Use
+    this mode whenever an ordinary IID sample-variance formula is required,
+    notably for the raw-evidence bridge loss.  Shapes match
+    :func:`sample_spline_flow`.  Torch RNG state is restored on return.
+    """
+
+    members = _validate_flow_ensemble(flow_packs)
+    n_samples = int(n_samples)
+    if n_samples < 1:
+        raise ValueError("n_samples must be positive.")
+    allocation = str(allocation).lower()
+    if allocation not in {"balanced", "iid"}:
+        raise ValueError("allocation must be 'balanced' or 'iid'.")
+    conditional = members[0]["context_scaler"] is not None
+    if conditional:
+        if context is None:
+            raise ValueError("This flow mixture requires context.")
+        context_rows = _as_2d_float32(context, "context")
+    else:
+        if context is not None:
+            raise ValueError(
+                "This flow mixture is unconditional; context must be None."
+            )
+        context_rows = np.empty((1, 0), dtype=np.float32)
+
+    rng = np.random.default_rng(int(seed))
+    n_context = len(context_rows)
+    n_members = len(members)
+    if allocation == "iid":
+        assignments = rng.integers(
+            0, n_members, size=(n_context, n_samples), dtype=np.int64
+        )
+    elif n_samples == 1:
+        # The one-draw class-building path can contain O(10^6) contexts.
+        assignments = rng.integers(
+            0, n_members, size=(n_context, 1), dtype=np.int64
+        )
+    else:
+        assignments = np.empty((n_context, n_samples), dtype=np.int64)
+        base_count, remainder = divmod(n_samples, n_members)
+        for row in range(n_context):
+            labels = np.repeat(np.arange(n_members), base_count)
+            if remainder:
+                labels = np.concatenate(
+                    [labels, rng.permutation(n_members)[:remainder]]
+                )
+            rng.shuffle(labels)
+            assignments[row] = labels
+
+    n_features = int(np.asarray(members[0]["target_scaler"].mean).size)
+    output = np.empty((n_context, n_samples, n_features), dtype=np.float32)
+    cpu_rng_state = torch.random.get_rng_state()
+    cuda_rng_states = (
+        torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
+    )
+    try:
+        torch.manual_seed(int(seed))
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(int(seed))
+        for member_index, member in enumerate(members):
+            counts = np.sum(assignments == member_index, axis=1)
+            for count in np.unique(counts):
+                count = int(count)
+                if count == 0:
+                    continue
+                rows = np.flatnonzero(counts == count)
+                member_context = context_rows[rows] if conditional else None
+                values = sample_spline_flow(
+                    member,
+                    count,
+                    context=member_context,
+                    batch_size=batch_size,
+                )
+                if len(rows) == 1:
+                    values = np.asarray(values)[None, :, :]
+                positions = np.nonzero(
+                    assignments[rows] == member_index
+                )[1].reshape(len(rows), count)
+                output[rows[:, None], positions, :] = values
+    finally:
+        torch.random.set_rng_state(cpu_rng_state)
+        if cuda_rng_states is not None:
+            torch.cuda.set_rng_state_all(cuda_rng_states)
+
+    if not conditional or n_context == 1:
+        return output[0]
+    return output
 
 
 class _RatioMLP(nn.Module):

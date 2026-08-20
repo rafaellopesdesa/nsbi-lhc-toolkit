@@ -18,6 +18,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib.collections import Collection, LineCollection, PathCollection
 from matplotlib.contour import ContourSet
+from matplotlib.image import AxesImage
 from matplotlib.lines import Line2D
 from matplotlib.patches import Polygon, Rectangle, StepPatch
 from matplotlib.text import Text
@@ -340,6 +341,57 @@ def export_standalone_figure_script(
                         ]
                     )
 
+            elif isinstance(artist, AxesImage):
+                # ``imshow`` artists are not Collections and were previously
+                # omitted from standalone reconstructions.  Store the exact
+                # resolved image array and the public display parameters used
+                # by the paper-oriented heat maps.
+                image_array = np.ma.asarray(artist.get_array())
+                if np.ma.isMaskedArray(image_array):
+                    image_array = image_array.filled(np.nan)
+                image_ref = store_array(
+                    np.asarray(image_array), f"ax{axis_index}_image"
+                )
+                extent = tuple(float(value) for value in artist.get_extent())
+                kwargs = {
+                    "origin": artist.origin,
+                    "extent": extent,
+                    "interpolation": artist.get_interpolation(),
+                    "cmap": artist.get_cmap().name,
+                    "aspect": ax.get_aspect(),
+                    "zorder": float(artist.get_zorder()),
+                }
+                vmin, vmax = artist.get_clim()
+                if vmin is not None:
+                    kwargs["vmin"] = float(vmin)
+                if vmax is not None:
+                    kwargs["vmax"] = float(vmax)
+                alpha = artist.get_alpha()
+                if alpha is not None:
+                    if np.ndim(alpha) == 0:
+                        kwargs["alpha"] = float(alpha)
+                    else:
+                        alpha_ref = store_array(
+                            alpha, f"ax{axis_index}_image_alpha"
+                        )
+                        kwargs["alpha"] = f"__ARRAY__:{alpha_ref}"
+                label = _public_artist_label(artist)
+                if label is not None:
+                    kwargs["label"] = label
+                rendered_kwargs = []
+                for key, value in kwargs.items():
+                    if isinstance(value, str) and value.startswith("__ARRAY__:"):
+                        rendered_kwargs.append(
+                            f"{key}={value.removeprefix('__ARRAY__:')}"
+                        )
+                    else:
+                        rendered_kwargs.append(f"{key}={value!r}")
+                lines.append(
+                    f"_image = {axis_name}.imshow({image_ref}, "
+                    + ", ".join(rendered_kwargs)
+                    + ")"
+                )
+
             elif isinstance(artist, PathCollection):
                 offsets = np.asarray(artist.get_offsets())
                 if offsets.ndim != 2 or offsets.shape[1] != 2:
@@ -618,10 +670,18 @@ def export_standalone_figure_script(
 
         for spine_name, spine in ax.spines.items():
             if not spine.get_visible():
-                lines.append(f"{axis_name}.spines[{spine_name!r}].set_visible(False)")
+                lines.extend(
+                    [
+                        f"if {spine_name!r} in {axis_name}.spines:",
+                        f"    {axis_name}.spines[{spine_name!r}].set_visible(False)",
+                    ]
+                )
             else:
-                lines.append(
-                    f"{axis_name}.spines[{spine_name!r}].set_linewidth({float(spine.get_linewidth())!r})"
+                lines.extend(
+                    [
+                        f"if {spine_name!r} in {axis_name}.spines:",
+                        f"    {axis_name}.spines[{spine_name!r}].set_linewidth({float(spine.get_linewidth())!r})",
+                    ]
                 )
 
         legend = ax.get_legend()
