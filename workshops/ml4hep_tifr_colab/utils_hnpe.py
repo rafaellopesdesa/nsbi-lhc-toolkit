@@ -676,20 +676,58 @@ def train_spline_flow(
     )
 
     flow = _build_flow_from_config(config, device)
-    optimizer = torch.optim.AdamW(
-        flow.parameters(),
-        lr=float(training_config["learning_rate"]),
-        weight_decay=float(training_config.get("weight_decay", 0.0)),
+    learning_rate = float(training_config["learning_rate"])
+    weight_decay = float(training_config.get("weight_decay", 0.0))
+    if weight_decay == 0.0:
+        optimizer = torch.optim.Adam(flow.parameters(), lr=learning_rate)
+    else:
+        optimizer = torch.optim.AdamW(
+            flow.parameters(), lr=learning_rate, weight_decay=weight_decay
+        )
+
+    scheduler_name = str(training_config.get("lr_scheduler", "plateau")).lower()
+    minimum_learning_rate = float(
+        training_config.get("min_learning_rate", 1.0e-6)
     )
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer,
-        mode="min",
-        factor=float(training_config.get("lr_scheduler_factor", 0.3)),
-        patience=int(training_config.get("lr_scheduler_patience", 2)),
-        min_lr=float(training_config.get("min_learning_rate", 1.0e-6)),
-    )
+    scheduler_factor = float(training_config.get("lr_scheduler_factor", 0.3))
+    scheduler_patience = int(training_config.get("lr_scheduler_patience", 2))
+    if scheduler_name == "plateau":
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer,
+            mode="min",
+            factor=scheduler_factor,
+            patience=scheduler_patience,
+            min_lr=minimum_learning_rate,
+        )
+        scheduler_uses_validation = True
+    elif scheduler_name == "step":
+        if scheduler_patience <= 0:
+            raise ValueError("Step LR interval must be strictly positive.")
+        if not 0.0 < scheduler_factor < 1.0:
+            raise ValueError("Step LR factor must lie strictly between zero and one.")
+        if not 0.0 < minimum_learning_rate <= learning_rate:
+            raise ValueError(
+                "Minimum learning rate must be positive and no larger than the initial rate."
+            )
+        floor_factor = minimum_learning_rate / learning_rate
+
+        def step_multiplier(completed_epochs):
+            return max(
+                floor_factor,
+                scheduler_factor ** (int(completed_epochs) // scheduler_patience),
+            )
+
+        scheduler = torch.optim.lr_scheduler.LambdaLR(
+            optimizer, lr_lambda=step_multiplier
+        )
+        scheduler_uses_validation = False
+    else:
+        raise ValueError(
+            f"Unknown lr_scheduler={scheduler_name!r}; expected 'plateau' or 'step'."
+        )
     n_epochs = int(training_config["n_epochs"])
     patience = int(training_config.get("patience", n_epochs))
+    print_every = max(1, int(training_config.get("print_every", 1)))
     gradient_clip = float(training_config.get("gradient_clip", 5.0))
     retain_initial_model = bool(
         training_config.get("retain_initial_model", False)
@@ -755,7 +793,10 @@ def train_spline_flow(
         history["train"].append(train_loss)
         history["validation"].append(validation_loss)
         history["learning_rate"].append(optimizer.param_groups[0]["lr"])
-        scheduler.step(validation_loss)
+        if scheduler_uses_validation:
+            scheduler.step(validation_loss)
+        else:
+            scheduler.step()
 
         if validation_loss < best_validation - minimum_validation_improvement:
             best_validation = validation_loss
@@ -764,10 +805,12 @@ def train_spline_flow(
             stale_epochs = 0
         else:
             stale_epochs += 1
-        print(
-            f"  epoch {epoch:02d}/{n_epochs}: train={train_loss:.4f}, "
-            f"validation={validation_loss:.4f}"
-        )
+        if epoch == 1 or epoch % print_every == 0 or epoch == n_epochs:
+            print(
+                f"  epoch {epoch:02d}/{n_epochs}: train={train_loss:.4f}, "
+                f"validation={validation_loss:.4f}, "
+                f"lr={history['learning_rate'][-1]:.1e}"
+            )
         if stale_epochs >= patience:
             print(f"  early stopping after {epoch} epochs")
             break
