@@ -81,7 +81,7 @@ LEARNING_RATE_DROP_FACTOR = 0.1
 LEARNING_RATE_STEP_EPOCHS = 40
 
 METRIC_SCHEMA = "paired_long_reference_bandwidth_v4_9a_matched"
-CAMPAIGN_SCHEMA = "plain_ce_v13_9a_matched_parallel_tasks"
+CAMPAIGN_SCHEMA = "plain_ce_v14_corrected_alternating_masks_parallel_tasks"
 JANA_PAPER_COMMIT = "6cbbc94faf0aa85147986f7f9516d13a52551bd4"
 
 
@@ -191,7 +191,10 @@ def campaign_signature(profile: str) -> str:
         "jana_baseline": "same_frozen_qphi_qeta_direct_no_classifier_v2",
         "jana_paper_commit": JANA_PAPER_COMMIT,
         "simulation_budget": "fixed_10000_non_smoke_as_in_9a",
-        "flow_topology": "original_ex9_rqs_10x512x4_bins16_tail5_per_member_v1",
+        "flow_topology": (
+            "ex9_rqs_10x512x4_bins16_tail5_"
+            "alternating_masks_no_reversal_per_member_v2"
+        ),
         "flow_training": (
             "four_members_batch32_epochs250_adam_lr1e-4_step40_to1e-9_"
             "full_patience_gradient_clip5_no_weight_decay_v1"
@@ -225,7 +228,7 @@ def campaign_run_tag(profile: str, seed: int) -> str:
     campaign = PROFILES[profile]
     signature = campaign_signature(profile)
     return (
-        f"v13_{profile.lower()}_seed{seed}_n{campaign['num_simulations']}_"
+        f"v14_{profile.lower()}_seed{seed}_n{campaign['num_simulations']}_"
         f"matched_flowmix{campaign['flow_members']}_"
         f"class{campaign['classifier_members']}_"
         f"fe{campaign['flow_epochs']}_ce{campaign['class_epochs']}_"
@@ -241,7 +244,7 @@ def aggregate_run_tag(profile: str, seeds) -> str:
     if len(values) == 1:
         return campaign_run_tag(profile, values[0])
     return (
-        f"v13_{profile.lower()}_seeds{'-'.join(map(str, values))}_"
+        f"v14_{profile.lower()}_seeds{'-'.join(map(str, values))}_"
         f"cfg{campaign_signature(profile)}_aggregate"
     )
 

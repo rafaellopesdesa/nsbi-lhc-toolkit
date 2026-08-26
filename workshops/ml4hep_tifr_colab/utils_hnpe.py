@@ -274,9 +274,16 @@ def _build_quadratic_spline(
 ) -> nn.Module:
     """Build the workshop rational-quadratic spline coupling flow.
 
+    Exactly one mechanism exchanges the transformed and conditioning
+    coordinates.  The corrected Exercise-9 topology uses alternating masks
+    with no fixed reversal.  ``use_layer_permutations=True`` is rejected:
+    combining the historical reversal with the alternating masks cancels the
+    role swap for even-dimensional targets and leaves half of the original
+    coordinates untransformed.
+
     ``linear_mixing="lu"`` inserts a learned invertible LU map after every
-    vector coupling.  It is an opt-in upgrade over Exercise 10's fixed
-    permutations, so historical workshop checkpoints remain loadable.
+    vector coupling.  It remains an opt-in upgrade over the Exercise-9
+    alternating-mask topology.
     Scalar flows retain their monotone autoregressive construction: an LU map
     in one dimension adds no useful coordinate mixing.
     """
@@ -292,7 +299,6 @@ def _build_quadratic_spline(
         from nflows.transforms.autoregressive import (
             MaskedPiecewiseRationalQuadraticAutoregressiveTransform,
         )
-        from nflows.transforms.permutations import ReversePermutation
         from nflows.transforms.lu import LULinear
         from nflows.utils.torchutils import create_alternating_binary_mask
     except ImportError as exc:
@@ -315,10 +321,10 @@ def _build_quadratic_spline(
             "linear_mixing must be 'none' or 'lu'; "
             f"received {linear_mixing!r}."
         )
-    if linear_mixing == "lu" and use_layer_permutations:
+    if use_layer_permutations:
         raise ValueError(
-            "Choose either learned LU mixing or fixed layer permutations, "
-            "not both."
+            "The Exercise-9 coupling stack must not combine alternating "
+            "masks with fixed reversals. Set use_layer_permutations=False."
         )
 
     def make_net(in_features: int, out_features: int) -> nn.Module:
@@ -393,8 +399,6 @@ def _build_quadratic_spline(
         transforms.append(transform)
         if linear_mixing == "lu":
             transforms.append(LULinear(int(n_features), identity_init=True))
-        elif use_layer_permutations:
-            transforms.append(ReversePermutation(features=n_features))
 
     for layer_index in range(n_coupling_layers):
         if n_features == 1:
@@ -454,8 +458,6 @@ def _build_quadratic_spline(
                 transforms.append(
                     LULinear(int(n_features), identity_init=True)
                 )
-            elif use_layer_permutations and layer_index + 1 < n_coupling_layers:
-                transforms.append(ReversePermutation(features=n_features))
 
     return Flow(
         transform=CompositeTransform(transforms),
@@ -491,12 +493,10 @@ def _build_flow_from_config(
         affine_hidden_layers=int(
             config.get("affine_hidden_layers", config["hidden_layers"])
         ),
-        # Historical workshop checkpoints used both alternating masks and
-        # reversals.  Keep that topology as the default so those state dicts
-        # remain loadable; newer architectures can disable the redundant
-        # permutations and obtain a pointwise-identity initialization.
+        # The corrected topology uses alternating masks alone. Historical
+        # fixed reversals are rejected inside the builder.
         use_layer_permutations=bool(
-            config.get("use_layer_permutations", True)
+            config.get("use_layer_permutations", False)
         ),
         n_coupling_layers=int(config["n_coupling_layers"]),
         hidden_features=int(config["hidden_features"]),
@@ -520,6 +520,19 @@ def load_spline_flow(
     checkpoint = Path(checkpoint)
     saved = _torch_load(checkpoint, device)
     config = dict(saved["config"])
+    if "use_layer_permutations" not in config:
+        legacy_permutations = any(
+            key.endswith("._permutation")
+            for key in saved["state_dict"]
+        )
+        if legacy_permutations:
+            raise RuntimeError(
+                f"Checkpoint {checkpoint} uses the retired Exercise-9 "
+                "double-alternation topology (alternating masks plus "
+                "reversals). Retrain it with "
+                "use_layer_permutations=False and a new run tag."
+            )
+        config["use_layer_permutations"] = False
     flow = _build_flow_from_config(config, device)
     flow.load_state_dict(saved["state_dict"])
     flow.eval()
@@ -582,6 +595,9 @@ def train_spline_flow(
             raise ValueError("context must contain one row per target row.")
 
     config = dict(model_config)
+    # Persist the topology choice so corrected checkpoints are never confused
+    # with historical files that silently combined two role exchanges.
+    config.setdefault("use_layer_permutations", False)
     config["n_features"] = int(target.shape[1])
     config["context_features"] = 0 if context is None else int(context.shape[1])
     training_fingerprint = None
