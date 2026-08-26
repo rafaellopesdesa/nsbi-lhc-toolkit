@@ -171,9 +171,9 @@ TASK_RECOMMENDATIONS = (
         10,
         "count time series",
         "hNPE",
-        "Julia backend required",
-        "The official simulator uses diffeqtorch/Julia; hNDE would need a "
-        "discrete or dequantized reference model.",
+        "launcher-ready",
+        "The task's legacy diffeqtorch solver is replaced by an audited Python "
+        "integration of the same SIR equations; count data are dequantized.",
     ),
     TaskRecommendation(
         "lotka_volterra",
