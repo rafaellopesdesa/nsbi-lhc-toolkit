@@ -180,10 +180,11 @@ TASK_RECOMMENDATIONS = (
         "Lotka--Volterra",
         4,
         20,
-        "count time series",
+        "continuous LogNormal-noised trajectories",
         "hNPE",
-        "Julia backend required",
-        "The official simulator uses diffeqtorch/Julia and is costly.",
+        "launcher-ready",
+        "The task's legacy diffeqtorch solver is replaced by an audited Python "
+        "integration of the same equations and LogNormal observation model.",
     ),
 )
 
