@@ -156,11 +156,11 @@ def write_core() -> None:
             "ex9c-core-overview",
             r'''# Exercise 9c — the deliberately hybrid SBIBM campaign
 
-This runner tests the original division of labor behind the hybrid model. The conditional flows are intentionally **modest normalized proposals**, not precision models: one member, four RQS coupling layers, width 64, two hidden layers, eight bins, linear tails, and no dropout. Precision is delegated to fresh-data density-ratio ensembles.
+This runner tests the original division of labor behind the hybrid model. The conditional flows are intentionally **intermediate normalized proposals**, not precision models: one member, eight RQS coupling layers, width 128, two hidden layers, eight bins, linear tails, and learned LU mixing between vector coupling layers. Fixed layer reversals remain disabled because they cancel the alternating-mask role exchange in even dimensions. Precision is delegated to fresh-data density-ratio ensembles.
 
 For a simulator joint (S(z,x)=p(z,x)), posterior reference (P(z,x)=q_\phi(z\mid x)p(x)), and likelihood reference (L(z,x)=p(z)q_\eta(x\mid z)), it compares:
 
-1. direct samples from the modest flows;
+1. direct samples from the intermediate flows;
 2. one equal-prior three-class CE model, using (D_S/D_P) and (D_S/D_L);
 3. two separate equal-prior binary CE models, (S\!:\!P) and (S\!:\!L).
 
@@ -173,7 +173,7 @@ The four simulator banks are role-separated and persistent: flow training, ratio
             "ex9c-core-profiles",
             r'''## Compute profiles
 
-`TUTORIAL` is the default Colab preview: 10k flow simulations, 100k fresh ratio-training pairs, 20k validation, 20k audit, and four members per ratio ensemble. `PAPER` is the intended scientific run: 1M fresh ratio-training pairs and ten 4×1024 ensembles. Because the separate-binary route contains two ensembles, PAPER trains 30 wide classifiers per task. `EXTREME` raises the ratio bank to 5M pairs to study saturation. Classifier compute is step-based, so bank size changes coverage without silently multiplying an epoch budget.
+`TUTORIAL` is the default Colab preview: 10k flow simulations, 100k fresh ratio-training pairs, 20k validation, 20k audit, and four members per ratio ensemble. `PAPER` is the intended scientific run: 1M fresh ratio-training pairs and ten 4×1024 ensembles. Because the separate-binary route contains two ensembles, PAPER trains 30 wide classifiers per task. `EXTREME` raises the ratio bank to 5M pairs to study saturation. The intermediate flows train for at most 200 epochs with validation-based scheduling and early stopping. Classifier compute is step-based, so bank size changes coverage without silently multiplying an epoch budget.
 
 Run each task in its own Colab runtime. The source checkout is runtime-local and all caches/checkpoints/results use task- and run-specific paths on Drive.
 ''',
@@ -192,7 +192,7 @@ print(json.dumps({
     "campaign_signature": campaign_signature(PROFILE),
     "campaign": PROFILES[PROFILE],
     "four_bank_rule": ["flow", "ratio_train", "ratio_validation", "audit"],
-    "comparison": ["modest flow", "one multiclass correction", "two binary corrections"],
+    "comparison": ["intermediate flow", "one multiclass correction", "two binary corrections"],
 }, indent=2))
 ''',
         ),
@@ -222,7 +222,7 @@ def launcher_overview(task: str) -> str:
     title = TASK_TITLES[task]
     base = f'''# Exercise 9c — {title}: deliberately hybrid training
 
-This notebook runs only the `{task}` SBIBM task and delegates to the shared Exercise-9c engine. It compares the same modest proposal flows against one multiclass ratio correction and two separate binary corrections, using fresh role-separated simulator banks and extensive audit-only diagnostics.
+This notebook runs only the `{task}` SBIBM task and delegates to the shared Exercise-9c engine. It compares the same intermediate single-flow proposals against one multiclass ratio correction and two separate binary corrections, using fresh role-separated simulator banks and extensive audit-only diagnostics.
 
 The default `TUTORIAL` profile is a substantial preview. Switch to `PAPER` for the intended 1M-pair, ten-member scientific campaign or `EXTREME` for the 5M-pair saturation test. Checkpoints and banks are persistent, fingerprinted by the campaign run tag, and safe to reuse with `LOAD_IF_AVAILABLE=True`.
 
@@ -362,7 +362,7 @@ print("Reading artifacts from:", ARTIFACT_ROOT)
             "ex9c-aggregate-overview",
             '''# Exercise 9c — aggregate hybrid comparison
 
-Run this after any subset of the ten task notebooks. It validates each task's profile, seed, and run-tag identity; partial campaigns are allowed and visibly marked. The figures compare the modest flow, one multiclass correction, and two separate binary corrections across posterior, predictive-data, and predictive-joint metrics. A dedicated delta heatmap answers the main question directly: where does multiclass factorization improve or degrade C2ST relative to separate binary estimators?
+Run this after any subset of the ten task notebooks. It validates each task's profile, seed, and run-tag identity; partial campaigns are allowed and visibly marked. The figures compare the intermediate single flow, one multiclass correction, and two separate binary corrections across posterior, predictive-data, and predictive-joint metrics. A dedicated delta heatmap answers the main question directly: where does multiclass factorization improve or degrade C2ST relative to separate binary estimators?
 
 The collector also relates accuracy to posterior and predictive importance-weight efficiency, because a visually improved distribution with collapsing ESS is not a robust hybrid result.
 ''',

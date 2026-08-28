@@ -1,4 +1,4 @@
-"""Runtime for Exercise 9c: modest flows plus large residual-ratio models.
+"""Runtime for Exercise 9c: intermediate flows plus large residual-ratio models.
 
 The notebooks are intentionally thin launchers.  Keeping the scientific logic
 here makes the ten SBIBM campaigns use exactly the same bank split, model,
@@ -6,7 +6,7 @@ checkpoint, ratio-arithmetic, metric, and plotting code.
 
 The design is deliberately asymmetric:
 
-* one modest, normalized conditional flow is a proposal with full support;
+* one intermediate, normalized conditional flow is a proposal with full support;
 * fresh, much larger simulator banks train plain wide CE classifiers;
 * a single 3-class S/P/L model is compared with independent S/P and S/L
   binary models;
@@ -39,6 +39,8 @@ from utils_benchmark import infer_parameter_transform, load_or_simulate_bank
 from utils_exercise9c_contract import (
     ALL_TASKS,
     CAMPAIGN_SCHEMA,
+    FLOW_MODEL_CONFIG,
+    FLOW_TRAINING_POLICY,
     INITIAL_LEARNING_RATE,
     JANA_PAPER_COMMIT,
     LEARNING_RATE_DROP_FACTOR,
@@ -239,32 +241,18 @@ class PlainCEMLP(nn.Module):
 
 
 def flow_model_config() -> dict[str, Any]:
-    return {
-        "n_coupling_layers": 4,
-        "hidden_features": 64,
-        "hidden_layers": 2,
-        "spline_num_bins": 8,
-        "spline_tail_bound": 5.0,
-        "dropout_probability": 0.0,
-        "use_layer_permutations": False,
-    }
+    return dict(FLOW_MODEL_CONFIG)
 
 
 def flow_training_config(campaign: Mapping[str, Any]) -> dict[str, Any]:
-    return {
-        "batch_size": int(campaign["flow_batch_size"]),
-        "n_epochs": int(campaign["flow_epochs"]),
-        "learning_rate": INITIAL_LEARNING_RATE,
-        "min_learning_rate": MINIMUM_LEARNING_RATE,
-        "lr_scheduler": "plateau",
-        "lr_scheduler_factor": 0.3,
-        "lr_scheduler_patience": 6,
-        "validation_fraction": 0.2,
-        "patience": 18,
-        "print_every": 10,
-        "gradient_clip": 5.0,
-        "weight_decay": 0.0,
-    }
+    config = dict(FLOW_TRAINING_POLICY)
+    config.update(
+        {
+            "batch_size": int(campaign["flow_batch_size"]),
+            "n_epochs": int(campaign["flow_epochs"]),
+        }
+    )
+    return config
 
 
 def draw_flow_mixture(

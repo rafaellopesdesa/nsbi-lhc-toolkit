@@ -60,7 +60,7 @@ METHOD_MULTICLASS = "hybrid_multiclass"
 METHOD_BINARY = "hybrid_binary"
 METHODS = (METHOD_FLOW, METHOD_MULTICLASS, METHOD_BINARY)
 METHOD_LABELS = {
-    METHOD_FLOW: "Modest flow (direct)",
+    METHOD_FLOW: "Intermediate flow (direct)",
     METHOD_MULTICLASS: "Hybrid: one 3-class ratio",
     METHOD_BINARY: "Hybrid: two binary ratios",
 }
@@ -79,8 +79,38 @@ MINIMUM_LEARNING_RATE = 1.0e-9
 LEARNING_RATE_DROP_FACTOR = 0.1
 
 METRIC_SCHEMA = "paired_reference_and_method_contrasts_v1_9c"
-CAMPAIGN_SCHEMA = "modest_flow_fresh_large_ratio_banks_multi_vs_binary_v1"
+CAMPAIGN_SCHEMA = "intermediate_flow_fresh_large_ratio_banks_multi_vs_binary_v2"
 JANA_PAPER_COMMIT = "6cbbc94faf0aa85147986f7f9516d13a52551bd4"
+
+
+# One deliberately intermediate proposal flow is shared by q_phi and q_eta.
+# Alternating masks already exchange transformed and conditioning coordinates.
+# The retired fixed reversals must remain disabled; learned LU maps provide
+# additional coordinate mixing without recreating the even-dimensional mask
+# cancellation that affected the historical Exercise-9 topology.
+FLOW_MODEL_CONFIG = {
+    "n_coupling_layers": 8,
+    "hidden_features": 128,
+    "hidden_layers": 2,
+    "spline_num_bins": 8,
+    "spline_tail_bound": 5.0,
+    "dropout_probability": 0.0,
+    "use_layer_permutations": False,
+    "linear_mixing": "lu",
+}
+
+FLOW_TRAINING_POLICY = {
+    "learning_rate": INITIAL_LEARNING_RATE,
+    "min_learning_rate": MINIMUM_LEARNING_RATE,
+    "lr_scheduler": "plateau",
+    "lr_scheduler_factor": 0.3,
+    "lr_scheduler_patience": 10,
+    "validation_fraction": 0.2,
+    "patience": 30,
+    "print_every": 10,
+    "gradient_clip": 5.0,
+    "weight_decay": 0.0,
+}
 
 
 # Classifier training is step based.  Bank size controls fresh simulator
@@ -119,7 +149,7 @@ PROFILES = {
         ratio_validation_simulations=20_000,
         audit_simulations=20_000,
         flow_members=1,
-        flow_epochs=100,
+        flow_epochs=200,
         flow_batch_size=128,
         classifier_members=4,
         classifier_width=1_024,
@@ -143,7 +173,7 @@ PROFILES = {
         ratio_validation_simulations=100_000,
         audit_simulations=100_000,
         flow_members=1,
-        flow_epochs=100,
+        flow_epochs=200,
         flow_batch_size=128,
         classifier_members=10,
         classifier_width=1_024,
@@ -167,7 +197,7 @@ PROFILES = {
         ratio_validation_simulations=200_000,
         audit_simulations=200_000,
         flow_members=1,
-        flow_epochs=100,
+        flow_epochs=200,
         flow_batch_size=128,
         classifier_members=10,
         classifier_width=1_024,
@@ -213,7 +243,8 @@ def _signature_payload(profile: str) -> dict:
         "campaign": PROFILES[profile],
         "methods": METHODS,
         "flow_role": "normalized_sampleable_support_complete_proposal_not_precision_model",
-        "flow_topology": "one_rqs_member_4x64x2_bins8_tail5_alternating_masks_no_permutations",
+        "flow_topology": FLOW_MODEL_CONFIG,
+        "flow_training": FLOW_TRAINING_POLICY,
         "flow_objective": "conditional_nll_only",
         "banks": "four_persistent_genuine_simulator_banks_disjoint_by_seed_and_role",
         "ratio_topology": "plain_relu_mlp_4x1024_no_dropout_no_weight_decay_no_layernorm",
@@ -241,7 +272,7 @@ def campaign_run_tag(profile: str, seed: int) -> str:
     seed = validate_seed(seed)
     cfg = PROFILES[profile]
     return (
-        f"v1_{profile.lower()}_seed{seed}_flow{cfg['flow_simulations']}_"
+        f"v2_{profile.lower()}_seed{seed}_flow{cfg['flow_simulations']}_"
         f"ratio{cfg['ratio_train_simulations']}_ens{cfg['classifier_members']}_"
         f"steps{cfg['classifier_steps']}_cfg{campaign_signature(profile)}_"
         "multi_vs_binary"
@@ -256,7 +287,7 @@ def aggregate_run_tag(profile: str, seeds) -> str:
     if len(values) == 1:
         return campaign_run_tag(profile, values[0])
     return (
-        f"v1_{profile.lower()}_seeds{'-'.join(map(str, values))}_"
+        f"v2_{profile.lower()}_seeds{'-'.join(map(str, values))}_"
         f"cfg{campaign_signature(profile)}_aggregate"
     )
 
