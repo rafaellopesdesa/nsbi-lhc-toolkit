@@ -60,7 +60,7 @@ METHOD_MULTICLASS = "hybrid_multiclass"
 METHOD_BINARY = "hybrid_binary"
 METHODS = (METHOD_FLOW, METHOD_MULTICLASS, METHOD_BINARY)
 METHOD_LABELS = {
-    METHOD_FLOW: "Intermediate flow (direct)",
+    METHOD_FLOW: "Defensive 4-flow mixture (direct)",
     METHOD_MULTICLASS: "Hybrid: one 3-class ratio",
     METHOD_BINARY: "Hybrid: two binary ratios",
 }
@@ -78,25 +78,37 @@ INITIAL_LEARNING_RATE = 1.0e-4
 MINIMUM_LEARNING_RATE = 1.0e-9
 LEARNING_RATE_DROP_FACTOR = 0.1
 
-METRIC_SCHEMA = "paired_reference_and_method_contrasts_v1_9c"
-CAMPAIGN_SCHEMA = "intermediate_flow_fresh_large_ratio_banks_multi_vs_binary_v2"
+METRIC_SCHEMA = "paired_posterior_likelihood_routes_v2_9c"
+CAMPAIGN_SCHEMA = "small_flow_ensemble_defensive_bases_multi_vs_binary_v3"
 JANA_PAPER_COMMIT = "6cbbc94faf0aa85147986f7f9516d13a52551bd4"
 
 
-# One deliberately intermediate proposal flow is shared by q_phi and q_eta.
+# The same deliberately small four-member flow mixture is used by q_phi and
+# q_eta in every task.  Each member is intentionally simple; mixture diversity
+# supplies multimodal coverage while the residual classifiers supply precision.
 # Alternating masks already exchange transformed and conditioning coordinates.
 # The retired fixed reversals must remain disabled; learned LU maps provide
 # additional coordinate mixing without recreating the even-dimensional mask
 # cancellation that affected the historical Exercise-9 topology.
 FLOW_MODEL_CONFIG = {
-    "n_coupling_layers": 8,
-    "hidden_features": 128,
+    "n_coupling_layers": 6,
+    "hidden_features": 32,
     "hidden_layers": 2,
     "spline_num_bins": 8,
     "spline_tail_bound": 5.0,
     "dropout_probability": 0.0,
     "use_layer_permutations": False,
     "linear_mixing": "lu",
+}
+
+# Every proposal is an exact mixture of the nominal standard-normal-base flow
+# ensemble and the same learned transports driven by a broader Gaussian base.
+# This construction applies identically to posterior and likelihood flows.
+DEFENSIVE_PROPOSAL_CONFIG = {
+    "broad_fraction": 0.03,
+    "broad_base_scale": 1.5,
+    "base_family": "isotropic_gaussian",
+    "member_weighting": "equal",
 }
 
 FLOW_TRAINING_POLICY = {
@@ -124,7 +136,7 @@ PROFILES = {
         ratio_train_simulations=1_024,
         ratio_validation_simulations=512,
         audit_simulations=512,
-        flow_members=1,
+        flow_members=4,
         flow_epochs=2,
         flow_batch_size=64,
         classifier_members=1,
@@ -141,6 +153,8 @@ PROFILES = {
         predictive_candidates=4,
         predictive_samples=128,
         predictive_reference_calls=128,
+        likelihood_normalizer_theta=8,
+        likelihood_normalizer_candidates=32,
         metric_max_samples=256,
     ),
     "TUTORIAL": dict(
@@ -148,7 +162,7 @@ PROFILES = {
         ratio_train_simulations=100_000,
         ratio_validation_simulations=20_000,
         audit_simulations=20_000,
-        flow_members=1,
+        flow_members=4,
         flow_epochs=200,
         flow_batch_size=128,
         classifier_members=4,
@@ -165,6 +179,8 @@ PROFILES = {
         predictive_candidates=16,
         predictive_samples=1_000,
         predictive_reference_calls=1_000,
+        likelihood_normalizer_theta=32,
+        likelihood_normalizer_candidates=128,
         metric_max_samples=2_000,
     ),
     "PAPER": dict(
@@ -172,7 +188,7 @@ PROFILES = {
         ratio_train_simulations=1_000_000,
         ratio_validation_simulations=100_000,
         audit_simulations=100_000,
-        flow_members=1,
+        flow_members=4,
         flow_epochs=200,
         flow_batch_size=128,
         classifier_members=10,
@@ -189,6 +205,8 @@ PROFILES = {
         predictive_candidates=32,
         predictive_samples=2_000,
         predictive_reference_calls=2_000,
+        likelihood_normalizer_theta=64,
+        likelihood_normalizer_candidates=256,
         metric_max_samples=5_000,
     ),
     "EXTREME": dict(
@@ -196,7 +214,7 @@ PROFILES = {
         ratio_train_simulations=5_000_000,
         ratio_validation_simulations=200_000,
         audit_simulations=200_000,
-        flow_members=1,
+        flow_members=4,
         flow_epochs=200,
         flow_batch_size=128,
         classifier_members=10,
@@ -213,6 +231,8 @@ PROFILES = {
         predictive_candidates=64,
         predictive_samples=2_000,
         predictive_reference_calls=2_000,
+        likelihood_normalizer_theta=64,
+        likelihood_normalizer_candidates=512,
         metric_max_samples=5_000,
     ),
 }
@@ -245,6 +265,7 @@ def _signature_payload(profile: str) -> dict:
         "flow_role": "normalized_sampleable_support_complete_proposal_not_precision_model",
         "flow_topology": FLOW_MODEL_CONFIG,
         "flow_training": FLOW_TRAINING_POLICY,
+        "defensive_proposal": DEFENSIVE_PROPOSAL_CONFIG,
         "flow_objective": "conditional_nll_only",
         "banks": "four_persistent_genuine_simulator_banks_disjoint_by_seed_and_role",
         "ratio_topology": "plain_relu_mlp_4x1024_no_dropout_no_weight_decay_no_layernorm",
@@ -253,8 +274,9 @@ def _signature_payload(profile: str) -> dict:
         ),
         "ratio_training": "step_based_adam_progressive_lr_best_fresh_validation_ce",
         "ratio_deployment": "arithmetic_mean_memberwise_direct_float64_softmax_quotients",
-        "posterior": "shared_qphi_candidates_direct_or_self_normalized_ratio_resampling",
-        "predictive": "direct_qeta_or_finite_K_ratio_SIR",
+        "posterior": "shared_defensive_qphi_candidates_direct_or_self_normalized_ratio_resampling",
+        "likelihood_route": "shared_qphi_candidates_weighted_by_prior_times_corrected_qeta_over_qphi",
+        "predictive": "direct_defensive_qeta_or_finite_K_ratio_SIR",
         "diagnostics": "fresh_audit_only_never_checkpoint_selection",
         "jana_paper_commit": JANA_PAPER_COMMIT,
     }
@@ -272,8 +294,9 @@ def campaign_run_tag(profile: str, seed: int) -> str:
     seed = validate_seed(seed)
     cfg = PROFILES[profile]
     return (
-        f"v2_{profile.lower()}_seed{seed}_flow{cfg['flow_simulations']}_"
-        f"ratio{cfg['ratio_train_simulations']}_ens{cfg['classifier_members']}_"
+        f"v3_{profile.lower()}_seed{seed}_flow{cfg['flow_simulations']}_"
+        f"flowmix{cfg['flow_members']}_ratio{cfg['ratio_train_simulations']}_"
+        f"classens{cfg['classifier_members']}_"
         f"steps{cfg['classifier_steps']}_cfg{campaign_signature(profile)}_"
         "multi_vs_binary"
     )
@@ -287,7 +310,7 @@ def aggregate_run_tag(profile: str, seeds) -> str:
     if len(values) == 1:
         return campaign_run_tag(profile, values[0])
     return (
-        f"v2_{profile.lower()}_seeds{'-'.join(map(str, values))}_"
+        f"v3_{profile.lower()}_seeds{'-'.join(map(str, values))}_"
         f"cfg{campaign_signature(profile)}_aggregate"
     )
 

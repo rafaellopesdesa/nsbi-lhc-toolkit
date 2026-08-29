@@ -903,6 +903,76 @@ def spline_flow_log_prob(
 
 
 @torch.no_grad()
+def spline_flow_log_prob_with_base_scale(
+    flow_pack: Mapping[str, Any],
+    target: np.ndarray,
+    *,
+    context: np.ndarray | None = None,
+    base_scale: float,
+    batch_size: int = 65_536,
+) -> np.ndarray:
+    """Evaluate a fitted transport with an isotropic broadened Gaussian base.
+
+    The learned target-to-base transformation and all stored standardizers are
+    unchanged.  Only the base density is replaced by ``N(0, base_scale**2 I)``.
+    Setting ``base_scale=1`` is numerically equivalent to
+    :func:`spline_flow_log_prob`.
+    """
+
+    base_scale = float(base_scale)
+    if not np.isfinite(base_scale) or base_scale <= 0.0:
+        raise ValueError("base_scale must be finite and strictly positive.")
+    target = _as_2d_float32(target, "target")
+    conditional = flow_pack["context_scaler"] is not None
+    if conditional:
+        if context is None:
+            raise ValueError("This flow requires context.")
+        context = _as_2d_float32(context, "context")
+        if len(context) != len(target):
+            raise ValueError("context must contain one row per target row.")
+    elif context is not None:
+        raise ValueError("This flow is unconditional; context must be None.")
+
+    flow = flow_pack["flow"]
+    device = next(flow.parameters()).device
+    target_scaler = flow_pack["target_scaler"]
+    context_scaler = flow_pack["context_scaler"]
+    flow.eval()
+    chunks = []
+    log_scale = math.log(base_scale)
+    log_two_pi = math.log(2.0 * math.pi)
+    for start in range(0, len(target), int(batch_size)):
+        stop = start + int(batch_size)
+        target_tensor = torch.tensor(
+            target_scaler.transform(target[start:stop]),
+            dtype=torch.float32,
+            device=device,
+        )
+        context_tensor = None
+        if conditional:
+            context_tensor = torch.tensor(
+                context_scaler.transform(context[start:stop]),
+                dtype=torch.float32,
+                device=device,
+            )
+        embedded_context = flow._embedding_net(context_tensor)
+        base, log_abs_det = flow._transform(
+            target_tensor, context=embedded_context
+        )
+        base_log_probability = -0.5 * torch.sum(
+            torch.square(base / base_scale) + log_two_pi + 2.0 * log_scale,
+            dim=1,
+        )
+        log_probability = (
+            base_log_probability + log_abs_det
+        ).detach().cpu().numpy()
+        chunks.append(log_probability + target_scaler.log_det_to_standard)
+    if not chunks:
+        return np.empty(0, dtype=np.float32)
+    return np.concatenate(chunks)
+
+
+@torch.no_grad()
 def scalar_spline_flow_cdf(
     flow_pack: Mapping[str, Any],
     target: np.ndarray,
@@ -1122,6 +1192,114 @@ def sample_spline_flow(
     return np.concatenate(chunks, axis=0)
 
 
+@torch.no_grad()
+def sample_spline_flow_with_base_scale(
+    flow_pack: Mapping[str, Any],
+    n_samples: int,
+    *,
+    context: np.ndarray | None = None,
+    base_scale: float,
+    batch_size: int = 16_384,
+) -> np.ndarray:
+    """Sample a fitted transport from ``N(0, base_scale**2 I)`` latent draws.
+
+    Return shapes follow :func:`sample_spline_flow`.  This is a proposal-only
+    operation: the fitted transformation is not retrained or modified.
+    """
+
+    n_samples = int(n_samples)
+    base_scale = float(base_scale)
+    if n_samples < 1:
+        raise ValueError("n_samples must be positive.")
+    if not np.isfinite(base_scale) or base_scale <= 0.0:
+        raise ValueError("base_scale must be finite and strictly positive.")
+    if base_scale == 1.0:
+        return sample_spline_flow(
+            flow_pack, n_samples, context=context, batch_size=batch_size
+        )
+
+    flow = flow_pack["flow"]
+    device = next(flow.parameters()).device
+    target_scaler = flow_pack["target_scaler"]
+    context_scaler = flow_pack["context_scaler"]
+    n_features = int(np.asarray(target_scaler.mean).size)
+    flow.eval()
+
+    if context_scaler is None:
+        if context is not None:
+            raise ValueError("This flow is unconditional; context must be None.")
+        chunks = []
+        remaining = n_samples
+        while remaining:
+            current = min(int(batch_size), remaining)
+            base = base_scale * torch.randn(
+                current, n_features, dtype=torch.float32, device=device
+            )
+            values, _ = flow._transform.inverse(base, context=None)
+            chunks.append(target_scaler.inverse(values.detach().cpu().numpy()))
+            remaining -= current
+        return np.concatenate(chunks, axis=0)
+
+    if context is None:
+        raise ValueError("This flow requires context.")
+    context = _as_2d_float32(context, "context")
+    if len(context) == 1:
+        context_tensor = torch.tensor(
+            context_scaler.transform(context),
+            dtype=torch.float32,
+            device=device,
+        )
+        embedded_context = flow._embedding_net(context_tensor)
+        chunks = []
+        remaining = n_samples
+        while remaining:
+            current = min(int(batch_size), remaining)
+            base = base_scale * torch.randn(
+                current, n_features, dtype=torch.float32, device=device
+            )
+            repeated_context = torch.repeat_interleave(
+                embedded_context, current, dim=0
+            )
+            values, _ = flow._transform.inverse(
+                base, context=repeated_context
+            )
+            chunks.append(target_scaler.inverse(values.detach().cpu().numpy()))
+            remaining -= current
+        return np.concatenate(chunks, axis=0)
+    context_batch_size = max(1, int(batch_size) // n_samples)
+    chunks = []
+    for start in range(0, len(context), context_batch_size):
+        local_context = context[start : start + context_batch_size]
+        context_tensor = torch.tensor(
+            context_scaler.transform(local_context),
+            dtype=torch.float32,
+            device=device,
+        )
+        embedded_context = flow._embedding_net(context_tensor)
+        base = base_scale * torch.randn(
+            len(local_context),
+            n_samples,
+            n_features,
+            dtype=torch.float32,
+            device=device,
+        )
+        flat_base = base.reshape(-1, n_features)
+        flat_context = torch.repeat_interleave(
+            embedded_context, n_samples, dim=0
+        )
+        values, _ = flow._transform.inverse(
+            flat_base, context=flat_context
+        )
+        original = target_scaler.inverse(
+            values.detach().cpu().numpy()
+        ).reshape(len(local_context), n_samples, n_features)
+        chunks.append(original)
+    output = np.concatenate(chunks, axis=0)
+    if len(context) == 1:
+        return output[0]
+    return output
+
+
 def train_spline_flow_ensemble(
     target: np.ndarray,
     *,
@@ -1239,6 +1417,49 @@ def spline_flow_ensemble_log_prob(
         axis=0,
     )
     return logsumexp(member_log_probabilities, axis=0) - math.log(len(members))
+
+
+def spline_flow_defensive_ensemble_log_prob(
+    flow_packs: Sequence[Mapping[str, Any]],
+    target: np.ndarray,
+    *,
+    context: np.ndarray | None = None,
+    broad_fraction: float,
+    broad_base_scale: float,
+    batch_size: int = 65_536,
+) -> np.ndarray:
+    """Evaluate an exact nominal-plus-broadened equal-weight flow mixture."""
+
+    members = _validate_flow_ensemble(flow_packs)
+    broad_fraction = float(broad_fraction)
+    broad_base_scale = float(broad_base_scale)
+    if not 0.0 <= broad_fraction < 1.0:
+        raise ValueError("broad_fraction must lie in [0, 1).")
+    if not np.isfinite(broad_base_scale) or broad_base_scale <= 0.0:
+        raise ValueError("broad_base_scale must be finite and positive.")
+    nominal = spline_flow_ensemble_log_prob(
+        members, target, context=context, batch_size=batch_size
+    )
+    if broad_fraction == 0.0:
+        return nominal
+    broad_members = np.stack(
+        [
+            spline_flow_log_prob_with_base_scale(
+                member,
+                target,
+                context=context,
+                base_scale=broad_base_scale,
+                batch_size=batch_size,
+            )
+            for member in members
+        ],
+        axis=0,
+    )
+    broad = logsumexp(broad_members, axis=0) - math.log(len(members))
+    return np.logaddexp(
+        math.log1p(-broad_fraction) + nominal,
+        math.log(broad_fraction) + broad,
+    )
 
 
 def scalar_spline_flow_ensemble_cdf(
@@ -1436,6 +1657,108 @@ def sample_spline_flow_ensemble(
                     assignments[rows] == member_index
                 )[1].reshape(len(rows), count)
                 output[rows[:, None], positions, :] = values
+    finally:
+        torch.random.set_rng_state(cpu_rng_state)
+        if cuda_rng_states is not None:
+            torch.cuda.set_rng_state_all(cuda_rng_states)
+
+    if not conditional or n_context == 1:
+        return output[0]
+    return output
+
+
+def sample_spline_flow_defensive_ensemble(
+    flow_packs: Sequence[Mapping[str, Any]],
+    n_samples: int,
+    *,
+    context: np.ndarray | None = None,
+    seed: int,
+    broad_fraction: float,
+    broad_base_scale: float,
+    batch_size: int = 16_384,
+) -> np.ndarray:
+    """Draw IID samples from the exact nominal-plus-broadened flow mixture.
+
+    Each draw first selects a flow member uniformly and then selects the
+    nominal or broadened Gaussian base with probabilities ``1-epsilon`` and
+    ``epsilon``.  The Torch RNG state is restored on return.
+    """
+
+    members = _validate_flow_ensemble(flow_packs)
+    n_samples = int(n_samples)
+    broad_fraction = float(broad_fraction)
+    broad_base_scale = float(broad_base_scale)
+    if n_samples < 1:
+        raise ValueError("n_samples must be positive.")
+    if not 0.0 <= broad_fraction < 1.0:
+        raise ValueError("broad_fraction must lie in [0, 1).")
+    if not np.isfinite(broad_base_scale) or broad_base_scale <= 0.0:
+        raise ValueError("broad_base_scale must be finite and positive.")
+    if broad_fraction == 0.0:
+        return sample_spline_flow_ensemble(
+            members,
+            n_samples,
+            context=context,
+            seed=seed,
+            batch_size=batch_size,
+            allocation="iid",
+        )
+
+    conditional = members[0]["context_scaler"] is not None
+    if conditional:
+        if context is None:
+            raise ValueError("This flow mixture requires context.")
+        context_rows = _as_2d_float32(context, "context")
+    else:
+        if context is not None:
+            raise ValueError(
+                "This flow mixture is unconditional; context must be None."
+            )
+        context_rows = np.empty((1, 0), dtype=np.float32)
+
+    rng = np.random.default_rng(int(seed))
+    n_context = len(context_rows)
+    n_members = len(members)
+    member_assignments = rng.integers(
+        0, n_members, size=(n_context, n_samples), dtype=np.int64
+    )
+    broad_assignments = rng.random((n_context, n_samples)) < broad_fraction
+    n_features = int(np.asarray(members[0]["target_scaler"].mean).size)
+    output = np.empty((n_context, n_samples, n_features), dtype=np.float32)
+
+    cpu_rng_state = torch.random.get_rng_state()
+    cuda_rng_states = (
+        torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
+    )
+    try:
+        torch.manual_seed(int(seed))
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(int(seed))
+        for member_index, member in enumerate(members):
+            for broad in (False, True):
+                component = (member_assignments == member_index) & (
+                    broad_assignments == broad
+                )
+                counts = np.sum(component, axis=1)
+                for count_value in np.unique(counts):
+                    count_value = int(count_value)
+                    if count_value == 0:
+                        continue
+                    rows = np.flatnonzero(counts == count_value)
+                    member_context = context_rows[rows] if conditional else None
+                    values = sample_spline_flow_with_base_scale(
+                        member,
+                        count_value,
+                        context=member_context,
+                        base_scale=(broad_base_scale if broad else 1.0),
+                        batch_size=batch_size,
+                    )
+                    if len(rows) == 1:
+                        values = np.asarray(values)[None, :, :]
+                    positions = np.nonzero(component[rows])[1].reshape(
+                        len(rows), count_value
+                    )
+                    output[rows[:, None], positions, :] = values
     finally:
         torch.random.set_rng_state(cpu_rng_state)
         if cuda_rng_states is not None:

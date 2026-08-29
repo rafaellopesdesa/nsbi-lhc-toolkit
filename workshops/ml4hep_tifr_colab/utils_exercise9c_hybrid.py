@@ -1,4 +1,4 @@
-"""Runtime for Exercise 9c: intermediate flows plus large residual-ratio models.
+"""Runtime for Exercise 9c: defensive flow mixtures plus residual ratios.
 
 The notebooks are intentionally thin launchers.  Keeping the scientific logic
 here makes the ten SBIBM campaigns use exactly the same bank split, model,
@@ -6,7 +6,8 @@ checkpoint, ratio-arithmetic, metric, and plotting code.
 
 The design is deliberately asymmetric:
 
-* one intermediate, normalized conditional flow is a proposal with full support;
+* four small conditional flows form an equal-weight proposal mixture;
+* the same transforms with a broadened Gaussian base provide defensive tails;
 * fresh, much larger simulator banks train plain wide CE classifiers;
 * a single 3-class S/P/L model is compared with independent S/P and S/L
   binary models;
@@ -39,6 +40,7 @@ from utils_benchmark import infer_parameter_transform, load_or_simulate_bank
 from utils_exercise9c_contract import (
     ALL_TASKS,
     CAMPAIGN_SCHEMA,
+    DEFENSIVE_PROPOSAL_CONFIG,
     FLOW_MODEL_CONFIG,
     FLOW_TRAINING_POLICY,
     INITIAL_LEARNING_RATE,
@@ -60,7 +62,8 @@ from utils_exercise9c_contract import (
 )
 from utils_hnpe import (
     install_nflows_rqs_float64_retry,
-    sample_spline_flow_ensemble,
+    sample_spline_flow_defensive_ensemble,
+    spline_flow_defensive_ensemble_log_prob,
     spline_flow_ensemble_log_prob,
     train_spline_flow_ensemble,
 )
@@ -255,6 +258,10 @@ def flow_training_config(campaign: Mapping[str, Any]) -> dict[str, Any]:
     return config
 
 
+def defensive_proposal_config() -> dict[str, Any]:
+    return dict(DEFENSIVE_PROPOSAL_CONFIG)
+
+
 def draw_flow_mixture(
     packs: Sequence[Mapping[str, Any]],
     n_samples: int,
@@ -263,15 +270,18 @@ def draw_flow_mixture(
     *,
     allocation: str = "iid",
 ) -> np.ndarray:
+    if str(allocation).lower() != "iid":
+        raise ValueError("Defensive Exercise-9c proposals require IID allocation.")
     contexts = np.atleast_2d(np.asarray(contexts, dtype=np.float32))
     seed_everything(seed)
-    values = sample_spline_flow_ensemble(
+    values = sample_spline_flow_defensive_ensemble(
         packs,
         int(n_samples),
         context=contexts,
         seed=int(seed),
+        broad_fraction=float(DEFENSIVE_PROPOSAL_CONFIG["broad_fraction"]),
+        broad_base_scale=float(DEFENSIVE_PROPOSAL_CONFIG["broad_base_scale"]),
         batch_size=16_384,
-        allocation=allocation,
     )
     values = np.asarray(values, dtype=np.float32)
     n_features = int(np.asarray(packs[0]["target_scaler"].mean).size)
@@ -283,6 +293,25 @@ def draw_flow_mixture(
     if not np.isfinite(values).all():
         raise FloatingPointError("Flow sampling returned non-finite values")
     return values
+
+
+def flow_proposal_log_prob(
+    packs: Sequence[Mapping[str, Any]],
+    target: np.ndarray,
+    *,
+    context: np.ndarray,
+    batch_size: int = 65_536,
+) -> np.ndarray:
+    """Evaluate the exact nominal-plus-broad Exercise-9c proposal density."""
+
+    return spline_flow_defensive_ensemble_log_prob(
+        packs,
+        target,
+        context=context,
+        broad_fraction=float(DEFENSIVE_PROPOSAL_CONFIG["broad_fraction"]),
+        broad_base_scale=float(DEFENSIVE_PROPOSAL_CONFIG["broad_base_scale"]),
+        batch_size=batch_size,
+    )
 
 
 def build_class_bank(
@@ -329,6 +358,7 @@ def build_class_bank(
             "class_sampling_seed": int(seed),
             "z_dim": int(bank.z.shape[1]),
             "x_dim": int(bank.x.shape[1]),
+            "proposal": defensive_proposal_config(),
         },
     )
 
@@ -872,21 +902,70 @@ def paired_distribution_metrics(
     return results
 
 
+def distribution_pair_metrics(
+    left: np.ndarray,
+    right: np.ndarray,
+    *,
+    seed: int,
+    max_samples: int,
+) -> dict[str, float]:
+    """C2ST and MMD for one equal-size pair using ``left`` as the reference."""
+
+    left = np.asarray(left, dtype=np.float64)
+    right = np.asarray(right, dtype=np.float64)
+    n = min(len(left), len(right), int(max_samples))
+    if n < 32:
+        raise RuntimeError("Too few rows for pairwise C2ST/MMD")
+    rng = np.random.default_rng(int(seed))
+    left_equal = left[rng.choice(len(left), n, replace=False)]
+    right_equal = right[rng.choice(len(right), n, replace=False)]
+    mean, std = _reference_standardization(left)
+    left_std = (left_equal - mean) / std
+    right_std = (right_equal - mean) / std
+    bandwidth2 = _reference_bandwidth2(left_std)
+    mmd2 = _mmd2(left_std, right_std, bandwidth2)
+    return {
+        "C2ST": _c2st_equal(left_equal, right_equal, int(seed) + 1, n),
+        "MMD2": mmd2,
+        "MMD": math.sqrt(mmd2),
+        "MMD_bandwidth2": bandwidth2,
+        "metric_rows": n,
+    }
+
+
 def flow_audit(
     q_phi: Sequence[Mapping[str, Any]],
     q_eta: Sequence[Mapping[str, Any]],
     audit_bank: PreparedBank,
 ) -> pd.DataFrame:
-    posterior_log_prob = spline_flow_ensemble_log_prob(
+    posterior_nominal_log_prob = spline_flow_ensemble_log_prob(
         q_phi, audit_bank.z, context=audit_bank.x
     )
-    likelihood_log_prob = spline_flow_ensemble_log_prob(
+    likelihood_nominal_log_prob = spline_flow_ensemble_log_prob(
+        q_eta, audit_bank.x, context=audit_bank.z
+    )
+    posterior_log_prob = flow_proposal_log_prob(
+        q_phi, audit_bank.z, context=audit_bank.x
+    )
+    likelihood_log_prob = flow_proposal_log_prob(
         q_eta, audit_bank.x, context=audit_bank.z
     )
     rows = []
-    for name, packs, target, log_probability in (
-        ("q_phi", q_phi, audit_bank.z, posterior_log_prob),
-        ("q_eta", q_eta, audit_bank.x, likelihood_log_prob),
+    for name, packs, target, log_probability, nominal_log_probability in (
+        (
+            "q_phi",
+            q_phi,
+            audit_bank.z,
+            posterior_log_prob,
+            posterior_nominal_log_prob,
+        ),
+        (
+            "q_eta",
+            q_eta,
+            audit_bank.x,
+            likelihood_log_prob,
+            likelihood_nominal_log_prob,
+        ),
     ):
         scaler = packs[0]["target_scaler"]
         standardized = (target - scaler.mean) / scaler.std
@@ -896,6 +975,7 @@ def flow_audit(
                 "flow": name,
                 "audit_rows": len(target),
                 "mean_nll": float(-np.mean(log_probability)),
+                "nominal_mean_nll": float(-np.mean(nominal_log_probability)),
                 "median_nll": float(-np.median(log_probability)),
                 "p99_nll": float(np.quantile(-log_probability, 0.99)),
                 "finite_log_probability_fraction": float(
@@ -903,6 +983,13 @@ def flow_audit(
                 ),
                 "outside_standardized_target_tail_bound_fraction": float(np.mean(tail)),
                 "linear_tails_preserve_support": True,
+                "flow_members": len(packs),
+                "defensive_broad_fraction": float(
+                    DEFENSIVE_PROPOSAL_CONFIG["broad_fraction"]
+                ),
+                "defensive_broad_base_scale": float(
+                    DEFENSIVE_PROPOSAL_CONFIG["broad_base_scale"]
+                ),
             }
         )
     return pd.DataFrame(rows)
@@ -915,27 +1002,40 @@ def plot_flow_training_and_audit(
     output_dir: Path,
 ) -> None:
     fig, axes = plt.subplots(1, 3, figsize=(12.8, 3.7), constrained_layout=True)
-    for label, pack, color in (
-        (r"$q_\phi(z\mid x)$", q_phi[0], METHOD_COLORS[METHOD_FLOW]),
-        (r"$q_\eta(x\mid z)$", q_eta[0], "#B279A2"),
+    for label, packs, color in (
+        (r"$q_\phi(z\mid x)$", q_phi, METHOD_COLORS[METHOD_FLOW]),
+        (r"$q_\eta(x\mid z)$", q_eta, "#B279A2"),
     ):
-        history = pack.get("history", {})
-        axes[0].plot(history.get("train", []), alpha=0.75, label=f"{label} train", color=color)
-        axes[0].plot(history.get("validation", []), ls="--", label=f"{label} val", color=color)
-        axes[1].step(
-            np.arange(1, len(history.get("learning_rate", [])) + 1),
-            history.get("learning_rate", []),
-            where="post",
-            label=label,
-            color=color,
-        )
-    axes[0].set(title="modest-flow learning curves", xlabel="epoch", ylabel="NLL")
+        for member, pack in enumerate(packs):
+            history = pack.get("history", {})
+            axes[0].plot(
+                history.get("train", []),
+                alpha=0.35,
+                label=f"{label} train" if member == 0 else None,
+                color=color,
+            )
+            axes[0].plot(
+                history.get("validation", []),
+                ls="--",
+                alpha=0.45,
+                label=f"{label} val" if member == 0 else None,
+                color=color,
+            )
+            axes[1].step(
+                np.arange(1, len(history.get("learning_rate", [])) + 1),
+                history.get("learning_rate", []),
+                where="post",
+                alpha=0.4,
+                label=label if member == 0 else None,
+                color=color,
+            )
+    axes[0].set(title="small-flow ensemble learning curves", xlabel="epoch", ylabel="NLL")
     axes[1].set(title="flow learning rate", xlabel="epoch", ylabel="Adam LR", yscale="log")
     axes[2].bar(
         audit_frame["flow"], audit_frame["mean_nll"],
         color=[METHOD_COLORS[METHOD_FLOW], "#B279A2"],
     )
-    axes[2].set(title="fresh audit-bank NLL", ylabel="mean NLL")
+    axes[2].set(title="fresh defensive-proposal NLL", ylabel="mean NLL")
     for ax in axes:
         ax.grid(alpha=0.25)
         if ax.lines:
@@ -1291,7 +1391,12 @@ def draw_posterior_comparison(
     n_posterior: int,
     n_jitters: int,
     seed: int,
-) -> tuple[dict[str, np.ndarray], pd.DataFrame, dict[str, np.ndarray]]:
+) -> tuple[
+    dict[str, np.ndarray],
+    pd.DataFrame,
+    dict[str, np.ndarray],
+    dict[str, Any],
+]:
     contexts = observation_contexts(
         task, observation, widths, n_jitters=n_jitters, seed=seed + 1
     )
@@ -1317,6 +1422,11 @@ def draw_posterior_comparison(
         METHOD_MULTICLASS: np.asarray(multiclass_ratio, dtype=np.float64),
         METHOD_BINARY: np.asarray(binary_ratio, dtype=np.float64),
     }
+    log_q_phi = flow_proposal_log_prob(
+        q_phi, z_flat, context=x_flat
+    ).astype(np.float64)
+    if not np.isfinite(log_q_phi).all():
+        raise FloatingPointError("Non-finite posterior proposal log density")
     outputs = {}
     direct_rng = np.random.default_rng(int(seed) + 3)
     outputs[METHOD_FLOW] = theta[
@@ -1369,7 +1479,265 @@ def draw_posterior_comparison(
             "posthoc_context_log_normalizer_rms": 0.0,
         },
     )
-    return outputs, pd.DataFrame(diagnostics), raw_weights
+    proposal_state = {
+        "contexts": contexts,
+        "draws_per_context": draws_per_context,
+        "z": z_flat,
+        "theta": theta,
+        "x": x_flat,
+        "points": points,
+        "log_q_phi": log_q_phi,
+        "posterior_ratios": {
+            METHOD_FLOW: np.ones(len(theta), dtype=np.float64),
+            **ratios,
+        },
+    }
+    return outputs, pd.DataFrame(diagnostics), raw_weights, proposal_state
+
+
+def _prior_log_prob_latent(
+    task: Any, transform: Any, latent: np.ndarray
+) -> np.ndarray:
+    """Evaluate the benchmark prior in the unconstrained flow coordinates."""
+
+    latent = np.asarray(latent, dtype=np.float32)
+    theta = transform.inverse(latent)
+    with torch.no_grad():
+        values = (
+            task.get_prior_dist()
+            .log_prob(torch.as_tensor(theta, dtype=torch.float32))
+            .detach()
+            .cpu()
+            .numpy()
+        )
+    values = np.asarray(values, dtype=np.float64)
+    if values.ndim > 1:
+        values = values.reshape(len(theta), -1).sum(axis=1)
+    values = values.reshape(-1) + np.asarray(
+        transform.log_abs_det_inverse(latent), dtype=np.float64
+    )
+    if not np.isfinite(values).all():
+        raise FloatingPointError("Non-finite transformed-prior log density")
+    return values
+
+
+def _equal_context_weights(
+    log_weights: np.ndarray, n_contexts: int, draws_per_context: int
+) -> np.ndarray:
+    matrix = np.asarray(log_weights, dtype=np.float64).reshape(
+        int(n_contexts), int(draws_per_context)
+    )
+    if not np.isfinite(matrix).all():
+        raise FloatingPointError("Non-finite likelihood-route log weights")
+    matrix = np.exp(matrix - logsumexp(matrix, axis=1, keepdims=True))
+    matrix /= int(n_contexts)
+    return normalized_positive_weights(matrix.reshape(-1))
+
+
+def draw_likelihood_route_comparison(
+    task: Any,
+    transform: Any,
+    q_eta: Sequence[Mapping[str, Any]],
+    classifiers: Mapping[str, Sequence[Mapping[str, Any]]],
+    proposal_state: Mapping[str, Any],
+    *,
+    n_posterior: int,
+    seed: int,
+) -> tuple[
+    dict[str, np.ndarray],
+    pd.DataFrame,
+    dict[str, np.ndarray],
+    dict[str, tuple[np.ndarray, np.ndarray]],
+]:
+    """Construct the likelihood-route posterior on shared q_phi candidates.
+
+    For each observation context the candidates receive weights proportional
+    to ``p(z) q_eta(x_o|z) r_L(z,x_o) / q_phi(z|x_o)``.  Contexts are
+    normalized separately and then mixed equally, matching the direct
+    posterior route's dequantization convention.
+    """
+
+    z = np.asarray(proposal_state["z"], dtype=np.float32)
+    theta = np.asarray(proposal_state["theta"], dtype=np.float32)
+    x = np.asarray(proposal_state["x"], dtype=np.float32)
+    points = np.asarray(proposal_state["points"], dtype=np.float32)
+    log_q_phi = np.asarray(proposal_state["log_q_phi"], dtype=np.float64)
+    n_contexts = len(proposal_state["contexts"])
+    draws_per_context = int(proposal_state["draws_per_context"])
+
+    log_prior = _prior_log_prob_latent(task, transform, z)
+    log_q_eta = flow_proposal_log_prob(q_eta, x, context=z).astype(np.float64)
+    multi_l = predict_probability_ratio(
+        classifiers["multiclass"],
+        points,
+        numerator=CLASS_S,
+        denominator=CLASS_L,
+    )
+    binary_l = predict_probability_ratio(
+        classifiers["likelihood_binary"], points
+    )
+    posterior_ratios = {
+        method: np.asarray(values, dtype=np.float64)
+        for method, values in proposal_state["posterior_ratios"].items()
+    }
+    likelihood_ratios = {
+        METHOD_FLOW: np.ones(len(z), dtype=np.float64),
+        METHOD_MULTICLASS: np.asarray(multi_l, dtype=np.float64),
+        METHOD_BINARY: np.asarray(binary_l, dtype=np.float64),
+    }
+
+    outputs: dict[str, np.ndarray] = {}
+    raw_weights: dict[str, np.ndarray] = {}
+    cycle_arrays: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+    rows = []
+    for method_index, method in enumerate(METHODS):
+        log_p_ratio = np.log(posterior_ratios[method])
+        log_l_ratio = np.log(likelihood_ratios[method])
+        log_weights = log_prior + log_q_eta + log_l_ratio - log_q_phi
+        weights = _equal_context_weights(
+            log_weights, n_contexts, draws_per_context
+        )
+        rng = np.random.default_rng(int(seed) + 101 * method_index)
+        selected = rng.choice(
+            len(theta), size=int(n_posterior), replace=True, p=weights
+        )
+        outputs[method] = theta[selected]
+        raw_weights[method] = weights
+
+        posterior_log_odds = log_q_phi + log_p_ratio - log_prior
+        likelihood_log_odds = log_q_eta + log_l_ratio
+        posterior_matrix = posterior_log_odds.reshape(
+            n_contexts, draws_per_context
+        )
+        likelihood_matrix = likelihood_log_odds.reshape(
+            n_contexts, draws_per_context
+        )
+        posterior_centered = posterior_matrix - np.median(
+            posterior_matrix, axis=1, keepdims=True
+        )
+        likelihood_centered = likelihood_matrix - np.median(
+            likelihood_matrix, axis=1, keepdims=True
+        )
+        posterior_flat = posterior_centered.reshape(-1)
+        likelihood_flat = likelihood_centered.reshape(-1)
+        residual = posterior_flat - likelihood_flat
+        if (
+            np.std(likelihood_flat) > 1.0e-12
+            and np.std(posterior_flat) > 1.0e-12
+        ):
+            correlation = float(
+                np.corrcoef(likelihood_flat, posterior_flat)[0, 1]
+            )
+            slope = float(
+                np.polyfit(likelihood_flat, posterior_flat, deg=1)[0]
+            )
+        else:
+            correlation = float("nan")
+            slope = float("nan")
+        cycle_arrays[method] = (likelihood_flat, posterior_flat)
+        rows.append(
+            {
+                "method": method,
+                "proposal_rows": len(theta),
+                "observation_jitters": n_contexts,
+                "ESS": effective_sample_size(weights),
+                "ESS_fraction": effective_sample_size(weights) / len(weights),
+                "max_weight": float(weights.max()),
+                "log_weight_p01": float(np.quantile(log_weights, 0.01)),
+                "log_weight_median": float(np.median(log_weights)),
+                "log_weight_p99": float(np.quantile(log_weights, 0.99)),
+                "bayes_cycle_pearson": correlation,
+                "bayes_cycle_slope": slope,
+                "bayes_cycle_residual_rms": float(
+                    np.sqrt(np.mean(np.square(residual)))
+                ),
+                "bayes_cycle_residual_mad": float(
+                    np.median(np.abs(residual - np.median(residual)))
+                ),
+                "bayes_cycle_residual_abs_p95": float(
+                    np.quantile(np.abs(residual), 0.95)
+                ),
+            }
+        )
+    return outputs, pd.DataFrame(rows), raw_weights, cycle_arrays
+
+
+def estimate_likelihood_normalization(
+    transform: Any,
+    theta: np.ndarray,
+    q_eta: Sequence[Mapping[str, Any]],
+    classifiers: Mapping[str, Sequence[Mapping[str, Any]]],
+    *,
+    n_candidates: int,
+    seed: int,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Estimate Z_eta(theta)=E_q[r_L] for posterior-relevant theta rows."""
+
+    theta = np.asarray(theta, dtype=np.float32)
+    z = np.asarray(transform.forward(theta), dtype=np.float32)
+    x = draw_flow_mixture(
+        q_eta, int(n_candidates), z, int(seed), allocation="iid"
+    )
+    z_repeat = np.repeat(z[:, None, :], int(n_candidates), axis=1)
+    points = np.concatenate([z_repeat, x], axis=2).reshape(
+        -1, z.shape[1] + x.shape[2]
+    )
+    multi_l = predict_probability_ratio(
+        classifiers["multiclass"],
+        points,
+        numerator=CLASS_S,
+        denominator=CLASS_L,
+    )
+    binary_l = predict_probability_ratio(
+        classifiers["likelihood_binary"], points
+    )
+    ratios = {
+        METHOD_FLOW: np.ones((len(theta), int(n_candidates)), dtype=np.float64),
+        METHOD_MULTICLASS: np.asarray(multi_l, dtype=np.float64).reshape(
+            len(theta), int(n_candidates)
+        ),
+        METHOD_BINARY: np.asarray(binary_l, dtype=np.float64).reshape(
+            len(theta), int(n_candidates)
+        ),
+    }
+    summary_rows = []
+    detail_rows = []
+    for method in METHODS:
+        odds = ratios[method]
+        log_z = logsumexp(np.log(odds), axis=1) - math.log(int(n_candidates))
+        scaled = odds / odds.max(axis=1, keepdims=True)
+        weights = scaled / scaled.sum(axis=1, keepdims=True)
+        ess_fraction = 1.0 / np.square(weights).sum(axis=1) / int(n_candidates)
+        summary_rows.append(
+            {
+                "method": method,
+                "theta_rows": len(theta),
+                "candidates_per_theta": int(n_candidates),
+                "log_Z_mean": float(log_z.mean()),
+                "log_Z_rms": float(np.sqrt(np.mean(np.square(log_z)))),
+                "log_Z_abs_p95": float(np.quantile(np.abs(log_z), 0.95)),
+                "log_Z_abs_max": float(np.max(np.abs(log_z))),
+                "ratio_ESS_fraction_mean": float(ess_fraction.mean()),
+                "ratio_ESS_fraction_min": float(ess_fraction.min()),
+                "ratio_max_weight_worst": float(weights.max()),
+            }
+        )
+        for index in range(len(theta)):
+            row = {
+                "method": method,
+                "theta_index": index,
+                "log_Z": float(log_z[index]),
+                "ratio_ESS_fraction": float(ess_fraction[index]),
+                "ratio_max_weight": float(weights[index].max()),
+            }
+            row.update(
+                {
+                    f"theta_{column + 1}": float(theta[index, column])
+                    for column in range(theta.shape[1])
+                }
+            )
+            detail_rows.append(row)
+    return pd.DataFrame(summary_rows), pd.DataFrame(detail_rows)
 
 
 def draw_predictive_comparison(
@@ -1519,6 +1887,142 @@ def plot_posterior_comparison(
     plt.show()
 
 
+def plot_likelihood_route_posteriors(
+    reference: np.ndarray,
+    posterior_route: Mapping[str, np.ndarray],
+    likelihood_route: Mapping[str, np.ndarray],
+    labels: Sequence[str],
+    *,
+    observation_number: int,
+    task_name: str,
+    output_dir: Path,
+) -> None:
+    """Overlay direct-posterior and likelihood-route marginals per method."""
+
+    reference = np.asarray(reference)
+    n_show = min(4, reference.shape[1])
+    fig, axes = plt.subplots(
+        len(METHODS), n_show, figsize=(3.4 * n_show, 3.0 * len(METHODS)),
+        squeeze=False, constrained_layout=True,
+    )
+    for row, method in enumerate(METHODS):
+        for column in range(n_show):
+            ax = axes[row, column]
+            arrays = [
+                reference,
+                np.asarray(posterior_route[method]),
+                np.asarray(likelihood_route[method]),
+            ]
+            limits = robust_pooled_limits(arrays, column)
+            bins = np.linspace(*limits, 55)
+            ax.hist(
+                reference[:, column], bins=bins, density=True,
+                histtype="step", lw=2, color="black", label="reference",
+            )
+            ax.hist(
+                posterior_route[method][:, column], bins=bins, density=True,
+                histtype="step", lw=1.8, color=METHOD_COLORS[method],
+                label="posterior route",
+            )
+            ax.hist(
+                likelihood_route[method][:, column], bins=bins, density=True,
+                histtype="step", lw=1.8, ls="--", color="#B279A2",
+                label="likelihood route",
+            )
+            title = METHOD_LABELS[method] if column == 0 else f"marginal {column + 1}"
+            ax.set(title=title, xlabel=labels[column], ylabel="density", xlim=limits)
+            ax.grid(alpha=0.2)
+            ax.legend(fontsize=6)
+    fig.suptitle(
+        f"{task_name}, observation {observation_number}: posterior vs likelihood route",
+        fontsize=10,
+    )
+    _export_figure(
+        fig, output_dir, f"likelihood_route_posterior_observation_{observation_number}"
+    )
+    plt.show()
+
+
+def plot_likelihood_route_diagnostics(
+    cycle_arrays: Mapping[str, tuple[np.ndarray, np.ndarray]],
+    route_diagnostics: pd.DataFrame,
+    normalization_detail: pd.DataFrame,
+    *,
+    observation_number: int,
+    seed: int,
+    output_dir: Path,
+) -> None:
+    """Plot Bayes-cycle log-ratio agreement, ESS, and conditional Z_eta."""
+
+    fig, axes = plt.subplots(2, 3, figsize=(13.2, 7.8), constrained_layout=True)
+    rng = np.random.default_rng(int(seed))
+    for column, method in enumerate(METHODS):
+        likelihood_log_odds, posterior_log_odds = cycle_arrays[method]
+        show = rng.choice(
+            len(likelihood_log_odds),
+            min(8_000, len(likelihood_log_odds)),
+            replace=False,
+        )
+        pooled = np.concatenate(
+            [likelihood_log_odds[show], posterior_log_odds[show]]
+        )
+        low, high = np.quantile(pooled, [0.005, 0.995])
+        if not np.isfinite(high - low) or high <= low:
+            center = float(np.median(pooled))
+            low, high = center - 1.0, center + 1.0
+        axes[0, column].scatter(
+            likelihood_log_odds[show], posterior_log_odds[show],
+            s=3, alpha=0.12, color=METHOD_COLORS[method], rasterized=True,
+        )
+        axes[0, column].plot([low, high], [low, high], "k--", lw=1)
+        axes[0, column].set(
+            title=METHOD_LABELS[method],
+            xlabel="likelihood-route centered log ratio",
+            ylabel="posterior-implied centered log ratio",
+            xlim=(low, high), ylim=(low, high),
+        )
+        axes[0, column].grid(alpha=0.2)
+
+    route = route_diagnostics.set_index("method")
+    axes[1, 0].bar(
+        ["flow", "multi", "binary"],
+        [route.loc[method, "ESS_fraction"] for method in METHODS],
+        color=[METHOD_COLORS[method] for method in METHODS],
+    )
+    axes[1, 0].set(
+        title="likelihood-route importance efficiency",
+        ylabel="ESS / proposal rows", ylim=(0, 1.02),
+    )
+    axes[1, 1].bar(
+        ["flow", "multi", "binary"],
+        [route.loc[method, "bayes_cycle_residual_rms"] for method in METHODS],
+        color=[METHOD_COLORS[method] for method in METHODS],
+    )
+    axes[1, 1].set(
+        title="Bayes-cycle discrepancy", ylabel="centered log-ratio RMS"
+    )
+    for method in METHODS:
+        selected = normalization_detail.loc[
+            normalization_detail["method"] == method, "log_Z"
+        ]
+        axes[1, 2].plot(
+            np.arange(1, len(selected) + 1), selected, "o-", ms=3,
+            lw=1, color=METHOD_COLORS[method], label=METHOD_LABELS[method],
+        )
+    axes[1, 2].axhline(0.0, color="black", ls="--", lw=1)
+    axes[1, 2].set(
+        title=r"conditional likelihood normalization",
+        xlabel=r"posterior-relevant $\theta$ index", ylabel=r"$\log Z_\eta(\theta)$",
+    )
+    axes[1, 2].legend(fontsize=6)
+    for ax in axes[1]:
+        ax.grid(alpha=0.2)
+    _export_figure(
+        fig, output_dir, f"likelihood_route_diagnostics_observation_{observation_number}"
+    )
+    plt.show()
+
+
 def plot_posterior_weights(
     diagnostic_frame: pd.DataFrame,
     raw_weights: Mapping[str, np.ndarray],
@@ -1664,6 +2168,7 @@ def _save_sample_archives(
     observation_number: int,
     posterior_reference: np.ndarray,
     posterior: Mapping[str, np.ndarray],
+    likelihood_posterior: Mapping[str, np.ndarray],
     predictive_reference_theta: np.ndarray,
     predictive_reference_x: np.ndarray,
     predictive: Mapping[str, tuple[np.ndarray, np.ndarray]],
@@ -1672,6 +2177,7 @@ def _save_sample_archives(
     campaign_seed: int,
     simulator_backend: str,
     widths: np.ndarray,
+    flow_members: int,
 ) -> None:
     common = {
         "method_keys": np.asarray(METHODS),
@@ -1680,6 +2186,13 @@ def _save_sample_archives(
         "campaign_seed": np.asarray(campaign_seed),
         "simulator_backend": np.asarray(simulator_backend),
         "metric_schema": np.asarray(METRIC_SCHEMA),
+        "flow_members": np.asarray(int(flow_members)),
+        "defensive_broad_fraction": np.asarray(
+            DEFENSIVE_PROPOSAL_CONFIG["broad_fraction"]
+        ),
+        "defensive_broad_base_scale": np.asarray(
+            DEFENSIVE_PROPOSAL_CONFIG["broad_base_scale"]
+        ),
     }
     posterior_path = result_root / (
         f"{task_name}__{run_tag}__observation{observation_number}__posterior_samples.npz"
@@ -1690,6 +2203,11 @@ def _save_sample_archives(
         simple_flow_theta=posterior[METHOD_FLOW],
         hybrid_multiclass_theta=posterior[METHOD_MULTICLASS],
         hybrid_binary_theta=posterior[METHOD_BINARY],
+        likelihood_route_simple_flow_theta=likelihood_posterior[METHOD_FLOW],
+        likelihood_route_hybrid_multiclass_theta=likelihood_posterior[
+            METHOD_MULTICLASS
+        ],
+        likelihood_route_hybrid_binary_theta=likelihood_posterior[METHOD_BINARY],
         **common,
     )
     predictive_path = result_root / (
@@ -1713,13 +2231,17 @@ def _save_sample_archives(
 
 
 def plot_metric_summary(metrics: pd.DataFrame, output_dir: Path) -> None:
-    fig, axes = plt.subplots(1, 3, figsize=(13.5, 3.9), constrained_layout=True)
+    fig, axes = plt.subplots(1, 4, figsize=(17.5, 3.9), constrained_layout=True)
     for method in METHODS:
         selected = metrics.loc[metrics["method"] == method].sort_values("num_observation")
         axes[0].plot(selected["num_observation"], selected["posterior_C2ST"], "o-", color=METHOD_COLORS[method], label=METHOD_LABELS[method])
-        axes[1].plot(selected["num_observation"], selected["predictive_x_C2ST"], "o-", color=METHOD_COLORS[method], label=METHOD_LABELS[method])
-        axes[2].plot(selected["num_observation"], selected["predictive_joint_C2ST"], "o-", color=METHOD_COLORS[method], label=METHOD_LABELS[method])
-    for ax, title in zip(axes, ("posterior", "predictive x", "predictive joint")):
+        axes[1].plot(selected["num_observation"], selected["likelihood_posterior_C2ST"], "o-", color=METHOD_COLORS[method], label=METHOD_LABELS[method])
+        axes[2].plot(selected["num_observation"], selected["predictive_x_C2ST"], "o-", color=METHOD_COLORS[method], label=METHOD_LABELS[method])
+        axes[3].plot(selected["num_observation"], selected["predictive_joint_C2ST"], "o-", color=METHOD_COLORS[method], label=METHOD_LABELS[method])
+    for ax, title in zip(
+        axes,
+        ("posterior route", "likelihood route", "predictive x", "predictive joint"),
+    ):
         ax.axhline(0.5, color="black", ls="--", lw=1)
         ax.set(title=f"{title} C2ST", xlabel="observation", ylabel="C2ST", ylim=(0.45, 1.0))
         ax.grid(alpha=0.25)
@@ -1821,6 +2343,13 @@ def run_task(
         "bank_contract": "fresh_disjoint_by_role_specific_rng_seed_and_persistent_path",
         "flow_model": flow_model_config(),
         "flow_training": flow_training_config(campaign),
+        "flow_ensemble": {
+            "members": int(campaign["flow_members"]),
+            "member_weights": "equal",
+            "training_rows": "same_complete_flow_bank_per_member",
+            "member_diversity": "independent_initialization_split_and_shuffle_seed",
+        },
+        "defensive_proposal": defensive_proposal_config(),
         "classifier": {
             "members": campaign["classifier_members"],
             "width": campaign["classifier_width"],
@@ -1971,6 +2500,9 @@ def run_task(
 
     metric_rows = []
     posterior_diagnostic_rows = []
+    likelihood_route_diagnostic_rows = []
+    likelihood_normalization_summary_rows = []
+    likelihood_normalization_detail_rows = []
     predictive_diagnostic_rows = []
     contrast_rows = []
     labels = task.get_labels_parameters()
@@ -1987,7 +2519,12 @@ def run_task(
         print("\n" + "=" * 88)
         print(f"{task_name}: observation {observation_number}")
         observation_seed = task_seed + 50_000 + 1_000 * observation_number
-        posterior, posterior_diagnostics, raw_weights = draw_posterior_comparison(
+        (
+            posterior,
+            posterior_diagnostics,
+            raw_weights,
+            proposal_state,
+        ) = draw_posterior_comparison(
             task,
             transform,
             observation,
@@ -2008,12 +2545,75 @@ def run_task(
                 num_observation=int(observation_number)
             ).detach().cpu().numpy(),
         ).astype(np.float32)
+        (
+            likelihood_posterior,
+            likelihood_route_diagnostics,
+            likelihood_raw_weights,
+            cycle_arrays,
+        ) = draw_likelihood_route_comparison(
+            task,
+            transform,
+            q_eta,
+            classifiers,
+            proposal_state,
+            n_posterior=int(campaign["n_posterior"]),
+            seed=observation_seed + 50,
+        )
+        likelihood_route_diagnostics.insert(
+            0, "num_observation", observation_number
+        )
+        likelihood_route_diagnostic_rows.extend(
+            likelihood_route_diagnostics.to_dict("records")
+        )
+        normalization_rng = np.random.default_rng(observation_seed + 60)
+        n_normalization_theta = min(
+            int(campaign["likelihood_normalizer_theta"]), len(reference)
+        )
+        normalization_theta = reference[
+            normalization_rng.choice(
+                len(reference), n_normalization_theta, replace=False
+            )
+        ]
+        (
+            normalization_summary,
+            normalization_detail,
+        ) = estimate_likelihood_normalization(
+            transform,
+            normalization_theta,
+            q_eta,
+            classifiers,
+            n_candidates=int(campaign["likelihood_normalizer_candidates"]),
+            seed=observation_seed + 70,
+        )
+        normalization_summary.insert(0, "num_observation", observation_number)
+        normalization_detail.insert(0, "num_observation", observation_number)
+        likelihood_normalization_summary_rows.extend(
+            normalization_summary.to_dict("records")
+        )
+        likelihood_normalization_detail_rows.extend(
+            normalization_detail.to_dict("records")
+        )
         posterior_metrics = paired_distribution_metrics(
             reference,
             posterior,
             seed=observation_seed + 100,
             max_samples=metric_max,
         )
+        likelihood_posterior_metrics = paired_distribution_metrics(
+            reference,
+            likelihood_posterior,
+            seed=observation_seed + 110,
+            max_samples=metric_max,
+        )
+        route_agreement_metrics = {
+            method: distribution_pair_metrics(
+                posterior[method],
+                likelihood_posterior[method],
+                seed=observation_seed + 120 + method_index,
+                max_samples=metric_max,
+            )
+            for method_index, method in enumerate(METHODS)
+        }
         plot_posterior_comparison(
             reference,
             posterior,
@@ -2027,6 +2627,23 @@ def run_task(
             posterior_diagnostics,
             raw_weights,
             observation_number=observation_number,
+            output_dir=run_figure_dir,
+        )
+        plot_likelihood_route_posteriors(
+            reference,
+            posterior,
+            likelihood_posterior,
+            labels,
+            observation_number=observation_number,
+            task_name=task_name,
+            output_dir=run_figure_dir,
+        )
+        plot_likelihood_route_diagnostics(
+            cycle_arrays,
+            likelihood_route_diagnostics,
+            normalization_detail,
+            observation_number=observation_number,
+            seed=observation_seed + 250,
             output_dir=run_figure_dir,
         )
 
@@ -2090,6 +2707,7 @@ def run_task(
             observation_number,
             reference,
             posterior,
+            likelihood_posterior,
             reference_theta,
             reference_x,
             predictive,
@@ -2097,9 +2715,11 @@ def run_task(
             campaign_seed=seed,
             simulator_backend=simulator_backend,
             widths=widths,
+            flow_members=int(campaign["flow_members"]),
         )
         for space, arrays in (
             ("posterior", posterior),
+            ("likelihood_posterior", likelihood_posterior),
             ("predictive_x", {method: predictive[method][1] for method in METHODS}),
             ("predictive_joint", predictive_joint),
         ):
@@ -2121,6 +2741,8 @@ def run_task(
                         }
                     )
         posterior_diag = posterior_diagnostics.set_index("method")
+        likelihood_diag = likelihood_route_diagnostics.set_index("method")
+        normalization_diag = normalization_summary.set_index("method")
         predictive_diag = predictive_diagnostics.set_index("method")
         for method in METHODS:
             metric_rows.append(
@@ -2142,6 +2764,10 @@ def run_task(
                     "ratio_validation_simulations": campaign["ratio_validation_simulations"],
                     "audit_simulations": campaign["audit_simulations"],
                     "flow_members": campaign["flow_members"],
+                    "flow_coupling_blocks": FLOW_MODEL_CONFIG["n_coupling_layers"],
+                    "flow_hidden_width": FLOW_MODEL_CONFIG["hidden_features"],
+                    "defensive_broad_fraction": DEFENSIVE_PROPOSAL_CONFIG["broad_fraction"],
+                    "defensive_broad_base_scale": DEFENSIVE_PROPOSAL_CONFIG["broad_base_scale"],
                     "classifier_members": 0 if method == METHOD_FLOW else campaign["classifier_members"],
                     "classifier_factorization": (
                         "none" if method == METHOD_FLOW else "one_multiclass" if method == METHOD_MULTICLASS else "two_separate_binary"
@@ -2149,6 +2775,12 @@ def run_task(
                     "posterior_C2ST": posterior_metrics[method]["C2ST"],
                     "posterior_MMD2": posterior_metrics[method]["MMD2"],
                     "posterior_MMD": posterior_metrics[method]["MMD"],
+                    "likelihood_posterior_C2ST": likelihood_posterior_metrics[method]["C2ST"],
+                    "likelihood_posterior_MMD2": likelihood_posterior_metrics[method]["MMD2"],
+                    "likelihood_posterior_MMD": likelihood_posterior_metrics[method]["MMD"],
+                    "posterior_likelihood_route_C2ST": route_agreement_metrics[method]["C2ST"],
+                    "posterior_likelihood_route_MMD2": route_agreement_metrics[method]["MMD2"],
+                    "posterior_likelihood_route_MMD": route_agreement_metrics[method]["MMD"],
                     "predictive_x_C2ST": predictive_x_metrics[method]["C2ST"],
                     "predictive_x_MMD2": predictive_x_metrics[method]["MMD2"],
                     "predictive_x_MMD": predictive_x_metrics[method]["MMD"],
@@ -2157,6 +2789,14 @@ def run_task(
                     "predictive_joint_MMD": predictive_joint_metrics[method]["MMD"],
                     "posterior_ESS_fraction": posterior_diag.loc[method, "ESS_fraction"],
                     "posterior_max_weight": posterior_diag.loc[method, "max_weight"],
+                    "likelihood_posterior_ESS_fraction": likelihood_diag.loc[method, "ESS_fraction"],
+                    "likelihood_posterior_max_weight": likelihood_diag.loc[method, "max_weight"],
+                    "bayes_cycle_pearson": likelihood_diag.loc[method, "bayes_cycle_pearson"],
+                    "bayes_cycle_slope": likelihood_diag.loc[method, "bayes_cycle_slope"],
+                    "bayes_cycle_residual_rms": likelihood_diag.loc[method, "bayes_cycle_residual_rms"],
+                    "likelihood_log_Z_rms": normalization_diag.loc[method, "log_Z_rms"],
+                    "likelihood_log_Z_abs_p95": normalization_diag.loc[method, "log_Z_abs_p95"],
+                    "likelihood_log_Z_abs_max": normalization_diag.loc[method, "log_Z_abs_max"],
                     "predictive_candidate_ESS_fraction_mean": predictive_diag.loc[method, "candidate_ESS_fraction_mean"],
                     "predictive_candidate_ESS_fraction_min": predictive_diag.loc[method, "candidate_ESS_fraction_min"],
                     "predictive_candidate_max_weight_worst": predictive_diag.loc[method, "candidate_max_weight_worst"],
@@ -2169,6 +2809,15 @@ def run_task(
     metrics.to_csv(run_result_dir / "metrics.csv", index=False)
     pd.DataFrame(posterior_diagnostic_rows).to_csv(
         run_result_dir / "posterior_weight_diagnostics.csv", index=False
+    )
+    pd.DataFrame(likelihood_route_diagnostic_rows).to_csv(
+        run_result_dir / "likelihood_route_diagnostics.csv", index=False
+    )
+    pd.DataFrame(likelihood_normalization_summary_rows).to_csv(
+        run_result_dir / "likelihood_normalization_summary.csv", index=False
+    )
+    pd.DataFrame(likelihood_normalization_detail_rows).to_csv(
+        run_result_dir / "likelihood_normalization_by_theta.csv", index=False
     )
     pd.DataFrame(predictive_diagnostic_rows).to_csv(
         run_result_dir / "predictive_weight_diagnostics.csv", index=False

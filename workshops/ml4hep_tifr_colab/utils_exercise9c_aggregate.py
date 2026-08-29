@@ -83,6 +83,7 @@ def collect_campaign(
                     "method",
                     "num_observation",
                     "posterior_C2ST",
+                    "likelihood_posterior_C2ST",
                     "predictive_x_C2ST",
                     "predictive_joint_C2ST",
                 }
@@ -106,12 +107,18 @@ def collect_campaign(
 def _mean_table(metrics: pd.DataFrame) -> pd.DataFrame:
     columns = [
         "posterior_C2ST",
+        "likelihood_posterior_C2ST",
         "predictive_x_C2ST",
         "predictive_joint_C2ST",
         "posterior_MMD",
+        "likelihood_posterior_MMD",
         "predictive_x_MMD",
         "predictive_joint_MMD",
         "posterior_ESS_fraction",
+        "likelihood_posterior_ESS_fraction",
+        "posterior_likelihood_route_C2ST",
+        "bayes_cycle_residual_rms",
+        "likelihood_log_Z_rms",
         "predictive_candidate_ESS_fraction_mean",
     ]
     return (
@@ -164,11 +171,16 @@ def render_aggregate(
     plt.show()
 
     tasks_present = [task for task in ALL_TASKS if task in set(mean["task"])]
-    fig, axes = plt.subplots(1, 3, figsize=(16.0, 4.5), constrained_layout=True)
+    fig, axes = plt.subplots(1, 4, figsize=(20.0, 4.5), constrained_layout=True)
     for ax, metric, title in zip(
         axes,
-        ("posterior_C2ST", "predictive_x_C2ST", "predictive_joint_C2ST"),
-        ("posterior", "predictive x", "predictive joint"),
+        (
+            "posterior_C2ST",
+            "likelihood_posterior_C2ST",
+            "predictive_x_C2ST",
+            "predictive_joint_C2ST",
+        ),
+        ("posterior route", "likelihood route", "predictive x", "predictive joint"),
     ):
         x = np.arange(len(tasks_present))
         width = 0.24
@@ -202,6 +214,7 @@ def render_aggregate(
     pivot = mean.pivot(index="task", columns="method")
     delta_columns = [
         "posterior_C2ST",
+        "likelihood_posterior_C2ST",
         "predictive_x_C2ST",
         "predictive_joint_C2ST",
     ]
@@ -222,8 +235,8 @@ def render_aggregate(
             ax.text(column, row, f"{delta[row, column]:+.3f}", ha="center", va="center", fontsize=8)
     ax.set(
         title="multiclass − separate-binary C2ST (negative favors multiclass)",
-        xticks=range(3),
-        xticklabels=["posterior", "predictive x", "predictive joint"],
+        xticks=range(4),
+        xticklabels=["posterior route", "likelihood route", "predictive x", "predictive joint"],
         yticks=range(len(tasks_present)),
         yticklabels=[TASK_TITLES[task] for task in tasks_present],
     )
@@ -232,7 +245,7 @@ def render_aggregate(
     plt.show()
 
     corrected = metrics.loc[metrics["method"].isin([METHOD_MULTICLASS, METHOD_BINARY])]
-    fig, axes = plt.subplots(1, 2, figsize=(10.8, 4.2), constrained_layout=True)
+    fig, axes = plt.subplots(1, 3, figsize=(15.8, 4.2), constrained_layout=True)
     for method in (METHOD_MULTICLASS, METHOD_BINARY):
         selected = corrected.loc[corrected["method"] == method]
         axes[0].scatter(
@@ -251,8 +264,17 @@ def render_aggregate(
             color=METHOD_COLORS[method],
             label=METHOD_LABELS[method],
         )
+        axes[2].scatter(
+            selected["likelihood_posterior_C2ST"],
+            selected["likelihood_posterior_ESS_fraction"],
+            s=22,
+            alpha=0.65,
+            color=METHOD_COLORS[method],
+            label=METHOD_LABELS[method],
+        )
     axes[0].set(title="posterior accuracy vs weight efficiency", xlabel="posterior C2ST", ylabel="posterior ESS fraction")
     axes[1].set(title="predictive accuracy vs SIR efficiency", xlabel="predictive-joint C2ST", ylabel="candidate ESS fraction")
+    axes[2].set(title="likelihood-route accuracy vs weight efficiency", xlabel="likelihood-route posterior C2ST", ylabel="likelihood-route ESS fraction")
     for ax in axes:
         ax.grid(alpha=0.25)
         ax.legend(fontsize=7)
