@@ -1,0 +1,9 @@
+# Reproducible source, manifests, and notebook definitions are tracked.  The
+# potentially large products below live under PAPER_SUMMARY_ARTIFACT_ROOT
+# (Google Drive by default in Colab) and must not be committed accidentally.
+/artifacts/
+/simulation_banks/
+/models/
+/checkpoints/
+/results/
+/figures_scripts/
