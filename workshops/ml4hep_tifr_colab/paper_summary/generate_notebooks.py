@@ -114,15 +114,25 @@ if IN_COLAB:
     )
     SOURCE_DIR = repository / "workshops" / "ml4hep_tifr_colab" / "paper_summary"
 
+    # Colab already provides the numerical/ML stack used by these notebooks.
+    # Install only the two missing modern-runtime packages normally.  In
+    # particular, do not let sbibm pull its historical algorithm dependency
+    # tree into the current Colab Python environment (currently Python 3.13).
     modern_requirements = []
     if installed_version("nflows") != "0.14":
         modern_requirements.append("nflows==0.14")
-    if installed_version("sbibm") != "1.1.0":
-        modern_requirements.append("sbibm==1.1.0")
     if importlib.util.find_spec("pyro") is None:
         modern_requirements.append("pyro-ppl")
     if modern_requirements:
         run(sys.executable, "-m", "pip", "install", "-q", *modern_requirements)
+    if installed_version("sbibm") != "1.1.0":
+        # This is the same Python-3.13-safe installation used by Exercises 9
+        # and 10: the SLCP task/metrics need sbibm itself, nflows, and Pyro,
+        # but not sbibm's old pinned SBI/algorithm environment.
+        run(
+            sys.executable, "-m", "pip", "install", "-q", "--no-deps",
+            "sbibm==1.1.0",
+        )
 else:
     candidates = (
         Path.cwd(),
