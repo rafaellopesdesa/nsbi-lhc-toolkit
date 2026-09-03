@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import argparse
 import json
 from pathlib import Path
 
@@ -325,10 +326,15 @@ INSTALL_EXACT_JANA_ENV_IF_MISSING = (
         code(
             "paper-02-jana-environment",
             '''if RUN_EXACT_JANA_PAPER:
-    from utils_jana import ensure_jana_environment
+    # Reload so rerunning this cell after the setup cell pulls a repository
+    # update cannot retain an older helper from the current Colab process.
+    import importlib
+    import utils_jana
+
+    utils_jana = importlib.reload(utils_jana)
 
     print("Preparing the isolated exact-JANA runtime (first install can take several minutes).")
-    JANA_PYTHON = ensure_jana_environment(
+    JANA_PYTHON = utils_jana.ensure_jana_environment(
         ARTIFACT_ROOT,
         install_if_missing=INSTALL_EXACT_JANA_ENV_IF_MISSING,
     )
@@ -391,10 +397,15 @@ INSTALL_EXACT_JANA_ENV_IF_MISSING = (
         ),
         code(
             "paper-03-jana-environment",
-            '''from utils_jana import ensure_jana_environment
+            '''# Reload so rerunning this cell after the setup cell pulls a repository
+# update cannot retain an older helper from the current Colab process.
+import importlib
+import utils_jana
+
+utils_jana = importlib.reload(utils_jana)
 
 print("Preparing the isolated exact-JANA runtime (first install can take several minutes).")
-JANA_PYTHON = ensure_jana_environment(
+JANA_PYTHON = utils_jana.ensure_jana_environment(
     ARTIFACT_ROOT,
     install_if_missing=INSTALL_EXACT_JANA_ENV_IF_MISSING,
 )
@@ -460,17 +471,28 @@ display_result(COMPARISON_RESULT)
 }
 
 
-def write_notebooks() -> None:
+def write_notebooks(filenames: list[str] | None = None) -> None:
     """Write all generated notebooks with deterministic formatting."""
 
-    for filename, cells in NOTEBOOKS.items():
+    selected = NOTEBOOKS if filenames is None else {
+        filename: NOTEBOOKS[filename] for filename in filenames
+    }
+    for filename, cells in selected.items():
         path = HERE / filename
         path.write_text(json.dumps(notebook(cells), indent=1) + "\n")
         print("Wrote", path.name)
 
 
 def main() -> None:
-    write_notebooks()
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "filenames",
+        nargs="*",
+        choices=sorted(NOTEBOOKS),
+        help="Optional generated notebooks to update; defaults to all five.",
+    )
+    arguments = parser.parse_args()
+    write_notebooks(arguments.filenames or None)
 
 
 if __name__ == "__main__":

@@ -201,5 +201,9 @@ run:
 python workshops/ml4hep_tifr_colab/paper_summary/generate_notebooks.py
 ```
 
+Pass one or more notebook filenames to regenerate only those files, for
+example `python generate_notebooks.py 02_SLCP_JANA.ipynb 03_SLCP_hybrid.ipynb`.
+This is useful when executed results in another stage must remain untouched.
+
 The generator emits stable cell IDs and clean notebooks with no execution
 counts or outputs.  Running it twice must leave the files byte-identical.

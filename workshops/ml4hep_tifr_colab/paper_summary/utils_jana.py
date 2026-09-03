@@ -94,6 +94,35 @@ EXPECTED_TENSORFLOW_PROBABILITY = "0.20.1"
 EXPECTED_KERAS = "2.12.0"
 
 
+_INHERITED_PYTHON_ENVIRONMENT_KEYS = (
+    "PYTHONHOME",
+    "PYTHONPATH",
+    "PYTHONUSERBASE",
+    "VIRTUAL_ENV",
+    "PIP_TARGET",
+    "PIP_PREFIX",
+    "PIP_USER",
+    "PIP_REQUIRE_VIRTUALENV",
+    "UV_PROJECT_ENVIRONMENT",
+    "UV_PYTHON",
+)
+
+
+def _isolated_jana_subprocess_env() -> dict[str, str]:
+    """Return an environment which cannot redirect the legacy interpreter.
+
+    Colab's modern kernel can expose Python and pip path variables to child
+    processes.  Those values must not participate in either installation or
+    execution of the independent Python 3.11 JANA environment.
+    """
+
+    environment = os.environ.copy()
+    for key in _INHERITED_PYTHON_ENVIRONMENT_KEYS:
+        environment.pop(key, None)
+    environment["PYTHONNOUSERSITE"] = "1"
+    return environment
+
+
 @dataclass(frozen=True)
 class SLCPBank:
     """Verified arrays and provenance read from one fixed SLCP bank."""
@@ -2522,7 +2551,7 @@ def launch_isolated_campaign(
         command.append("--no-load-if-available")
     if force:
         command.append("--force")
-    subprocess.run(command, check=True)
+    subprocess.run(command, check=True, env=_isolated_jana_subprocess_env())
     summary_path = (
         Path(artifact_root).expanduser().resolve()
         / "jana_paper"
@@ -2559,6 +2588,7 @@ def resolve_jana_python(artifact_root: str | Path) -> Path:
         ]
     )
     failures = []
+    subprocess_environment = _isolated_jana_subprocess_env()
     seen_candidates = set()
     for candidate in candidates:
         candidate = candidate.expanduser()
@@ -2590,6 +2620,7 @@ def resolve_jana_python(artifact_root: str | Path) -> Path:
             ],
             text=True,
             capture_output=True,
+            env=subprocess_environment,
         )
         if check.returncode == 0:
             return candidate.resolve()
@@ -2606,6 +2637,73 @@ def resolve_jana_python(artifact_root: str | Path) -> Path:
         "incompatible jax/jaxlib pair, uninstall both there.\n"
         f"Runtime checks: {detail}"
     )
+
+
+def _probe_installed_jana_environment(
+    interpreter: Path,
+    environment: Path,
+    *,
+    subprocess_environment: Mapping[str, str],
+) -> Mapping[str, Any]:
+    """Verify that pip populated the selected Python 3.11 environment."""
+
+    probe = subprocess.run(
+        [
+            str(interpreter),
+            "-c",
+            (
+                "import json,numpy,site,sys,sysconfig; "
+                "print(json.dumps({"
+                "'python':sys.version.split()[0],"
+                "'executable':sys.executable,"
+                "'prefix':sys.prefix,"
+                "'base_prefix':sys.base_prefix,"
+                "'purelib':sysconfig.get_path('purelib'),"
+                "'site_packages':site.getsitepackages(),"
+                "'numpy':numpy.__version__}))"
+            ),
+        ],
+        text=True,
+        capture_output=True,
+        env=subprocess_environment,
+    )
+    pip_show = subprocess.run(
+        [str(interpreter), "-m", "pip", "--isolated", "show", "numpy"],
+        text=True,
+        capture_output=True,
+        env=subprocess_environment,
+    )
+    if probe.returncode != 0:
+        raise RuntimeError(
+            "The exact-JANA package installation returned success, but the "
+            "selected interpreter cannot import its pinned NumPy.\n"
+            f"Interpreter: {interpreter}\n"
+            f"Python probe stdout: {probe.stdout.strip()[-2000:]}\n"
+            f"Python probe stderr: {probe.stderr.strip()[-2000:]}\n"
+            f"pip show numpy: {(pip_show.stdout + pip_show.stderr).strip()[-2000:]}"
+        )
+    try:
+        payload = json.loads(probe.stdout.strip().splitlines()[-1])
+    except (IndexError, json.JSONDecodeError) as error:
+        raise RuntimeError(
+            f"Could not parse the exact-JANA environment probe: {probe.stdout}"
+        ) from error
+    expected_prefix = environment.resolve()
+    actual_prefix = Path(payload["prefix"]).resolve()
+    purelib = Path(payload["purelib"]).resolve()
+    if actual_prefix != expected_prefix or not purelib.is_relative_to(expected_prefix):
+        raise RuntimeError(
+            "The exact-JANA interpreter is resolving packages outside its "
+            f"environment: expected prefix={expected_prefix}, probe={payload}"
+        )
+    if payload.get("python", "").split(".")[:2] != ["3", "11"]:
+        raise RuntimeError(f"Exact-JANA did not resolve Python 3.11: {payload}")
+    if payload.get("numpy") != EXPECTED_NUMPY:
+        raise RuntimeError(
+            f"Exact-JANA needs NumPy {EXPECTED_NUMPY}; probe={payload}"
+        )
+    print("Exact-JANA installation probe:", json.dumps(payload, sort_keys=True))
+    return payload
 
 
 def ensure_jana_environment(
@@ -2660,6 +2758,10 @@ def ensure_jana_environment(
     else:
         uv_prefix = [uv_executable]
 
+    subprocess_environment = _isolated_jana_subprocess_env()
+    uv_environment = os.environ.copy()
+    for key in ("VIRTUAL_ENV", "UV_PROJECT_ENVIRONMENT", "UV_PYTHON"):
+        uv_environment.pop(key, None)
     try:
         python311_usable = False
         if interpreter.is_file():
@@ -2674,6 +2776,7 @@ def ensure_jana_environment(
                 ],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
+                env=subprocess_environment,
             )
             python311_usable = probe.returncode == 0
         # Recreate our runtime-local environment whenever the complete JANA
@@ -2713,17 +2816,23 @@ def ensure_jana_environment(
                 # recursive deletion.  uv limits --clear to this validated path.
                 venv_command.append("--clear")
             print(f"Rebuilding isolated exact-JANA environment: {environment}")
-            subprocess.run([*venv_command, str(environment)], check=True)
+            subprocess.run(
+                [*venv_command, str(environment)],
+                check=True,
+                env=uv_environment,
+            )
         else:
             pip_probe = subprocess.run(
                 [str(interpreter), "-m", "pip", "--version"],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
+                env=subprocess_environment,
             )
             if pip_probe.returncode != 0:
                 subprocess.run(
                     [str(interpreter), "-m", "ensurepip", "--upgrade"],
                     check=True,
+                    env=subprocess_environment,
                 )
 
         # Use the environment's interpreter for installation, rather than
@@ -2736,14 +2845,23 @@ def ensure_jana_environment(
                 str(interpreter),
                 "-m",
                 "pip",
+                "--isolated",
                 "install",
                 "--no-input",
                 "--disable-pip-version-check",
+                "--ignore-installed",
+                "--no-user",
                 "--no-deps",
                 "--requirement",
                 str(requirements),
             ],
             check=True,
+            env=subprocess_environment,
+        )
+        _probe_installed_jana_environment(
+            interpreter,
+            environment,
+            subprocess_environment=subprocess_environment,
         )
     except subprocess.CalledProcessError as error:
         raise RuntimeError(
@@ -2970,7 +3088,7 @@ def _launch_isolated_evaluation(
     ]
     if not load_if_available:
         command.append("--no-load-if-available")
-    subprocess.run(command, check=True)
+    subprocess.run(command, check=True, env=_isolated_jana_subprocess_env())
     manifest_path = output_directory / "evaluation_manifest.json"
     if not manifest_path.is_file():
         raise RuntimeError(f"Isolated JANA evaluation did not write {manifest_path}.")
@@ -3010,7 +3128,7 @@ def _launch_isolated_ratio_export(
     ]
     if not load_if_available:
         command.append("--no-load-if-available")
-    subprocess.run(command, check=True)
+    subprocess.run(command, check=True, env=_isolated_jana_subprocess_env())
     manifest_path = output_directory / "manifest.json"
     if not manifest_path.is_file():
         raise RuntimeError(f"Isolated ratio export did not write {manifest_path}.")
