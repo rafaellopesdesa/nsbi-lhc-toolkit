@@ -187,7 +187,9 @@ tables, sample archives, and PNG/PDF figures beneath the artifact root.
 The exact baseline runs in an isolated Python 3.11 environment.  Notebooks 02
 and 03 can create it from `requirements_jana.txt`.  In Colab the environment
 is runtime-local at `/content/paper_summary_jana_env` while results remain on
-Drive; an existing environment may instead be selected with
+Drive.  If this managed environment is left incomplete by an interrupted
+installation, rerunning the environment cell rebuilds it from scratch.  An
+existing environment may instead be selected with
 `PAPER_SUMMARY_JANA_ENV` or `PAPER_SUMMARY_JANA_PYTHON`.
 
 ## Maintaining the notebooks

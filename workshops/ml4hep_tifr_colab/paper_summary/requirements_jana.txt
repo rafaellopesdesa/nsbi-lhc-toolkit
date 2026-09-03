@@ -6,6 +6,7 @@
 # precise historical commit used by that paper.  The upstream file also listed
 # jax==0.4.10 without pinning jaxlib; JANA does not import JAX, so both are
 # intentionally omitted to avoid a modern jaxlib/old-ml-dtypes resolver clash.
+# The environment helper installs this complete frozen set with --no-deps.
 
 absl-py==1.4.0
 aesara==2.9.0

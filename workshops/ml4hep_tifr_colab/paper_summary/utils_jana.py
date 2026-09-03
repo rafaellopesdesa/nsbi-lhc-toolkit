@@ -2559,7 +2559,13 @@ def resolve_jana_python(artifact_root: str | Path) -> Path:
         ]
     )
     failures = []
+    seen_candidates = set()
     for candidate in candidates:
+        candidate = candidate.expanduser()
+        candidate_key = str(candidate.resolve())
+        if candidate_key in seen_candidates:
+            continue
+        seen_candidates.add(candidate_key)
         if not candidate.is_file():
             continue
         check = subprocess.run(
@@ -2593,7 +2599,7 @@ def resolve_jana_python(artifact_root: str | Path) -> Path:
     raise RuntimeError(
         "Exact JANA needs an isolated Python 3.11 environment. Create it with:\n"
         "  python3.11 -m venv /path/to/jana-env\n"
-        f"  /path/to/jana-env/bin/python -m pip install -r {requirements}\n"
+        f"  /path/to/jana-env/bin/python -m pip install --no-deps -r {requirements}\n"
         "  export PAPER_SUMMARY_JANA_ENV=/path/to/jana-env\n"
         "  export PAPER_SUMMARY_JANA_PYTHON=/path/to/jana-env/bin/python\n"
         "The JANA code does not use JAX; if a pre-existing environment has an "
@@ -2630,6 +2636,7 @@ def ensure_jana_environment(
     if not requirements.is_file():
         raise FileNotFoundError(f"Missing exact-JANA requirements: {requirements}")
     configured_environment = os.environ.get("PAPER_SUMMARY_JANA_ENV")
+    managed_environment = not configured_environment
     if configured_environment:
         environment = Path(configured_environment).expanduser().resolve()
     elif Path("/content").is_dir():
@@ -2669,7 +2676,14 @@ def ensure_jana_environment(
                 stderr=subprocess.DEVNULL,
             )
             python311_usable = probe.returncode == 0
-        if not python311_usable:
+        # Recreate our runtime-local environment whenever the complete JANA
+        # validation above failed.  Merely finding a working Python 3.11
+        # executable is not enough: an interrupted Colab installation can
+        # leave that executable behind with an empty site-packages directory.
+        # Explicitly configured environments are repaired in place when their
+        # interpreter is already Python 3.11.
+        recreate_environment = managed_environment or not python311_usable
+        if recreate_environment:
             resolved_environment = environment.resolve()
             source_directory = Path(__file__).resolve().parent
             protected = {
@@ -2687,19 +2701,45 @@ def ensure_jana_environment(
                     "Refusing to clear an unsafe PAPER_SUMMARY_JANA_ENV target: "
                     f"{resolved_environment}"
                 )
-            venv_command = [*uv_prefix, "venv", "--python", "3.11"]
+            venv_command = [
+                *uv_prefix,
+                "venv",
+                "--python",
+                "3.11",
+                "--seed",
+            ]
             if environment.exists() or environment.is_symlink():
                 # Recover safely from a stale/broken Colab venv without a broad
                 # recursive deletion.  uv limits --clear to this validated path.
                 venv_command.append("--clear")
+            print(f"Rebuilding isolated exact-JANA environment: {environment}")
             subprocess.run([*venv_command, str(environment)], check=True)
+        else:
+            pip_probe = subprocess.run(
+                [str(interpreter), "-m", "pip", "--version"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            if pip_probe.returncode != 0:
+                subprocess.run(
+                    [str(interpreter), "-m", "ensurepip", "--upgrade"],
+                    check=True,
+                )
+
+        # Use the environment's interpreter for installation, rather than
+        # asking the kernel's uv process to infer the target.  --no-deps keeps
+        # the audited frozen package set exact and intentionally avoids the
+        # unused JAX dependency carried by TensorFlow 2.12 metadata.
+        print(f"Installing pinned exact-JANA packages into: {environment}")
         subprocess.run(
             [
-                *uv_prefix,
+                str(interpreter),
+                "-m",
                 "pip",
                 "install",
-                "--python",
-                str(interpreter),
+                "--no-input",
+                "--disable-pip-version-check",
+                "--no-deps",
                 "--requirement",
                 str(requirements),
             ],
@@ -2711,9 +2751,17 @@ def ensure_jana_environment(
             f"{environment}. The original resolution error was: "
             f"{initial_error_message}"
         ) from error
-
     os.environ["PAPER_SUMMARY_JANA_PYTHON"] = str(interpreter)
-    validated = resolve_jana_python(artifact_root)
+    try:
+        validated = resolve_jana_python(artifact_root)
+    except RuntimeError as validation_error:
+        os.environ.pop("PAPER_SUMMARY_JANA_PYTHON", None)
+        raise RuntimeError(
+            "The isolated exact-JANA installation completed but did not pass "
+            f"runtime validation at {environment}. Rerunning this cell will "
+            "rebuild the managed Colab environment from scratch. Validation "
+            f"details: {validation_error}"
+        ) from validation_error
     _atomic_write_json(
         environment / "paper_summary_environment.json",
         {
