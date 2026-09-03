@@ -2591,8 +2591,12 @@ def resolve_jana_python(artifact_root: str | Path) -> Path:
     subprocess_environment = _isolated_jana_subprocess_env()
     seen_candidates = set()
     for candidate in candidates:
-        candidate = candidate.expanduser()
-        candidate_key = str(candidate.resolve())
+        # Keep the virtual-environment launcher path intact. ``bin/python`` is
+        # normally a symlink to the base interpreter, and resolving that
+        # symlink before launching Python bypasses ``pyvenv.cfg`` and therefore
+        # the environment's site-packages (including its NumPy installation).
+        candidate = Path(os.path.abspath(candidate.expanduser()))
+        candidate_key = str(candidate)
         if candidate_key in seen_candidates:
             continue
         seen_candidates.add(candidate_key)
@@ -2600,7 +2604,7 @@ def resolve_jana_python(artifact_root: str | Path) -> Path:
             continue
         check = subprocess.run(
             [
-                str(candidate.resolve()),
+                str(candidate),
                 "-c",
                 (
                     "import json,numpy,tensorflow,bayesflow,platform; "
@@ -2623,7 +2627,7 @@ def resolve_jana_python(artifact_root: str | Path) -> Path:
             env=subprocess_environment,
         )
         if check.returncode == 0:
-            return candidate.resolve()
+            return candidate
         failures.append(f"{candidate}: {check.stderr.strip()[-500:]}")
     requirements = Path(__file__).resolve().parent / "requirements_jana.txt"
     detail = "\n".join(failures) if failures else "no candidate interpreter found"
