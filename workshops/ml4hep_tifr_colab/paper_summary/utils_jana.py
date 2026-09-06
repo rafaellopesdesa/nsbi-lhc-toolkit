@@ -57,6 +57,11 @@ from typing import Any, Mapping, Sequence
 import numpy as np
 
 try:
+    from .utils_concurrency import campaign_job_claim
+except ImportError:
+    from utils_concurrency import campaign_job_claim
+
+try:
     from config import (
         JANA_BAYESFLOW_COMMIT,
         JANA_PAPER_COMMIT,
@@ -3608,115 +3613,155 @@ def run_exact_jana_campaign(
         for seed in selected_seeds
     }
 
-    missing_pairs = [
+    requested_pairs = [
         (budget, seed)
         for budget in selected_budgets
         for seed in selected_seeds
-        if not (load_if_available and cached_pairs[(budget, seed)] is not None)
     ]
     banks = None
     legacy_python = None
     evaluation_input = None
-    if missing_pairs:
-        banks = _load_campaign_banks(artifact_root)
-        legacy_python = resolve_jana_python(artifact_root)
-        evaluation_input = _prepare_evaluation_input(
+    for budget, ml_seed in requested_pairs:
+        if load_if_available and cached_pairs[(budget, ml_seed)] is not None:
+            continue
+        job_key = f"budget={int(budget)}/seed={int(ml_seed)}"
+        with campaign_job_claim(
             artifact_root,
-            campaign,
-            banks=banks,
-            load_if_available=load_if_available,
-        )
-        launch_isolated_campaign(
-            legacy_python,
-            artifact_root=artifact_root,
-            master_bank_path=banks["master"]["path"],
-            shape_bank_path=banks["jana_shape"]["path"],
-            pilot_bank_path=banks["jana_pilot"]["path"],
-            validation_bank_path=banks["jana_validation"]["path"],
-            budgets=sorted({budget for budget, _ in missing_pairs}),
-            seeds=sorted({seed for _, seed in missing_pairs}),
-            profile=campaign["profile"],
-            load_if_available=load_if_available,
-        )
-    for budget, ml_seed in missing_pairs:
-        run_directory = default_run_directory(
-            artifact_root, budget=int(budget), seed=int(ml_seed)
-        )
-        output_directory = (
-            result_root
-            / f"budget_{int(budget)}"
-            / f"seed_{int(ml_seed)}"
-            / "standardized"
-        )
-        evaluation = _launch_isolated_evaluation(
-            legacy_python,
-            run_directory=run_directory,
-            input_path=evaluation_input,
-            output_directory=output_directory,
-            posterior_samples=int(campaign["posterior_samples"]),
-            proposal_candidates=int(campaign["proposal_candidates"]),
-            seed=int(ml_seed) + 500_000,
-            load_if_available=load_if_available,
-        )
-        pair_rows = _evaluate_saved_routes_modern(
+            campaign_signature=signature,
+            stage="exact_jana",
+            job_key=job_key,
+        ) as claim:
+            if not claim.acquired:
+                print(
+                    f"[exact JANA] Busy {job_key} "
+                    f"({claim.owner_summary}); taking the next job."
+                )
+                continue
+            if load_if_available and load_pair_shard(budget, ml_seed) is not None:
+                continue
+            action = "Reclaimed and running" if claim.reclaimed_stale else "Running"
+            print(f"[exact JANA] {action} {job_key}")
+            if banks is None:
+                banks = _load_campaign_banks(artifact_root)
+            if legacy_python is None:
+                legacy_python = resolve_jana_python(artifact_root)
+            if evaluation_input is None:
+                with campaign_job_claim(
+                    artifact_root,
+                    campaign_signature=signature,
+                    stage="exact_jana_shared",
+                    job_key="evaluation_input",
+                    wait=True,
+                    timeout_seconds=300.0,
+                ) as shared_claim:
+                    if not shared_claim.acquired:
+                        raise RuntimeError(
+                            "Timed out waiting for the shared exact-JANA "
+                            "evaluation input."
+                        )
+                    evaluation_input = _prepare_evaluation_input(
+                        artifact_root,
+                        campaign,
+                        banks=banks,
+                        load_if_available=load_if_available,
+                    )
+            launch_isolated_campaign(
+                legacy_python,
+                artifact_root=artifact_root,
+                master_bank_path=banks["master"]["path"],
+                shape_bank_path=banks["jana_shape"]["path"],
+                pilot_bank_path=banks["jana_pilot"]["path"],
+                validation_bank_path=banks["jana_validation"]["path"],
+                budgets=[int(budget)],
+                seeds=[int(ml_seed)],
+                profile=campaign["profile"],
+                load_if_available=load_if_available,
+            )
+            run_directory = default_run_directory(
+                artifact_root, budget=int(budget), seed=int(ml_seed)
+            )
+            output_directory = (
+                result_root
+                / f"budget_{int(budget)}"
+                / f"seed_{int(ml_seed)}"
+                / "standardized"
+            )
+            evaluation = _launch_isolated_evaluation(
+                legacy_python,
+                run_directory=run_directory,
+                input_path=evaluation_input,
+                output_directory=output_directory,
+                posterior_samples=int(campaign["posterior_samples"]),
+                proposal_candidates=int(campaign["proposal_candidates"]),
+                seed=int(ml_seed) + 500_000,
+                load_if_available=load_if_available,
+            )
+            pair_rows = _evaluate_saved_routes_modern(
                 artifact_root=artifact_root,
                 campaign=campaign,
                 budget=int(budget),
                 ml_seed=int(ml_seed),
                 evaluation_manifest=evaluation,
-        )
-        pair_frame = pd.DataFrame(pair_rows)
-        missing_diagnostics = [
-            name for name in campaign["diagnostics"] if name not in pair_frame.columns
-        ]
-        if missing_diagnostics:
-            raise RuntimeError(
-                "Exact-JANA output is missing configured diagnostics: "
-                f"{missing_diagnostics}"
             )
-        if (
-            len(pair_frame) != len(expected_observations)
-            or pair_frame["observation"].nunique() != len(expected_observations)
-            or not np.isfinite(
-                pair_frame[list(campaign["diagnostics"])].to_numpy(
-                    dtype=np.float64
+            pair_frame = pd.DataFrame(pair_rows)
+            missing_diagnostics = [
+                name
+                for name in campaign["diagnostics"]
+                if name not in pair_frame.columns
+            ]
+            if missing_diagnostics:
+                raise RuntimeError(
+                    "Exact-JANA output is missing configured diagnostics: "
+                    f"{missing_diagnostics}"
                 )
-            ).all()
-        ):
-            raise RuntimeError(
-                "Exact-JANA metric shard is incomplete or contains non-finite "
-                "configured diagnostics."
+            if (
+                len(pair_frame) != len(expected_observations)
+                or pair_frame["observation"].nunique()
+                != len(expected_observations)
+                or not np.isfinite(
+                    pair_frame[list(campaign["diagnostics"])].to_numpy(
+                        dtype=np.float64
+                    )
+                ).all()
+            ):
+                raise RuntimeError(
+                    "Exact-JANA metric shard is incomplete or contains non-finite "
+                    "configured diagnostics."
+                )
+            pair_csv, pair_manifest = pair_paths(int(budget), int(ml_seed))
+            _atomic_write_dataframe_csv(pair_csv, pair_frame)
+            checkpoint_path = run_directory / "checkpoint_manifest.json"
+            checkpoint = json.loads(checkpoint_path.read_text())
+            _atomic_write_json(
+                pair_manifest,
+                {
+                    "schema": JANA_EVALUATION_SCHEMA,
+                    "campaign_signature": signature,
+                    "budget": int(budget),
+                    "ml_seed": int(ml_seed),
+                    "rows": len(pair_frame),
+                    "csv_path": str(pair_csv),
+                    "csv_sha256": _sha256_file(pair_csv),
+                    "evaluation_manifest": str(
+                        output_directory / "evaluation_manifest.json"
+                    ),
+                    "checkpoint_manifest": str(checkpoint_path),
+                    "checkpoint_artifact_sha256": _checkpoint_artifact_sha256(
+                        checkpoint
+                    ),
+                    "updated_utc": _utc_now(),
+                },
             )
-        pair_csv, pair_manifest = pair_paths(int(budget), int(ml_seed))
-        _atomic_write_dataframe_csv(pair_csv, pair_frame)
-        checkpoint_path = run_directory / "checkpoint_manifest.json"
-        checkpoint = json.loads(checkpoint_path.read_text())
-        _atomic_write_json(
-            pair_manifest,
-            {
-                "schema": JANA_EVALUATION_SCHEMA,
-                "campaign_signature": signature,
-                "budget": int(budget),
-                "ml_seed": int(ml_seed),
-                "rows": len(pair_frame),
-                "csv_path": str(pair_csv),
-                "csv_sha256": _sha256_file(pair_csv),
-                "evaluation_manifest": str(
-                    output_directory / "evaluation_manifest.json"
-                ),
-                "checkpoint_manifest": str(checkpoint_path),
-                "checkpoint_artifact_sha256": _checkpoint_artifact_sha256(
-                    checkpoint
-                ),
-                "updated_utc": _utc_now(),
-            },
-        )
-    import fcntl
-
-    cached_path.parent.mkdir(parents=True, exist_ok=True)
-    lock_path = cached_path.parent / f"jana_paper_{signature}.lock"
-    with lock_path.open("a+") as lock_stream:
-        fcntl.flock(lock_stream.fileno(), fcntl.LOCK_EX)
+    with campaign_job_claim(
+        artifact_root,
+        campaign_signature=signature,
+        stage="exact_jana_aggregate",
+        job_key="metrics",
+        wait=True,
+        timeout_seconds=300.0,
+    ) as aggregate_claim:
+        if not aggregate_claim.acquired:
+            raise RuntimeError("Timed out waiting to aggregate exact-JANA shards.")
         all_pair_frames = []
         pair_manifest_paths = []
         for budget in campaign["budgets"]:
@@ -3728,7 +3773,11 @@ def run_exact_jana_campaign(
                         str(pair_paths(int(budget), int(ml_seed))[1])
                     )
         if not all_pair_frames:
-            raise RuntimeError("No valid exact-JANA metric shards are available.")
+            print(
+                "[exact JANA] No completed shard is available yet; "
+                "other workers may still be training."
+            )
+            return pd.DataFrame()
         merged = pd.concat(all_pair_frames, ignore_index=True)
         merged = (
             merged.drop_duplicates(
@@ -3789,7 +3838,6 @@ def run_exact_jana_campaign(
                 "updated_utc": _utc_now(),
             },
         )
-        fcntl.flock(lock_stream.fileno(), fcntl.LOCK_UN)
     return merged
 
 

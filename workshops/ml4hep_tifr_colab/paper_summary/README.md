@@ -156,6 +156,25 @@ write per-budget/per-seed atomic shards and aggregate when later notebooks are
 rerun.  Notebook 04 refuses to label a PAPER campaign complete until every
 registered budget, seed, observation, method, and diagnostic is present.
 
+Notebooks 01 and 02 may also be run as automatic parallel workers.  Open the
+same notebook in several independent Colab runtimes, leave
+`LOAD_IF_AVAILABLE=True`, mount the same default Drive artifact root, and run
+the notebook normally in each runtime.  Before an expensive unit starts, the
+runtime atomically claims its screen or `(budget, ML seed)` shard on Drive.  A
+runtime that finds that shard busy immediately moves to the next pending one,
+so no manual budget/seed assignment is required.  Completed, validated shards
+remain the source of truth; the claim only prevents two live runtimes from
+producing the same shard.
+
+Active claims heartbeat once per minute.  A claim left behind by an
+interrupted Colab runtime is automatically reclaimed after six hours without
+a heartbeat.  Claims live under `.paper_summary_locks` within the artifact
+root and are separated by campaign signature.  Set
+`PAPER_SUMMARY_WORKER_ID` before the run to give a runtime a recognizable name
+in progress messages.  `PAPER_SUMMARY_LOCK_STALE_HOURS` may override the stale
+interval when necessary.  Cross-runtime coordination requires the shared
+Drive artifact root; runtime-local artifact roots cannot see one another.
+
 ## Diagnostics and outputs
 
 All six methods are evaluated per observation, budget, and ML seed.  The

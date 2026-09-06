@@ -271,6 +271,10 @@ flow runs the full six-plateau schedule and deploys its final epoch.
 No official posterior samples, audit-bank rows, C2ST values, or residual-ratio
 diagnostics participate in selection.  The selected nominal checkpoints are
 the separate-flow baseline and are loaded unchanged by its correction stage.
+
+Several independent Colab runtimes may run this notebook against the same
+Drive artifact root.  Each runtime claims one pending capacity-screen tuple at
+a time and skips tuples already being trained by another live runtime.
 ''',
         ),
         code("paper-01-setup", COMMON_SETUP),
@@ -310,6 +314,10 @@ likelihood-route C2ST/MMD, route agreement, predictive closure, importance
 efficiency, Bayes-cycle and conditional-normalization checks, and comparison
 with the analytic SLCP likelihood.  Each is the direct control for corrections
 trained over that same flow base in notebook 03.
+
+Several independent Colab runtimes may run this notebook against the same
+Drive artifact root.  Each runtime claims one pending `(budget, ML seed)` shard
+at a time and skips shards already being trained by another live runtime.
 ''',
         ),
         code("paper-02-setup", COMMON_SETUP),

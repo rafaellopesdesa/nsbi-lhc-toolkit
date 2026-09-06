@@ -39,6 +39,11 @@ from scipy.special import logsumexp, ndtr, ndtri
 from scipy.spatial.distance import cdist, pdist
 from torch.utils.data import DataLoader, TensorDataset
 
+try:
+    from .utils_concurrency import campaign_job_claim
+except ImportError:
+    from utils_concurrency import campaign_job_claim
+
 
 PAPER_RUNTIME_SCHEMA = "slcp_paper_summary_v2"
 
@@ -3506,105 +3511,16 @@ def _capacity_paths(
     )
 
 
-def run_capacity_scan(
-    artifact_root: str | Path,
+def _finalize_capacity_scan(
+    artifact_root: Path,
     campaign: Mapping[str, Any],
     *,
-    budgets_to_run: Sequence[int] | None = None,
-    ml_seeds_to_run: Sequence[int] | None = None,
-    load_if_available: bool = True,
-    device: torch.device | None = None,
+    result_path: Path,
+    selection_path: Path,
+    signature: str,
 ) -> dict[str, Any]:
-    """Select the smallest flow within one SE of the best validation NLL."""
+    """Merge immutable screen shards and publish selection under one claim."""
 
-    paper_config = _config_module()
-    paper_config.validate_campaign_config(campaign)
-    artifact_root = Path(artifact_root).expanduser().resolve()
-    result_path, selection_path = _capacity_paths(artifact_root, campaign)
-    run_budgets = _execution_subset(
-        campaign["budgets"], budgets_to_run, "budget"
-    )
-    run_seeds = _execution_subset(
-        campaign["ml_seeds"], ml_seeds_to_run, "ML-seed"
-    )
-    device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    install_nflows_rqs_float64_retry()
-    rows: list[dict[str, Any]] = []
-    training_config = _flow_training_config(campaign, capacity_screen=True)
-    signature = paper_config.campaign_signature(campaign)
-    for budget in run_budgets:
-        bank = load_slcp_budget(artifact_root, int(budget))
-        train_ids = bank["training_ids"]
-        validation_ids = bank["validation_ids"]
-        routes = {
-            "posterior": (
-                bank["z"][train_ids], bank["x"][train_ids],
-                bank["z"][validation_ids], bank["x"][validation_ids],
-            ),
-            "likelihood": (
-                bank["x"][train_ids], bank["z"][train_ids],
-                bank["x"][validation_ids], bank["z"][validation_ids],
-            ),
-        }
-        for route, (target, context, val_target, val_context) in routes.items():
-            for architecture_index, architecture in enumerate(
-                campaign["flow_architecture_grid"]
-            ):
-                model_config = _flow_model_config(campaign, architecture)
-                architecture_key = _architecture_key(architecture)
-                for seed_index, ml_seed in enumerate(run_seeds):
-                    checkpoint = (
-                        artifact_root / "models" / "capacity" / signature
-                        / f"budget_{int(budget)}" / route / architecture_key
-                        / f"seed_{int(ml_seed)}" / "screen.pt"
-                    )
-                    row_path = checkpoint.parent / "screen_result.json"
-                    if load_if_available and row_path.exists():
-                        continue
-                    pack = train_spline_flow(
-                        target,
-                        context=context,
-                        validation_target=val_target,
-                        validation_context=val_context,
-                        checkpoint=checkpoint,
-                        model_config=model_config,
-                        training_config=training_config,
-                        device=device,
-                        seed=int(ml_seed) + 10_000 * architecture_index,
-                        load_if_available=load_if_available,
-                        verify_checkpoint_data=True,
-                    )
-                    validation_log_prob = spline_flow_log_prob(
-                        pack, val_target, context=val_context
-                    )
-                    losses = -np.asarray(validation_log_prob, dtype=np.float64)
-                    row = {
-                            "schema": PAPER_RUNTIME_SCHEMA,
-                            "campaign_signature": signature,
-                            "budget": int(budget),
-                            "route": route,
-                            "architecture": architecture_key,
-                            "n_coupling_layers": int(
-                                architecture["n_coupling_layers"]
-                            ),
-                            "hidden_features": int(
-                                architecture["hidden_features"]
-                            ),
-                            "ml_seed": int(ml_seed),
-                            "validation_nll": float(losses.mean()),
-                            "validation_nll_row_sem": float(
-                                losses.std(ddof=1) / math.sqrt(len(losses))
-                            ),
-                            "validation_rows": int(len(losses)),
-                            "parameter_count": flow_parameter_count(pack),
-                            "selected_epoch": int(
-                                pack["history"].get("selected_epoch", [0])[0]
-                            ),
-                            "split_fingerprint": bank["split_fingerprint"],
-                            "checkpoint": str(checkpoint),
-                        }
-                    rows.append(row)
-                    _write_json(row_path, row)
     result_files = sorted(
         (
             artifact_root / "models" / "capacity" / signature
@@ -3613,7 +3529,17 @@ def run_capacity_scan(
     collected = [json.loads(path.read_text()) for path in result_files]
     scan = pd.DataFrame(collected)
     if scan.empty:
-        raise RuntimeError("The capacity scan produced no result records.")
+        return {
+            "scan": scan,
+            "selection": None,
+            "complete": False,
+            "missing_screen_runs": (
+                len(campaign["budgets"])
+                * 2
+                * len(campaign["flow_architecture_grid"])
+                * len(campaign["ml_seeds"])
+            ),
+        }
     scan = scan.drop_duplicates(
         ["budget", "route", "architecture", "ml_seed"], keep="last"
     ).sort_values(["budget", "route", "parameter_count", "ml_seed"])
@@ -3694,6 +3620,144 @@ def run_capacity_scan(
         "complete": True,
         "missing_screen_runs": 0,
     }
+
+
+def run_capacity_scan(
+    artifact_root: str | Path,
+    campaign: Mapping[str, Any],
+    *,
+    budgets_to_run: Sequence[int] | None = None,
+    ml_seeds_to_run: Sequence[int] | None = None,
+    load_if_available: bool = True,
+    device: torch.device | None = None,
+) -> dict[str, Any]:
+    """Select the smallest flow within one SE of the best validation NLL."""
+
+    paper_config = _config_module()
+    paper_config.validate_campaign_config(campaign)
+    artifact_root = Path(artifact_root).expanduser().resolve()
+    result_path, selection_path = _capacity_paths(artifact_root, campaign)
+    run_budgets = _execution_subset(
+        campaign["budgets"], budgets_to_run, "budget"
+    )
+    run_seeds = _execution_subset(
+        campaign["ml_seeds"], ml_seeds_to_run, "ML-seed"
+    )
+    device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    install_nflows_rqs_float64_retry()
+    training_config = _flow_training_config(campaign, capacity_screen=True)
+    signature = paper_config.campaign_signature(campaign)
+    for budget in run_budgets:
+        bank = load_slcp_budget(artifact_root, int(budget))
+        train_ids = bank["training_ids"]
+        validation_ids = bank["validation_ids"]
+        routes = {
+            "posterior": (
+                bank["z"][train_ids], bank["x"][train_ids],
+                bank["z"][validation_ids], bank["x"][validation_ids],
+            ),
+            "likelihood": (
+                bank["x"][train_ids], bank["z"][train_ids],
+                bank["x"][validation_ids], bank["z"][validation_ids],
+            ),
+        }
+        for route, (target, context, val_target, val_context) in routes.items():
+            for architecture_index, architecture in enumerate(
+                campaign["flow_architecture_grid"]
+            ):
+                model_config = _flow_model_config(campaign, architecture)
+                architecture_key = _architecture_key(architecture)
+                for ml_seed in run_seeds:
+                    checkpoint = (
+                        artifact_root / "models" / "capacity" / signature
+                        / f"budget_{int(budget)}" / route / architecture_key
+                        / f"seed_{int(ml_seed)}" / "screen.pt"
+                    )
+                    row_path = checkpoint.parent / "screen_result.json"
+                    if load_if_available and row_path.exists():
+                        continue
+                    job_key = (
+                        f"budget={int(budget)}/route={route}/"
+                        f"architecture={architecture_key}/seed={int(ml_seed)}"
+                    )
+                    with campaign_job_claim(
+                        artifact_root,
+                        campaign_signature=signature,
+                        stage="capacity_screen",
+                        job_key=job_key,
+                    ) as claim:
+                        if not claim.acquired:
+                            print(
+                                f"[capacity] Busy {job_key} "
+                                f"({claim.owner_summary}); taking the next job."
+                            )
+                            continue
+                        if load_if_available and row_path.exists():
+                            continue
+                        action = "Reclaimed and running" if claim.reclaimed_stale else "Running"
+                        print(f"[capacity] {action} {job_key}")
+                        pack = train_spline_flow(
+                            target,
+                            context=context,
+                            validation_target=val_target,
+                            validation_context=val_context,
+                            checkpoint=checkpoint,
+                            model_config=model_config,
+                            training_config=training_config,
+                            device=device,
+                            seed=int(ml_seed) + 10_000 * architecture_index,
+                            load_if_available=load_if_available,
+                            verify_checkpoint_data=True,
+                        )
+                        validation_log_prob = spline_flow_log_prob(
+                            pack, val_target, context=val_context
+                        )
+                        losses = -np.asarray(
+                            validation_log_prob, dtype=np.float64
+                        )
+                        row = {
+                            "schema": PAPER_RUNTIME_SCHEMA,
+                            "campaign_signature": signature,
+                            "budget": int(budget),
+                            "route": route,
+                            "architecture": architecture_key,
+                            "n_coupling_layers": int(
+                                architecture["n_coupling_layers"]
+                            ),
+                            "hidden_features": int(
+                                architecture["hidden_features"]
+                            ),
+                            "ml_seed": int(ml_seed),
+                            "validation_nll": float(losses.mean()),
+                            "validation_nll_row_sem": float(
+                                losses.std(ddof=1) / math.sqrt(len(losses))
+                            ),
+                            "validation_rows": int(len(losses)),
+                            "parameter_count": flow_parameter_count(pack),
+                            "selected_epoch": int(
+                                pack["history"].get("selected_epoch", [0])[0]
+                            ),
+                            "split_fingerprint": bank["split_fingerprint"],
+                            "checkpoint": str(checkpoint),
+                        }
+                        _write_json(row_path, row)
+    with campaign_job_claim(
+        artifact_root,
+        campaign_signature=signature,
+        stage="capacity_aggregate",
+        job_key="scan_and_selection",
+        wait=True,
+        timeout_seconds=300.0,
+    ) as aggregate_claim:
+        if not aggregate_claim.acquired:
+            raise RuntimeError("Timed out waiting to aggregate capacity shards.")
+        return _finalize_capacity_scan(
+            artifact_root,
+            campaign,
+            result_path=result_path,
+            selection_path=selection_path,
+            signature=signature,
+        )
 
 
 def _load_selected_architectures(
@@ -4511,14 +4575,35 @@ def run_jana_campaign(
                     / "metrics.csv"
                 )
                 if not (load_if_available and per_run_path.exists()):
-                    trained = train_matched_flow_pair(
+                    job_key = f"budget={int(budget)}/seed={int(ml_seed)}"
+                    with campaign_job_claim(
                         artifact_root,
-                        campaign,
-                        budget=int(budget),
-                        ml_seed=int(ml_seed),
-                        load_if_available=load_if_available,
-                    )
-                    per_run = evaluate_matched_jana(
+                        campaign_signature=signature,
+                        stage="separate_flows",
+                        job_key=job_key,
+                    ) as claim:
+                        if not claim.acquired:
+                            print(
+                                f"[separate flows] Busy {job_key} "
+                                f"({claim.owner_summary}); taking the next job."
+                            )
+                            continue
+                        if load_if_available and per_run_path.exists():
+                            continue
+                        action = (
+                            "Reclaimed and running"
+                            if claim.reclaimed_stale
+                            else "Running"
+                        )
+                        print(f"[separate flows] {action} {job_key}")
+                        trained = train_matched_flow_pair(
+                            artifact_root=artifact_root,
+                            campaign=campaign,
+                            budget=int(budget),
+                            ml_seed=int(ml_seed),
+                            load_if_available=load_if_available,
+                        )
+                        per_run = evaluate_matched_jana(
                             artifact_root=artifact_root,
                             campaign=campaign,
                             budget=int(budget),
@@ -4526,21 +4611,38 @@ def run_jana_campaign(
                             q_phi=trained["q_phi"],
                             q_eta=trained["q_eta"],
                         )
-                    per_run_path.parent.mkdir(parents=True, exist_ok=True)
-                    _write_csv(per_run_path, per_run)
-        run_files = sorted(
-            (artifact_root / "results" / "separate_flows" / signature).glob(
-                "budget_*/seed_*/metrics.csv"
+                        per_run_path.parent.mkdir(parents=True, exist_ok=True)
+                        _write_csv(per_run_path, per_run)
+        with campaign_job_claim(
+            artifact_root,
+            campaign_signature=signature,
+            stage="separate_flows_aggregate",
+            job_key="metrics",
+            wait=True,
+            timeout_seconds=300.0,
+        ) as aggregate_claim:
+            if not aggregate_claim.acquired:
+                raise RuntimeError(
+                    "Timed out waiting to aggregate separate-flow shards."
+                )
+            run_files = sorted(
+                (artifact_root / "results" / "separate_flows" / signature).glob(
+                    "budget_*/seed_*/metrics.csv"
+                )
             )
-        )
-        if not run_files:
-            raise RuntimeError("No separate-flow metric shards were produced.")
-        matched = pd.concat(
-            [pd.read_csv(path) for path in run_files], ignore_index=True
-        ).drop_duplicates(
-            ["method", "budget", "ml_seed", "observation"], keep="last"
-        )
-        _write_csv(matched_path, matched)
+            if not run_files:
+                print(
+                    "[separate flows] No completed shard is available yet; "
+                    "other workers may still be training."
+                )
+                matched = pd.DataFrame()
+            else:
+                matched = pd.concat(
+                    [pd.read_csv(path) for path in run_files], ignore_index=True
+                ).drop_duplicates(
+                    ["method", "budget", "ml_seed", "observation"], keep="last"
+                )
+                _write_csv(matched_path, matched)
         output["separate_flows"] = matched
     if run_exact_paper:
         try:
