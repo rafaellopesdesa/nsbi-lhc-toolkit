@@ -4536,6 +4536,160 @@ def evaluate_matched_jana(
     return pd.DataFrame(rows)
 
 
+def _read_json_mapping(path: Path) -> dict[str, Any] | None:
+    try:
+        value = json.loads(path.read_text())
+    except (FileNotFoundError, OSError, json.JSONDecodeError):
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def _unused_recovery_path(path: Path, label: str) -> Path:
+    candidate = path.with_name(f"{path.name}.{label}")
+    index = 2
+    while candidate.exists():
+        candidate = path.with_name(f"{path.name}.{label}-{index}")
+        index += 1
+    return candidate
+
+
+def _preserve_nonreusable_exact_jana_evaluations(
+    *,
+    artifact_root: Path,
+    campaign_signature: str,
+    budgets: Sequence[int],
+    ml_seeds: Sequence[int],
+) -> list[Path]:
+    """Move stale/partial evaluation caches aside without touching checkpoints.
+
+    Exact-JANA training and evaluation share a per-pair result directory. If a
+    checkpoint is replaced after evaluation, the metric shard is correctly
+    rejected, but the legacy evaluator refuses to overwrite the now-stale
+    complete manifest. Interrupted evaluations can leave the same obstacle.
+    Preserve those products under a recovery name so the current, fingerprinted
+    checkpoint can be evaluated again with load_if_available=True.
+    """
+
+    preserved: list[Path] = []
+    result_root = (
+        artifact_root / "results" / "jana_paper" / campaign_signature
+    )
+    for budget in budgets:
+        for ml_seed in ml_seeds:
+            job_key = f"budget={int(budget)}/seed={int(ml_seed)}"
+            claim_probe = campaign_job_claim(
+                artifact_root,
+                campaign_signature=campaign_signature,
+                stage="exact_jana",
+                job_key=job_key,
+            )
+            if claim_probe.lock_directory.exists():
+                # Never move files which may belong to a live evaluator. The
+                # normal lease logic will reclaim an abandoned claim later.
+                continue
+
+            checkpoint_path = (
+                artifact_root
+                / "jana_paper"
+                / f"budget_n{int(budget):07d}"
+                / f"seed_{int(ml_seed)}"
+                / "checkpoint_manifest.json"
+            )
+            checkpoint = _read_json_mapping(checkpoint_path)
+            if (
+                checkpoint is None
+                or checkpoint.get("status") != "complete"
+                or not checkpoint.get("checkpoint_artifact_sha256")
+            ):
+                continue
+
+            pair_root = (
+                result_root
+                / f"budget_{int(budget)}"
+                / f"seed_{int(ml_seed)}"
+            )
+            output_directory = pair_root / "standardized"
+            try:
+                output_entries = list(output_directory.iterdir())
+            except (FileNotFoundError, OSError):
+                continue
+            if not output_entries:
+                continue
+
+            evaluation = _read_json_mapping(
+                output_directory / "evaluation_manifest.json"
+            )
+            current_artifact = str(
+                checkpoint["checkpoint_artifact_sha256"]
+            )
+            declared_outputs = (
+                evaluation.get("output_files", [])
+                if evaluation is not None
+                else []
+            )
+            declared_outputs_exist = bool(declared_outputs) and all(
+                isinstance(entry, dict)
+                and isinstance(entry.get("relative_path"), str)
+                and (output_directory / entry["relative_path"]).is_file()
+                and (
+                    entry.get("bytes") is None
+                    or (output_directory / entry["relative_path"]).stat().st_size
+                    == int(entry["bytes"])
+                )
+                for entry in declared_outputs
+            )
+            reusable = (
+                evaluation is not None
+                and evaluation.get("status") == "complete"
+                and evaluation.get("checkpoint_artifact_sha256")
+                == current_artifact
+                and evaluation.get("checkpoint_contract_sha256")
+                == checkpoint.get("training_contract_sha256")
+                and evaluation.get("driver_source_sha256")
+                == checkpoint.get("driver_source_sha256")
+                and evaluation.get("requirements_sha256")
+                == checkpoint.get("requirements_sha256")
+                and declared_outputs_exist
+            )
+            if reusable:
+                continue
+
+            previous_artifact = (
+                None
+                if evaluation is None
+                else evaluation.get("checkpoint_artifact_sha256")
+            )
+            state = "stale" if previous_artifact else "partial"
+            fingerprint = str(previous_artifact or current_artifact)[:12]
+            label = f"recovery-{state}-{fingerprint}"
+            archive = _unused_recovery_path(output_directory, label)
+            try:
+                output_directory.rename(archive)
+            except FileNotFoundError:
+                # Another recovery worker won the rename race.
+                continue
+            except OSError as error:
+                raise RuntimeError(
+                    "Could not preserve non-reusable exact-JANA evaluation "
+                    f"cache {output_directory}."
+                ) from error
+
+            for name in ("metrics.csv", "metrics.manifest.json"):
+                metric_path = pair_root / name
+                if not metric_path.exists():
+                    continue
+                metric_archive = _unused_recovery_path(metric_path, label)
+                metric_path.rename(metric_archive)
+                preserved.append(metric_archive)
+            preserved.append(archive)
+            print(
+                f"[exact JANA] Preserved {state} evaluation cache for "
+                f"{job_key} as {archive.name}; the trained checkpoint is "
+                "unchanged and will be reused."
+            )
+    return preserved
+
+
 def run_jana_campaign(
     artifact_root: str | Path,
     campaign: Mapping[str, Any],
@@ -4645,6 +4799,13 @@ def run_jana_campaign(
                 _write_csv(matched_path, matched)
         output["separate_flows"] = matched
     if run_exact_paper:
+        if load_if_available:
+            _preserve_nonreusable_exact_jana_evaluations(
+                artifact_root=artifact_root,
+                campaign_signature=signature,
+                budgets=run_budgets,
+                ml_seeds=run_seeds,
+            )
         try:
             from .utils_jana import run_exact_jana_campaign
         except ImportError:

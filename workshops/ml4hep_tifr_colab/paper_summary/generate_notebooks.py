@@ -352,9 +352,13 @@ INSTALL_EXACT_JANA_ENV_IF_MISSING = (
         code("paper-02-display-helper", DISPLAY_RESULT),
         code(
             "paper-02-run",
-            '''from utils import run_jana_campaign
+            '''import importlib
+import utils
 
-JANA_RESULT = run_jana_campaign(
+# Pull repository fixes into an already-open Colab runtime.
+utils = importlib.reload(utils)
+
+JANA_RESULT = utils.run_jana_campaign(
     artifact_root=ARTIFACT_ROOT,
     campaign=CAMPAIGN,
     run_exact_paper=RUN_EXACT_JANA_PAPER,
