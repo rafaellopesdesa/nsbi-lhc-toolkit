@@ -93,6 +93,11 @@ def _install_bayesflow_numerical_guards() -> None:
         left_edge, bottom_edge, widths, heights, derivatives = (
             tf.cast(value, tf.float64) for value in spline_params
         )
+        zero = tf.constant(0.0, tf.float64)
+        one = tf.constant(1.0, tf.float64)
+        two = tf.constant(2.0, tf.float64)
+        four = tf.constant(4.0, tf.float64)
+        half = tf.constant(0.5, tf.float64)
         result = tf.zeros_like(target)
 
         total_width = tf.reduce_sum(widths, axis=-1, keepdims=True)
@@ -136,31 +141,34 @@ def _install_bayesflow_numerical_guards() -> None:
             sk = dy / dx
 
             y_minus_yk = target_in - yk
-            curvature = dkp + dk - 2.0 * sk
+            curvature = dkp + dk - two * sk
             a = dy * (sk - dk) + y_minus_yk * curvature
             b = dy * dk - y_minus_yk * curvature
             c = -sk * y_minus_yk
-            discriminant = tf.maximum(b * b - 4.0 * a * c, 0.0)
+            discriminant = tf.maximum(b * b - four * a * c, zero)
             sqrt_discriminant = tf.math.sqrt(discriminant)
 
             # q avoids subtracting nearly equal numbers.  q/a and c/q are
             # the two roots; this branch is algebraically identical to the
             # root selected by the legacy implementation.
-            sign_b = tf.where(b >= 0.0, 1.0, -1.0)
-            q = -0.5 * (b + sign_b * sqrt_discriminant)
+            sign_b = tf.where(
+                b >= zero, tf.ones_like(b), -tf.ones_like(b)
+            )
+            q = -half * (b + sign_b * sqrt_discriminant)
             root_from_q = tf.where(
-                b >= 0.0,
+                b >= zero,
                 tf.math.divide_no_nan(c, q),
                 tf.math.divide_no_nan(q, a),
             )
             linear_root = tf.math.divide_no_nan(-c, b)
-            scale = tf.abs(b) + tf.abs(c) + 1.0
-            near_linear = tf.abs(a) <= np.finfo(np.float64).eps * scale
+            scale = tf.abs(b) + tf.abs(c) + one
+            epsilon = tf.constant(np.finfo(np.float64).eps, tf.float64)
+            near_linear = tf.abs(a) <= epsilon * scale
             xi = tf.where(near_linear, linear_root, root_from_q)
 
             # A monotone RQS has one inverse root in [0, 1].  Numerical
             # roundoff can move an endpoint by a few ulps only.
-            xi = tf.clip_by_value(xi, 0.0, 1.0)
+            xi = tf.clip_by_value(xi, zero, one)
             result_in = xi * dx + xk
             result = tf.tensor_scatter_nd_update(
                 result, target_in_idx, result_in
