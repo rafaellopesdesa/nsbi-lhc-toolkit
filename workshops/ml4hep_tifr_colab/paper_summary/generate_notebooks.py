@@ -338,11 +338,13 @@ INSTALL_EXACT_JANA_ENV_IF_MISSING = (
     # update cannot retain an older helper from the current Colab process.
     import importlib
     import utils_jana
+    import utils_jana_runtime
 
     utils_jana = importlib.reload(utils_jana)
+    utils_jana_runtime = importlib.reload(utils_jana_runtime)
 
     print("Preparing the isolated exact-JANA runtime (first install can take several minutes).")
-    JANA_PYTHON = utils_jana.ensure_jana_environment(
+    JANA_PYTHON = utils_jana_runtime.ensure_jana_environment(
         ARTIFACT_ROOT,
         install_if_missing=INSTALL_EXACT_JANA_ENV_IF_MISSING,
     )
@@ -413,11 +415,13 @@ INSTALL_EXACT_JANA_ENV_IF_MISSING = (
 # update cannot retain an older helper from the current Colab process.
 import importlib
 import utils_jana
+import utils_jana_runtime
 
 utils_jana = importlib.reload(utils_jana)
+utils_jana_runtime = importlib.reload(utils_jana_runtime)
 
 print("Preparing the isolated exact-JANA runtime (first install can take several minutes).")
-JANA_PYTHON = utils_jana.ensure_jana_environment(
+JANA_PYTHON = utils_jana_runtime.ensure_jana_environment(
     ARTIFACT_ROOT,
     install_if_missing=INSTALL_EXACT_JANA_ENV_IF_MISSING,
 )
