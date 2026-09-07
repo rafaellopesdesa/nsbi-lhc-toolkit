@@ -4690,6 +4690,75 @@ def _preserve_nonreusable_exact_jana_evaluations(
     return preserved
 
 
+def _launch_checkpoint_compatible_jana_evaluation(
+    python_executable: Path,
+    *,
+    run_directory: Path,
+    input_path: Path,
+    output_directory: Path,
+    posterior_samples: int,
+    proposal_candidates: int,
+    seed: int,
+    load_if_available: bool,
+) -> Mapping[str, Any]:
+    """Run evaluation-only numerical handling outside the hashed JANA driver."""
+
+    try:
+        from . import utils_jana as jana_runtime
+    except ImportError:
+        import utils_jana as jana_runtime
+
+    runner = Path(__file__).resolve().parent / "utils_jana_evaluation.py"
+    if not runner.is_file():
+        raise FileNotFoundError(f"Missing exact-JANA evaluation runner: {runner}")
+    command = [
+        str(python_executable),
+        str(runner),
+        "evaluate",
+        "--run-directory",
+        str(run_directory),
+        "--input",
+        str(input_path),
+        "--output-directory",
+        str(output_directory),
+        "--posterior-samples",
+        str(int(posterior_samples)),
+        "--proposal-candidates",
+        str(int(proposal_candidates)),
+        "--likelihood-route-samples",
+        str(int(posterior_samples)),
+        "--seed",
+        str(int(seed)),
+    ]
+    if not load_if_available:
+        command.append("--no-load-if-available")
+    completed = subprocess.run(
+        command,
+        text=True,
+        capture_output=True,
+        env=jana_runtime._isolated_jana_subprocess_env(),
+    )
+    if completed.returncode:
+        details = "\n".join(
+            part.strip()
+            for part in (completed.stdout, completed.stderr)
+            if part and part.strip()
+        )
+        raise RuntimeError(
+            "The isolated exact-JANA evaluation failed. Its trained checkpoint "
+            "was not modified. Isolated-process diagnostics:\n"
+            + (details[-12000:] or "(no subprocess output was captured)")
+        )
+    if completed.stdout.strip():
+        print(completed.stdout.strip())
+    manifest_path = output_directory / "evaluation_manifest.json"
+    if not manifest_path.is_file():
+        raise RuntimeError(
+            f"Isolated JANA evaluation did not write {manifest_path}."
+        )
+    return json.loads(manifest_path.read_text())
+
+
 def run_jana_campaign(
     artifact_root: str | Path,
     campaign: Mapping[str, Any],
@@ -4807,10 +4876,16 @@ def run_jana_campaign(
                 ml_seeds=run_seeds,
             )
         try:
-            from .utils_jana import run_exact_jana_campaign
+            from . import utils_jana as jana_runtime
         except ImportError:
-            from utils_jana import run_exact_jana_campaign
-        exact = run_exact_jana_campaign(
+            import utils_jana as jana_runtime
+        # The scientific/training driver is checkpoint-fingerprinted and must
+        # remain unchanged.  Replace only its modern-process evaluation
+        # launcher with the external, evaluation-only runner above.
+        jana_runtime._launch_isolated_evaluation = (
+            _launch_checkpoint_compatible_jana_evaluation
+        )
+        exact = jana_runtime.run_exact_jana_campaign(
             artifact_root=artifact_root,
             campaign=campaign,
             budgets_to_run=run_budgets,
