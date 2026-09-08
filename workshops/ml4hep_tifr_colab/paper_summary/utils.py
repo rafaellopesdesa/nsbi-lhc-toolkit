@@ -3447,6 +3447,97 @@ def _execution_subset(
     return selected
 
 
+# The third exact-JANA repetition at the largest budget did not survive its
+# Colab session.  Keep the frozen campaign identity and all other three-seed
+# comparisons intact, but treat these two completed, independently trained
+# repetitions as the planned exact-JANA grid at N=1,000,000.  This policy lives
+# outside config.py so it cannot change the campaign signature or invalidate
+# the expensive checkpoint contracts.
+_EXACT_JANA_ML_SEEDS_BY_BUDGET = {
+    1_000_000: (31_082_026, 31_082_027),
+}
+
+
+def _exact_jana_ml_seeds_for_budget(
+    campaign: Mapping[str, Any],
+    *,
+    budget: int,
+    requested_seeds: Sequence[int],
+) -> tuple[int, ...]:
+    """Return the accepted exact-JANA repetitions for one budget."""
+
+    campaign_seeds = tuple(int(value) for value in campaign["ml_seeds"])
+    requested = tuple(int(value) for value in requested_seeds)
+    accepted = _EXACT_JANA_ML_SEEDS_BY_BUDGET.get(
+        int(budget), campaign_seeds
+    )
+    unknown = set(accepted).difference(campaign_seeds)
+    if unknown:
+        raise RuntimeError(
+            "Exact-JANA repetition policy contains seeds outside the frozen "
+            f"campaign: {sorted(unknown)}"
+        )
+    accepted_set = set(accepted)
+    return tuple(seed for seed in requested if seed in accepted_set)
+
+
+def _exact_jana_budget_seed_groups(
+    campaign: Mapping[str, Any],
+    *,
+    budgets: Sequence[int],
+    requested_seeds: Sequence[int],
+) -> tuple[tuple[int, tuple[int, ...]], ...]:
+    """Represent the non-rectangular exact-JANA execution grid by budget."""
+
+    groups = []
+    for budget in budgets:
+        seeds = _exact_jana_ml_seeds_for_budget(
+            campaign,
+            budget=int(budget),
+            requested_seeds=requested_seeds,
+        )
+        if seeds:
+            groups.append((int(budget), seeds))
+    return tuple(groups)
+
+
+def _filter_exact_jana_grid(
+    frame: pd.DataFrame, campaign: Mapping[str, Any]
+) -> pd.DataFrame:
+    """Remove rows outside the accepted exact-JANA budget/seed grid."""
+
+    if frame.empty or not {"budget", "ml_seed"}.issubset(frame.columns):
+        return frame.copy()
+    accepted_pairs = {
+        (int(budget), int(seed))
+        for budget, seeds in _exact_jana_budget_seed_groups(
+            campaign,
+            budgets=campaign["budgets"],
+            requested_seeds=campaign["ml_seeds"],
+        )
+        for seed in seeds
+    }
+    mask = [
+        (int(row.budget), int(row.ml_seed)) in accepted_pairs
+        for row in frame[["budget", "ml_seed"]].itertuples(index=False)
+    ]
+    return frame.loc[mask].copy()
+
+
+def _expected_ml_seeds_for_method(
+    campaign: Mapping[str, Any], *, method: str, budget: int
+) -> tuple[int, ...]:
+    """Return the expected repetitions for one reported method and budget."""
+
+    if str(method).startswith("jana_paper"):
+        return _exact_jana_ml_seeds_for_budget(
+            campaign,
+            budget=int(budget),
+            requested_seeds=campaign["ml_seeds"],
+        )
+    return tuple(int(value) for value in campaign["ml_seeds"])
+
+
 def _flow_model_config(
     campaign: Mapping[str, Any], architecture: Mapping[str, Any]
 ) -> dict[str, Any]:
@@ -4868,13 +4959,6 @@ def run_jana_campaign(
                 _write_csv(matched_path, matched)
         output["separate_flows"] = matched
     if run_exact_paper:
-        if load_if_available:
-            _preserve_nonreusable_exact_jana_evaluations(
-                artifact_root=artifact_root,
-                campaign_signature=signature,
-                budgets=run_budgets,
-                ml_seeds=run_seeds,
-            )
         try:
             from . import utils_jana as jana_runtime
         except ImportError:
@@ -4885,15 +4969,37 @@ def run_jana_campaign(
         jana_runtime._launch_isolated_evaluation = (
             _launch_checkpoint_compatible_jana_evaluation
         )
-        exact = jana_runtime.run_exact_jana_campaign(
-            artifact_root=artifact_root,
-            campaign=campaign,
-            budgets_to_run=run_budgets,
-            ml_seeds_to_run=run_seeds,
-            load_if_available=load_if_available,
-        )
-        if not isinstance(exact, pd.DataFrame):
-            exact = pd.DataFrame(exact)
+        exact_frames = []
+        for budget, exact_seeds in _exact_jana_budget_seed_groups(
+            campaign,
+            budgets=run_budgets,
+            requested_seeds=run_seeds,
+        ):
+            if load_if_available:
+                _preserve_nonreusable_exact_jana_evaluations(
+                    artifact_root=artifact_root,
+                    campaign_signature=signature,
+                    budgets=(budget,),
+                    ml_seeds=exact_seeds,
+                )
+            current = jana_runtime.run_exact_jana_campaign(
+                artifact_root=artifact_root,
+                campaign=campaign,
+                budgets_to_run=(budget,),
+                ml_seeds_to_run=exact_seeds,
+                load_if_available=load_if_available,
+            )
+            if not isinstance(current, pd.DataFrame):
+                current = pd.DataFrame(current)
+            if not current.empty:
+                exact_frames.append(current)
+        if exact_frames:
+            exact = pd.concat(exact_frames, ignore_index=True).drop_duplicates(
+                ["method", "budget", "ml_seed", "observation"], keep="last"
+            )
+            exact = _filter_exact_jana_grid(exact, campaign)
+        else:
+            exact = pd.DataFrame()
         output["jana_paper"] = exact
     return output
 
@@ -6399,30 +6505,57 @@ def run_exact_jana_corrections(
         from utils_jana import export_exact_jana_ratio_banks, run_exact_jana_campaign
     artifact_root = Path(artifact_root).expanduser().resolve()
     signature = _config_module().campaign_signature(campaign)
-    exact_rows = run_exact_jana_campaign(
-        artifact_root,
+    exact_groups = _exact_jana_budget_seed_groups(
         campaign,
-        load_if_available=load_if_available,
-        budgets_to_run=budgets_to_run,
-        ml_seeds_to_run=ml_seeds_to_run,
+        budgets=budgets_to_run,
+        requested_seeds=ml_seeds_to_run,
     )
-    exports = export_exact_jana_ratio_banks(
-        artifact_root,
-        campaign,
-        load_if_available=load_if_available,
-        budgets_to_run=budgets_to_run,
-        ml_seeds_to_run=ml_seeds_to_run,
-    )
-    export_by_key = {
-        (int(item["budget"]), int(item["seed"])): item
-        for item in exports["runs"]
+    requested_pairs = {
+        (int(budget), int(seed))
+        for budget, seeds in exact_groups
+        for seed in seeds
     }
+    exact_frames = []
+    export_by_key = {}
+    for budget, exact_seeds in exact_groups:
+        current_rows = run_exact_jana_campaign(
+            artifact_root,
+            campaign,
+            load_if_available=load_if_available,
+            budgets_to_run=(budget,),
+            ml_seeds_to_run=exact_seeds,
+        )
+        if not isinstance(current_rows, pd.DataFrame):
+            current_rows = pd.DataFrame(current_rows)
+        if not current_rows.empty:
+            exact_frames.append(current_rows)
+        exports = export_exact_jana_ratio_banks(
+            artifact_root,
+            campaign,
+            load_if_available=load_if_available,
+            budgets_to_run=(budget,),
+            ml_seeds_to_run=exact_seeds,
+        )
+        for item in exports["runs"]:
+            key = (int(item["budget"]), int(item["seed"]))
+            if key in requested_pairs:
+                export_by_key[key] = item
+    exact_rows = (
+        _filter_exact_jana_grid(
+            pd.concat(exact_frames, ignore_index=True).drop_duplicates(
+                ["method", "budget", "ml_seed", "observation"], keep="last"
+            ),
+            campaign,
+        )
+        if exact_frames
+        else pd.DataFrame()
+    )
     expected_methods = {f"jana_paper_corrected_{value}" for value in factorizations}
     expected_observations = {
         int(value) for value in campaign["observations"]
     }
-    for budget in budgets_to_run:
-        for ml_seed in ml_seeds_to_run:
+    for budget, exact_seeds in exact_groups:
+        for ml_seed in exact_seeds:
             per_run_path = (
                 artifact_root
                 / "results"
@@ -6502,8 +6635,8 @@ def run_exact_jana_corrections(
     requested_keys = {
         (method, int(budget), int(seed), int(observation))
         for method in expected_methods
-        for budget in budgets_to_run
-        for seed in ml_seeds_to_run
+        for budget, exact_seeds in exact_groups
+        for seed in exact_seeds
         for observation in expected_observations
     }
     obtained_keys = {
@@ -6750,6 +6883,23 @@ def build_paper_comparison(
     if not tables:
         raise FileNotFoundError("No completed metric tables were found.")
     long = pd.concat(tables.values(), ignore_index=True, sort=False)
+    accepted_grid = {
+        (str(method), int(budget), int(seed))
+        for method in campaign["methods"]
+        for budget in campaign["budgets"]
+        for seed in _expected_ml_seeds_for_method(
+            campaign, method=str(method), budget=int(budget)
+        )
+    }
+    long = long.loc[
+        [
+            (str(row.method), int(row.budget), int(row.ml_seed))
+            in accepted_grid
+            for row in long[["method", "budget", "ml_seed"]].itertuples(
+                index=False
+            )
+        ]
+    ].copy()
     expected_methods = set(campaign["methods"])
     present_methods = set(long["method"].astype(str))
     if require_complete and present_methods != expected_methods:
@@ -6766,7 +6916,9 @@ def build_paper_comparison(
         (method, int(budget), int(seed), int(observation))
         for method in expected_methods
         for budget in campaign["budgets"]
-        for seed in campaign["ml_seeds"]
+        for seed in _expected_ml_seeds_for_method(
+            campaign, method=method, budget=int(budget)
+        )
         for observation in campaign["observations"]
     }
     actual_keys = {
@@ -7041,6 +7193,19 @@ def build_paper_comparison(
         "missing_tables": sorted(missing_tables),
         "missing_rows": len(missing_keys),
         "metric_columns": metric_columns,
+        "expected_ml_seeds_by_method_budget": [
+            {
+                "method": str(method),
+                "budget": int(budget),
+                "ml_seeds": list(
+                    _expected_ml_seeds_for_method(
+                        campaign, method=str(method), budget=int(budget)
+                    )
+                ),
+            }
+            for method in sorted(expected_methods)
+            for budget in campaign["budgets"]
+        ],
         "paired_contrast_convention": (
             "raw_difference_is_treatment_minus_control; "
             "positive_oriented_improvement_always_means_closer_to_metric_goal"
