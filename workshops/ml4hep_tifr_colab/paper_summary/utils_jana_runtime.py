@@ -44,7 +44,7 @@ def _run_repair(
     )
 
 
-def ensure_jana_environment(
+def _ensure_pinned_environment(
     artifact_root: str | Path,
     install_if_missing: bool = True,
 ) -> Path:
@@ -156,6 +156,21 @@ def ensure_jana_environment(
         f"Initial installer error:\n{initial_error}\n\n"
         + "\n\n".join(diagnostics)
     ) from initial_error
+
+
+def ensure_jana_environment(
+    artifact_root: str | Path,
+    install_if_missing: bool = True,
+    *,
+    require_gpu: bool = False,
+) -> Path:
+    """Prepare the pinned runtime, optionally requiring GPU execution (02)."""
+    interpreter = _ensure_pinned_environment(artifact_root, install_if_missing)
+    if require_gpu:
+        from utils_jana_gpu import prepare_gpu_environment
+
+        return prepare_gpu_environment(interpreter, install_if_missing=install_if_missing)
+    return interpreter
 
 
 __all__ = ["ensure_jana_environment"]

@@ -149,6 +149,41 @@ exercise the full code path; its outputs are never paper results.
 
 The full PAPER campaign is intentionally larger than one ordinary Colab
 session, especially the literal JANA 1M run (100 epochs at batch size 32).
+Notebook 02 now requires a Colab GPU. Its environment cell installs the
+CUDA 11.8/cuDNN 8.6 user-space libraries for the pinned TensorFlow 2.12 in the
+isolated Python 3.11 environment, and verifies an actual GPU computation.
+It does not upgrade BayesFlow, change model/training hyperparameters, replace
+Colab's NVIDIA driver, or change the modern notebook's CUDA library path.
+The extra pins live in `requirements_jana_gpu.txt`; the original driver and
+requirements fingerprints are unchanged so existing smaller-budget results
+remain reusable. There is no silent CPU fallback in 02.
+
+Every PAPER budget, including **1,000,000**, again requires all three seeds:
+31082026, 31082027 and 31082028. The former two-repetition exception is removed
+from training, corrections and comparison completion checks.
+
+New exact-JANA trainings print their GPU, each epoch start/end, batch progress
+at least about once per minute, losses, elapsed time and checkpoint progress.
+At each completed epoch the runner writes model weights, Adam slots and
+iterations, completed epoch, RNG metadata and loss history under
+`jana_paper/budget_nNNNNNNN/seed_SEED/resume/`. A `state.json` is published only
+after its checkpoint/history files are written and fingerprinted. The most
+recent two weight generations are retained; all epoch histories and a compact
+`training_progress.json` are saved. A damaged/incomplete generation falls back
+to the previous valid epoch. With `LOAD_IF_AVAILABLE=True`, rerunning 02 on
+the same Drive root restores this state and continues the **full-run cosine
+schedule**, not a newly restarted learning-rate schedule. An interrupted
+partial epoch is repeated. Old final-only checkpoints cannot resume partial
+training. Legacy dropout and dataset shuffle streams do not promise bitwise
+identity across a restart, but the trained parameters and optimizer state do
+continue from the saved epoch. Save/reload is automatic, not a new pilot run.
+
+Select the Colab GPU before starting, keep `LOAD_IF_AVAILABLE=True`, and run
+02 from the top after an interruption. Existing job-claim lease rules below
+still apply. Do not use `LOAD_IF_AVAILABLE=False` to resume: that explicitly
+requests fresh training. New checkpoints invalidate derived evaluation and
+ratio caches through their artifact fingerprints.
+
 Shard execution without changing the campaign signature by setting, for
 example, `PAPER_SUMMARY_RUN_BUDGETS=1000000` and
 `PAPER_SUMMARY_RUN_SEEDS=31082026`.  Capacity screens and all method results

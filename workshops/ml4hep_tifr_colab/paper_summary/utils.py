@@ -3447,38 +3447,23 @@ def _execution_subset(
     return selected
 
 
-# The third exact-JANA repetition at the largest budget did not survive its
-# Colab session.  Keep the frozen campaign identity and all other three-seed
-# comparisons intact, but treat these two completed, independently trained
-# repetitions as the planned exact-JANA grid at N=1,000,000.  This policy lives
-# outside config.py so it cannot change the campaign signature or invalidate
-# the expensive checkpoint contracts.
-_EXACT_JANA_ML_SEEDS_BY_BUDGET = {
-    1_000_000: (31_082_026, 31_082_027),
-}
-
-
 def _exact_jana_ml_seeds_for_budget(
     campaign: Mapping[str, Any],
     *,
     budget: int,
     requested_seeds: Sequence[int],
 ) -> tuple[int, ...]:
-    """Return the accepted exact-JANA repetitions for one budget."""
+    """Use every configured repetition, including all three PAPER 1M seeds."""
 
     campaign_seeds = tuple(int(value) for value in campaign["ml_seeds"])
     requested = tuple(int(value) for value in requested_seeds)
-    accepted = _EXACT_JANA_ML_SEEDS_BY_BUDGET.get(
-        int(budget), campaign_seeds
-    )
-    unknown = set(accepted).difference(campaign_seeds)
+    unknown = set(requested).difference(campaign_seeds)
     if unknown:
         raise RuntimeError(
-            "Exact-JANA repetition policy contains seeds outside the frozen "
+            "Exact-JANA request contains seeds outside the frozen "
             f"campaign: {sorted(unknown)}"
         )
-    accepted_set = set(accepted)
-    return tuple(seed for seed in requested if seed in accepted_set)
+    return requested
 
 
 def _exact_jana_budget_seed_groups(
@@ -3487,7 +3472,7 @@ def _exact_jana_budget_seed_groups(
     budgets: Sequence[int],
     requested_seeds: Sequence[int],
 ) -> tuple[tuple[int, tuple[int, ...]], ...]:
-    """Represent the non-rectangular exact-JANA execution grid by budget."""
+    """Represent the complete exact-JANA execution grid by budget."""
 
     groups = []
     for budget in budgets:
@@ -4802,6 +4787,12 @@ def _launch_checkpoint_compatible_jana_evaluation(
     runner = Path(__file__).resolve().parent / "utils_jana_evaluation.py"
     if not runner.is_file():
         raise FileNotFoundError(f"Missing exact-JANA evaluation runner: {runner}")
+    # This launcher runs under the pair's active claim, AFTER training. The
+    # pre-campaign recovery cannot detect this case when the old checkpoint
+    # was deleted and its replacement has only just finished training.
+    if load_if_available:
+        _preserve_evaluation_after_retraining(run_directory, output_directory)
+    print(f"[exact JANA evaluation] Starting/reusing diagnostics for {run_directory.parent.name}/{run_directory.name}.", flush=True)
     command = [
         str(python_executable),
         str(runner),
@@ -4848,6 +4839,24 @@ def _launch_checkpoint_compatible_jana_evaluation(
             f"Isolated JANA evaluation did not write {manifest_path}."
         )
     return json.loads(manifest_path.read_text())
+
+
+def _preserve_evaluation_after_retraining(run_directory: Path, output_directory: Path) -> None:
+    """Retire only evaluation data belonging to a replaced checkpoint."""
+    checkpoint = _read_json_mapping(run_directory / "checkpoint_manifest.json")
+    evaluation = _read_json_mapping(output_directory / "evaluation_manifest.json")
+    if checkpoint is None or not output_directory.is_dir():
+        return
+    if evaluation is not None and (
+        evaluation.get("checkpoint_artifact_sha256") == checkpoint.get("checkpoint_artifact_sha256")
+        and evaluation.get("checkpoint_contract_sha256") == checkpoint.get("training_contract_sha256")
+    ):
+        return
+    if not any(output_directory.iterdir()):
+        return
+    archive = _unused_recovery_path(output_directory, "recovery-before-new-checkpoint-evaluation")
+    output_directory.rename(archive)
+    print(f"[exact JANA evaluation] Preserved outputs from the previous checkpoint in {archive.name}; evaluating the new training.", flush=True)
 
 
 def _launch_checkpoint_compatible_jana_ratio_export(
@@ -5033,6 +5042,8 @@ def run_jana_campaign(
             from . import utils_jana as jana_runtime
         except ImportError:
             import utils_jana as jana_runtime
+        from utils_jana_gpu import activate_runtime_hooks
+        activate_runtime_hooks(jana_runtime)
         # The scientific/training driver is checkpoint-fingerprinted and must
         # remain unchanged.  Replace only its modern-process evaluation
         # launcher with the external, evaluation-only runner above.

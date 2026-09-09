@@ -331,6 +331,33 @@ INSTALL_EXACT_JANA_ENV_IF_MISSING = (
 )
 ''',
         ),
+        markdown(
+            "paper-02-gpu-resume",
+            '''## GPU execution and interruption recovery
+
+Select a **GPU** in Colab's Runtime settings before running this notebook.
+The next cell installs CUDA 11.8/cuDNN 8.6 libraries in the isolated Python
+3.11 environment and verifies GPU computation with TensorFlow 2.12. It does
+not replace the modern notebook's PyTorch/CUDA installation. CPU fallback is
+not allowed for exact-JANA training in this notebook.
+
+The PAPER grid again requires **three independent ML seeds at every budget**,
+including 1,000,000. Leave `LOAD_IF_AVAILABLE=True`: completed smaller-budget
+results are reused, missing runs train, and interrupted runs resume from the
+last completed epoch. Keep the same Drive artifact root. Each run writes
+`resume/` checkpoints and `training_progress.json` inside its training folder.
+Model weights, Adam slots/iterations, and the completed epoch are restored;
+the cosine schedule remains the original full 100-epoch schedule. An unfinished
+epoch is repeated. Resume does not promise bitwise-identical dropout/shuffling
+to an uninterrupted run.
+
+Training prints the GPU, epoch starts/ends, batch progress about once a minute,
+losses and checkpoint locations. The most recent two checkpoint generations
+are retained, along with all epoch loss histories. Concurrent notebooks keep
+using the existing per-run claims; after a killed session, an abandoned claim
+is reclaimed once its existing six-hour lease expires.
+''',
+        ),
         code(
             "paper-02-jana-environment",
             '''if RUN_EXACT_JANA_PAPER:
@@ -339,14 +366,17 @@ INSTALL_EXACT_JANA_ENV_IF_MISSING = (
     import importlib
     import utils_jana
     import utils_jana_runtime
+    import utils_jana_gpu
 
     utils_jana = importlib.reload(utils_jana)
     utils_jana_runtime = importlib.reload(utils_jana_runtime)
+    utils_jana_gpu = importlib.reload(utils_jana_gpu)
 
     print("Preparing the isolated exact-JANA runtime (first install can take several minutes).")
     JANA_PYTHON = utils_jana_runtime.ensure_jana_environment(
         ARTIFACT_ROOT,
         install_if_missing=INSTALL_EXACT_JANA_ENV_IF_MISSING,
+        require_gpu=True,
     )
     print("Exact-JANA Python:", JANA_PYTHON)
 ''',
