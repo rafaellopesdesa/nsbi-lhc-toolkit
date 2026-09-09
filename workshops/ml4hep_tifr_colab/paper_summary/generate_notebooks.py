@@ -302,9 +302,10 @@ display_result(CAPACITY_RESULT)
             r'''# 02 — JANA-paper and separate-flow baselines
 
 This notebook produces two deliberately distinct baselines.  **JANA-paper**
-runs the pinned algorithm and hyperparameters in its isolated legacy
-TensorFlow/BayesFlow environment, with only the simulator input adapted to the
-fixed nested banks.  In keeping with upstream, this row uses N training pairs,
+runs the pinned algorithm in its isolated legacy TensorFlow/BayesFlow
+environment, with simulator input adapted to the fixed nested banks. At 1M,
+the minibatch size is increased from 32 to 1024 for GPU efficiency; other
+model and training settings are retained. In keeping with upstream, this row uses N training pairs,
 the two-row shape bank, the fixed two-row Trainer pilot, and the fixed 300-pair
 validation bank, and is labelled N+304 in resource tables.  **Separate flows** loads the nominal
 posterior and likelihood ensembles selected in notebook 01.
@@ -341,13 +342,22 @@ The next cell installs CUDA 11.8/cuDNN 8.6 libraries in the isolated Python
 not replace the modern notebook's PyTorch/CUDA installation. CPU fallback is
 not allowed for exact-JANA training in this notebook.
 
+The 1,000,000-simulation exact-JANA runs use **batch size 1024**; the 10k and
+100k runs retain batch size 32. The 1M runs still use 100 epochs, now with
+977 updates per epoch (including the final partial batch), and Adam's cosine
+learning-rate decay from $5 \\times 10^{-4}$ to zero spans those 97,700 updates.
+This is a documented change to the upstream optimization protocol, not a
+claim of identical convergence. The saved training contract records the
+actual batch size. Old batch-32 checkpoints must not be resumed as batch-1024
+runs; after the one-time reset, subsequent interruptions resume normally.
+
 The PAPER grid again requires **three independent ML seeds at every budget**,
 including 1,000,000. Leave `LOAD_IF_AVAILABLE=True`: completed smaller-budget
 results are reused, missing runs train, and interrupted runs resume from the
 last completed epoch. Keep the same Drive artifact root. Each run writes
 `resume/` checkpoints and `training_progress.json` inside its training folder.
 Model weights, Adam slots/iterations, and the completed epoch are restored;
-the cosine schedule remains the original full 100-epoch schedule. An unfinished
+the cosine schedule remains the full 100-epoch schedule for that batch size. An unfinished
 epoch is repeated. Resume does not promise bitwise-identical dropout/shuffling
 to an uninterrupted run.
 

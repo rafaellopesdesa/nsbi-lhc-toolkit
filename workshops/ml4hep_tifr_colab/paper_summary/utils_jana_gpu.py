@@ -15,6 +15,12 @@ import subprocess
 import sys
 
 
+# The original 10k/100k training contracts remain reusable. Only the 1M
+# campaign uses larger minibatches; the driver records this in each run's
+# training contract and derives its 100-epoch cosine schedule accordingly.
+GPU_BATCH_SIZE_BY_BUDGET = {1_000_000: 1024}
+
+
 def subprocess_environment(environment=None):
     environment = dict(os.environ if environment is None else environment)
     libraries = environment.get("PAPER_SUMMARY_JANA_CUDA_LIBRARY_PATH", "")
@@ -148,14 +154,28 @@ def launch_gpu_campaign(python_executable, **kwargs):
     for key in ("artifact_root", "master_bank_path", "shape_bank_path", "pilot_bank_path", "validation_bank_path"):
         flag = key.removesuffix("_path").replace("_", "-")
         command += ["--" + flag, str(Path(kwargs[key]).expanduser().resolve())]
-    for key in ("budgets", "seeds"):
-        command += ["--" + key, *[str(int(value)) for value in kwargs[key]]]
+    command += ["--seeds", *[str(int(value)) for value in kwargs["seeds"]]]
     command += ["--profile", str(kwargs.get("profile", "PAPER"))]
     if not kwargs.get("load_if_available", True):
         command += ["--no-load-if-available"]
     if kwargs.get("force", False):
         command += ["--force"]
-    subprocess.run(command, check=True, env=subprocess_environment(jana._isolated_jana_subprocess_env()))
+    # The CLI accepts one batch size per invocation. Group by batch size so
+    # callers supplying several budgets cannot apply the 1M override to the
+    # smaller, already-trained budgets. The driver merges campaign manifests.
+    budget_groups = {}
+    for value in kwargs["budgets"]:
+        budget = int(value)
+        batch_size = GPU_BATCH_SIZE_BY_BUDGET.get(budget, jana.DEFAULT_BATCH_SIZE)
+        budget_groups.setdefault(batch_size, []).append(budget)
+    if not budget_groups:
+        raise ValueError("budgets must be non-empty.")
+    for batch_size, budgets in budget_groups.items():
+        print(f"[exact JANA GPU] Budgets {budgets}: batch size {batch_size}.", flush=True)
+        subprocess.run(
+            [*command, "--budgets", *map(str, budgets), "--batch-size", str(batch_size)],
+            check=True, env=subprocess_environment(jana._isolated_jana_subprocess_env()),
+        )
     path = Path(kwargs["artifact_root"]).expanduser().resolve() / "jana_paper" / "campaign_manifest.json"
     return json.loads(path.read_text())
 

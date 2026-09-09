@@ -150,6 +150,29 @@ class ConfigurationTests(unittest.TestCase):
             options = jana._cli_parser().parse_args(command[3:])
             self.assertEqual(options.budgets, [1_000_000])
             self.assertEqual(options.seeds, list(config.DEFAULT_ML_SEEDS))
+            self.assertEqual(options.batch_size, 1024)
+
+    def test_gpu_launcher_scopes_batch_override_to_1m(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            jana._atomic_write_json(root / "jana_paper" / "campaign_manifest.json", {"status": "test"})
+            with patch.object(gpu.subprocess, "run") as launched:
+                gpu.launch_gpu_campaign("/venv/bin/python", artifact_root=root,
+                    master_bank_path=root / "master.npz", shape_bank_path=root / "shape.npz",
+                    pilot_bank_path=root / "pilot.npz", validation_bank_path=root / "validation.npz",
+                    budgets=[10_000, 100_000, 1_000_000], seeds=config.DEFAULT_ML_SEEDS,
+                    profile="PAPER", load_if_available=True)
+            self.assertEqual(launched.call_count, 2)
+            actual = {}
+            for call in launched.call_args_list:
+                options = jana._cli_parser().parse_args(call.args[0][3:])
+                actual.update({budget: options.batch_size for budget in options.budgets})
+                self.assertEqual(options.seeds, list(config.DEFAULT_ML_SEEDS))
+                self.assertEqual(options.profile, "PAPER")
+                self.assertFalse(options.force)
+                self.assertFalse(options.no_load_if_available)
+                self.assertTrue(call.kwargs["check"])
+            self.assertEqual(actual, {10_000: 32, 100_000: 32, 1_000_000: 1024})
 
     def test_old_evaluation_retired_after_retraining(self):
         helper = extracted_helpers()["_preserve_evaluation_after_retraining"]

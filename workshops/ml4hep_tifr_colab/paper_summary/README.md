@@ -15,8 +15,9 @@ improves two conditional density estimators when the simulator calls, trained
 flows, observations, evaluation samples, and ML seeds are paired.  The main
 comparison contains six rows grouped into two controlled comparisons:
 
-1. **JANA-paper**: the algorithm and hyperparameters from the pinned JANA
-   source, adapted only to consume the pre-generated SLCP bank;
+1. **JANA-paper**: the algorithm from the pinned JANA source, adapted to
+   consume the pre-generated SLCP bank, with batch size increased to 1024
+   at 1M simulations as described below;
 2. **JANA + multiclass correction**: the same exact JANA checkpoints with one
    equal-prior three-class CE correction;
 3. **JANA + binary corrections**: those checkpoints with two independent
@@ -147,12 +148,20 @@ Each notebook exposes `PROFILE`, `BUDGETS_TO_RUN`, `ML_SEEDS_TO_RUN`, and
 campaign.  `SMOKE` uses tiny synthetic budgets and one observation solely to
 exercise the full code path; its outputs are never paper results.
 
-The full PAPER campaign is intentionally larger than one ordinary Colab
-session, especially the literal JANA 1M run (100 epochs at batch size 32).
+The full PAPER campaign can exceed one ordinary Colab session. To improve
+GPU efficiency, notebook 02 uses **batch size 1024 only for the exact-JANA
+1,000,000-simulation budget**; 10k and 100k retain batch size 32. The 1M run
+still uses 100 epochs: 977 updates per epoch (including the final partial
+batch), with the cosine learning-rate decay from $5 \times 10^{-4}$ to zero
+spanning all 97,700 updates. This changes the upstream optimization protocol;
+it does not imply identical convergence. The actual batch size is recorded
+in each checkpoint's training contract. Batch-32 partial checkpoints cannot
+be resumed under the batch-1024 contract; after the one-time 1M reset,
+ordinary checkpoint/resume behavior is unchanged.
 Notebook 02 now requires a Colab GPU. Its environment cell installs the
 CUDA 11.8/cuDNN 8.6 user-space libraries for the pinned TensorFlow 2.12 in the
 isolated Python 3.11 environment, and verifies an actual GPU computation.
-It does not upgrade BayesFlow, change model/training hyperparameters, replace
+It does not upgrade BayesFlow, change the model architecture, replace
 Colab's NVIDIA driver, or change the modern notebook's CUDA library path.
 The extra pins live in `requirements_jana_gpu.txt`; the original driver and
 requirements fingerprints are unchanged so existing smaller-budget results
