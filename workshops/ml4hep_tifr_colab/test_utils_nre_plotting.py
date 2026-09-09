@@ -80,7 +80,8 @@ class NREPlottingTests(unittest.TestCase):
         ratios = np.exp(rng.normal(size=(180, 2)))
         histories = {
             key: [{"member": 0, "train_loss": [0.7, 0.6, 0.55],
-                   "validation_loss": [0.72, 0.64, 0.60], "best_epoch": 2}]
+                   "validation_loss": [0.72, 0.64, 0.60], "best_epoch": 2,
+                   "learning_rate": [1e-4, 1e-7, 1e-10], "selected_epoch": 3}]
             for key in ("signal", "background")
         }
         raw = [[self.result(0.9), self.result(1.03)], [self.result(1.1), self.result(0.98)]]
@@ -93,6 +94,8 @@ class NREPlottingTests(unittest.TestCase):
         initial_font_size = plt.rcParams["font.size"]
         with tempfile.TemporaryDirectory() as directory:
             plotting.plot_training(histories, directory)
+            records = [{"score_at_truth": x, "score_mc_se": 0.2, "mu_true": 1.0} for x in (-0.1, 0.2)]
+            plotting.plot_simulator_score_closure(records, {"score_mean": 0.05, "score_mc_se": 0.14}, directory)
             plotting.plot_ratio_validation(ratios, ratios[:80], ratios[80:], directory)
             plotting.plot_mle_convergence({"sizes": [100, 1000], "raw": raw, "corrected": corrected}, directory)
             plotting.plot_asimov_scans(raw[0], [100, 1000], "Direct simulator Asimov", directory, "scans")
@@ -114,7 +117,7 @@ class NREPlottingTests(unittest.TestCase):
             self.assertEqual(simulator_script.read_bytes(), simulator_content)
             self.assertTrue(simulator_pdf.is_file())
             script_files = sorted(Path(directory).glob("*.py"))
-            self.assertEqual(len(script_files), 8)
+            self.assertEqual(len(script_files), 10)
             self.assertEqual(plt.rcParams["font.size"], initial_font_size)
             exported = (Path(directory) / "toys.py").read_text()
             self.assertIn("Simulator toys", exported)

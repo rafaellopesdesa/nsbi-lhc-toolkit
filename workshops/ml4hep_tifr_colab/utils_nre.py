@@ -13,25 +13,28 @@ import os
 from pathlib import Path
 import shutil
 import tempfile
+import time
 
 import numpy as np
 
 
 FEATURES = ("x1", "x2", "x3", "x4", "x5")
 SIMULATOR_VERSION = "exercise12-selected-simulator-v1"
-TRAINING_VERSION = "exercise12-bce-swish-nadam-v1"
+TRAINING_VERSION = "exercise12-bce-swish-nadam-v2"
 BANK_VERSION = "exercise12-immutable-bank-v1"
 DEFAULT_TRAINING_CONFIG = {
     "ensemble_size": 4,
     "hidden_layers": 4,
     "hidden_features": 1024,
     "activation": "swish",
-    "epochs": 50,
+    "epochs": 140,
     "batch_size": 4096,
-    "learning_rate": 1.0e-3,
-    "scheduler_step": 10,
-    "scheduler_gamma": 0.01,
-    "patience": 10,
+    "learning_rate": 1.0e-4,
+    "scheduler_step": 20,
+    "scheduler_gamma": 0.1,
+    "minimum_learning_rate": 1.0e-10,
+    "patience": None,
+    "checkpoint_selection": "last",
     "device": "auto",
     "prediction_batch_size": 8192,
 }
@@ -411,6 +414,8 @@ def _cached_bank(root, selection, predictor, role, component, n, seed, batch_siz
     with _new_artifact(directory) as staging:
         result = np.lib.format.open_memmap(staging / "values.npy", mode="w+", dtype=dtype, shape=(n, columns))
         cursor = 0
+        reported = 0
+        print(f"Generating {role}/{component}: {n:,} {kind}.", flush=True)
         for features in selected_feature_chunks(selection, role, component, n, seed, batch_size):
             values = features if predictor is None else np.asarray(predictor(features), dtype=np.float64)
             if values.shape != (len(features), columns) or not np.isfinite(values).all():
@@ -419,6 +424,9 @@ def _cached_bank(root, selection, predictor, role, component, n, seed, batch_siz
                 raise ValueError("NRE ratios must be strictly positive; refusing to cache invalid values.")
             result[cursor:cursor + len(values)] = values
             cursor += len(values)
+            if cursor == n or cursor - reported >= 1_000_000:
+                print(f"  {role}/{component}: {cursor:,}/{n:,}", flush=True)
+                reported = cursor
         result.flush()
         del result
         _write_manifest(staging, contract, ["values.npy"])
@@ -443,19 +451,31 @@ def _training_config(config):
         raise ValueError(f"Unknown NRE training settings: {sorted(unknown)}")
     cfg = {**DEFAULT_TRAINING_CONFIG, **config}
     for key in ("ensemble_size", "hidden_layers", "hidden_features", "epochs", "batch_size",
-                "scheduler_step", "patience", "prediction_batch_size"):
+                "scheduler_step", "prediction_batch_size"):
         cfg[key] = _positive_integer(cfg[key], key)
-    for key in ("learning_rate", "scheduler_gamma"):
+    if cfg["patience"] is not None:
+        cfg["patience"] = _positive_integer(cfg["patience"], "patience")
+    if cfg["checkpoint_selection"] not in ("last", "best_validation"):
+        raise ValueError("checkpoint_selection must be last or best_validation.")
+    for key in ("learning_rate", "scheduler_gamma", "minimum_learning_rate"):
         cfg[key] = float(cfg[key])
         if not np.isfinite(cfg[key]) or cfg[key] <= 0:
             raise ValueError(f"{key} must be finite and positive.")
     if cfg["scheduler_gamma"] > 1:
         raise ValueError("scheduler_gamma must not exceed 1.")
+    if cfg["minimum_learning_rate"] > cfg["learning_rate"]:
+        raise ValueError("minimum_learning_rate must not exceed learning_rate.")
     if cfg["activation"] not in ("swish", "relu", "tanh"):
         raise ValueError("activation must be swish, relu or tanh.")
     if cfg["device"] not in ("auto", "cpu", "cuda"):
         raise ValueError("device must be auto, cpu or cuda.")
     return cfg
+
+
+def _epoch_learning_rate(config, epoch):
+    """Actual rate for a zero-based epoch; the final decade has a hard floor."""
+    return max(config["minimum_learning_rate"],
+               config["learning_rate"] * config["scheduler_gamma"] ** (epoch // config["scheduler_step"]))
 
 
 def _torch():
@@ -493,9 +513,8 @@ def _train_member(positive, reference, val_positive, val_reference, config, seed
         torch.cuda.manual_seed_all(seed)
     model = _network(config).to(device)
     optimizer = torch.optim.NAdam(model.parameters(), lr=config["learning_rate"], weight_decay=0.0)
-    scheduler = torch.optim.lr_scheduler.StepLR(
-        optimizer, step_size=config["scheduler_step"], gamma=config["scheduler_gamma"]
-    )
+    # Assign the rate explicitly at the start of each epoch: history and the
+    # printed rate then describe actual updates, not the next scheduler step.
     rng = np.random.default_rng(seed)
     offset, scale = scaler
     # Equal class counts make sigmoid(logit)/(1-sigmoid(logit)) = exp(logit)
@@ -519,6 +538,11 @@ def _train_member(positive, reference, val_positive, val_reference, config, seed
     best_state = None
     stale = 0
     for epoch in range(config["epochs"]):
+        epoch_started = time.monotonic()
+        learning_rate = _epoch_learning_rate(config, epoch)
+        for group in optimizer.param_groups:
+            group["lr"] = learning_rate
+        print(f"  Starting epoch {epoch + 1:03d}/{config['epochs']}, lr={learning_rate:.3e}.", flush=True)
         model.train()
         permutation = rng.permutation(2 * n_train)
         train_sum = 0.0
@@ -548,7 +572,9 @@ def _train_member(positive, reference, val_positive, val_reference, config, seed
         history["train_loss"].append(train_loss)
         history["validation_loss"].append(val_loss)
         history["learning_rate"].append(float(optimizer.param_groups[0]["lr"]))
-        print(f"  epoch {epoch + 1:02d}: train BCE={train_loss:.6f}, validation BCE={val_loss:.6f}", flush=True)
+        print(f"  epoch {epoch + 1:03d}/{config['epochs']}: lr={learning_rate:.3e}, "
+              f"train BCE={train_loss:.9f}, validation BCE={val_loss:.9f}, "
+              f"elapsed={time.monotonic() - epoch_started:.1f}s", flush=True)
         if val_loss < best_loss:
             best_loss = val_loss
             best_state = {key: value.detach().cpu().clone() for key, value in model.state_dict().items()}
@@ -556,11 +582,18 @@ def _train_member(positive, reference, val_positive, val_reference, config, seed
             stale = 0
         else:
             stale += 1
-        scheduler.step()
-        if stale >= config["patience"]:
+        if config["patience"] is not None and stale >= config["patience"]:
             break
     history["best_validation_loss"] = best_loss
-    model.load_state_dict(best_state)
+    history["checkpoint_selection"] = config["checkpoint_selection"]
+    history["selected_epoch"] = (history["best_epoch"] if config["checkpoint_selection"] == "best_validation"
+                                 else len(history["train_loss"]))
+    history["selected_learning_rate"] = history["learning_rate"][history["selected_epoch"] - 1]
+    if config["checkpoint_selection"] == "best_validation":
+        model.load_state_dict(best_state)
+    print(f"  Selected {config['checkpoint_selection']} weights: epoch {history['selected_epoch']}, "
+          f"lr={history['selected_learning_rate']:.3e}; "
+          f"best validation epoch={history['best_epoch']}, BCE={best_loss:.9f}.", flush=True)
     model.eval()
     return model, history
 
@@ -622,9 +655,11 @@ def train_nre(root, train_signal, train_background, train_ref,
     """Train/reuse independent S/REF and B/REF BCE-only classifier ensembles.
 
     Defaults match the Exercise-5 topology: four 4x1024 SiLU networks per
-    component, MinMax[-1.5,1.5] inputs, NAdam(1e-3), StepLR(10,.01), maximum
-    50 epochs and batch 4096. Best independent-validation weights are retained
-    with patience 10. There is no dropout, weight decay, calibration, flow,
+    component, MinMax[-1.5,1.5] inputs and batch 4096. NAdam runs 140 epochs:
+    1e-4 initially, a factor 0.1 every 20 epochs, and a floor of 1e-10.
+    All epochs run by default and the final weights are retained. Validation
+    and its best epoch are diagnostics, not a default stopping/selection rule.
+    There is no dropout, weight decay, calibration, flow,
     or density evaluation. Validation banks must be independent simulations.
 
     Each completed member is committed separately, so interruption can lose

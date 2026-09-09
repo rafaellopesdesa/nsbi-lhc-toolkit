@@ -178,7 +178,20 @@ class ConfigTests(unittest.TestCase):
         cfg = nre._training_config(None)
         self.assertEqual((cfg["ensemble_size"], cfg["hidden_layers"], cfg["hidden_features"]), (4, 4, 1024))
         self.assertEqual(cfg["activation"], "swish")
-        self.assertEqual((cfg["scheduler_step"], cfg["scheduler_gamma"]), (10, 0.01))
+        self.assertEqual((cfg["scheduler_step"], cfg["scheduler_gamma"]), (20, 0.1))
+        self.assertEqual(cfg["epochs"], 140)
+        self.assertIsNone(cfg["patience"])
+        self.assertEqual(cfg["checkpoint_selection"], "last")
+        rates = [nre._epoch_learning_rate(cfg, epoch) for epoch in range(cfg["epochs"])]
+        np.testing.assert_allclose(rates, np.repeat(10.0 ** -np.arange(4, 11), 20), rtol=1e-14)
+        self.assertAlmostEqual(rates[-1], 1e-10, delta=1e-24)
+        self.assertEqual(nre._epoch_learning_rate(cfg, 10000), 1e-10)
+
+    def test_invalid_schedule_and_selection(self):
+        for config in ({"patience": 0}, {"minimum_learning_rate": 0},
+                       {"minimum_learning_rate": 1.0}, {"checkpoint_selection": "unknown"}):
+            with self.assertRaises(ValueError):
+                nre._training_config(config)
 
     def test_bad_training_parameters_stop(self):
         for settings in ({"epochs": 0}, {"batch_size": 4.5}, {"learning_rate": float("nan")},
@@ -196,6 +209,40 @@ class ConfigTests(unittest.TestCase):
 
 @unittest.skipUnless(importlib.util.find_spec("torch"), "PyTorch not installed")
 class TorchSmokeTests(unittest.TestCase):
+    def test_last_weights_and_full_schedule_despite_worsening_validation(self):
+        import torch
+
+        arrays = [np.random.default_rng(seed).normal(size=(8, 5)).astype(np.float32)
+                  for seed in range(4)]
+        cfg = nre._training_config(dict(hidden_layers=1, hidden_features=8, epochs=7,
+                                       batch_size=64, scheduler_step=1, device="cpu"))
+        original_loss = torch.nn.functional.binary_cross_entropy_with_logits
+
+        def train(selection):
+            count = 0
+
+            def loss(*args, **kwargs):
+                nonlocal count
+                if not torch.is_grad_enabled():
+                    count += 1
+                    return torch.tensor(0.5 + count / 100, dtype=torch.float32)
+                return original_loss(*args, **kwargs)
+
+            with patch.object(torch.nn.functional, "binary_cross_entropy_with_logits", side_effect=loss):
+                return nre._train_member(*arrays, {**cfg, "checkpoint_selection": selection},
+                                         18, torch.device("cpu"), (np.zeros(5), np.ones(5)))
+
+        last, history = train("last")
+        best, best_history = train("best_validation")
+        self.assertEqual(len(history["train_loss"]), 7)
+        self.assertEqual(history["best_epoch"], 1)
+        self.assertEqual(history["selected_epoch"], 7)
+        self.assertAlmostEqual(history["selected_learning_rate"], 1e-10, delta=1e-24)
+        self.assertEqual(best_history["selected_epoch"], 1)
+        self.assertTrue(any(not torch.equal(value, best.state_dict()[key])
+                            for key, value in last.state_dict().items()))
+        self.assertFalse(any(isinstance(layer, torch.nn.Dropout) for layer in last.modules()))
+
     def test_small_training_member_resume_and_ratio_averaging(self):
         import torch
 
@@ -213,6 +260,12 @@ class TorchSmokeTests(unittest.TestCase):
                 reused = nre.train_nre(tmp, *arrays, config=cfg, seed=18)
             np.testing.assert_array_equal(output, reused(arrays[3]))
             self.assertEqual(predictor.fingerprint, reused.fingerprint)
+            # A different schedule gets a separate cache, preserving old weights.
+            old_saved = next((Path(tmp) / "training").glob("*/signal/member_00/weights.npz"))
+            old_bytes = old_saved.read_bytes()
+            changed = nre.train_nre(tmp, *arrays, config={**cfg, "learning_rate": 2e-4}, seed=18)
+            self.assertNotEqual(predictor.fingerprint, changed.fingerprint)
+            self.assertEqual(old_saved.read_bytes(), old_bytes)
             # Directly distinguish arithmetic ratio averaging from score averaging.
             with torch.no_grad():
                 for index, model in enumerate(predictor.models["signal"]):
@@ -220,7 +273,7 @@ class TorchSmokeTests(unittest.TestCase):
                         parameter.zero_()
                     model[-1].bias.fill_(float(index * 2))
             np.testing.assert_allclose(predictor(arrays[3])[:, 0], (1 + np.exp(2)) / 2, rtol=1e-7)
-            saved = next((Path(tmp) / "training").glob("*/signal/member_00/weights.npz"))
+            saved = old_saved
             with saved.open("ab") as handle:
                 handle.write(b"corrupt")
             with self.assertRaises(nre.CacheError):

@@ -12,6 +12,7 @@ from utils_nre_inference import (
     q0_bin_probabilities, raw_simulator_asimov, ratio_to_q,
     run_toys, run_toys_cached, simulator_bin_probabilities,
     validate_compression,
+    simulator_score_diagnostic, summarize_score_diagnostics,
 )
 
 
@@ -20,6 +21,47 @@ class TestNREInference(unittest.TestCase):
         rng = np.random.default_rng(2026)
         self.ratios = np.exp(rng.normal(size=(257, 2)))
         self.yields = np.array([12.0, 30.0])
+
+    def test_simulator_score_and_mc_error_match_direct_calculation(self):
+        signal, background = self.ratios[:100], self.ratios[100:]
+        normalizers = [0.8, 1.3]
+        for mu in (0.0, 1.0, 2.0):
+            result = simulator_score_diagnostic(signal, background, self.yields, mu, normalizers)
+            gs, gb = [ratio_to_q(bank, self.yields, normalizers) for bank in (signal, background)]
+            gs, gb = gs / (1 + mu * gs), gb / (1 + mu * gb)
+            score = -12 + mu * 12 * gs.mean() + 30 * gb.mean()
+            variance = (mu * 12)**2 * gs.var(ddof=1) / len(gs) + 30**2 * gb.var(ddof=1) / len(gb)
+            information = mu * 12 * np.mean(gs**2) + 30 * np.mean(gb**2)
+            self.assertAlmostEqual(result["score_at_truth"], score)
+            self.assertAlmostEqual(result["score_mc_se"]**2, variance)
+            self.assertAlmostEqual(result["information_at_truth"], information)
+            self.assertAlmostEqual(result["linearized_shift_mc_se"], np.sqrt(variance) / information)
+            asimov = raw_simulator_asimov(signal, background, self.yields, mu, normalizers=normalizers)
+            self.assertAlmostEqual(result["score_at_truth"], asimov["score_at_truth"])
+        with self.assertRaises(ValueError):
+            simulator_score_diagnostic(signal[:1], background, self.yields)
+
+    def test_mc_errors_match_independent_bank_scatter(self):
+        rng = np.random.default_rng(89)
+        records = [simulator_score_diagnostic(np.exp(rng.normal(size=(64, 2))),
+                                             np.exp(rng.normal(size=(128, 2))), self.yields)
+                   for _ in range(400)]
+        predicted_variance = np.mean([row["score_mc_se"]**2 for row in records])
+        empirical_variance = np.var([row["score_at_truth"] for row in records], ddof=1)
+        self.assertLess(abs(predicted_variance / empirical_variance - 1), 0.15)
+        summary = summarize_score_diagnostics(records)
+        self.assertAlmostEqual(summary["score_mc_se"]**2, predicted_variance / 400)
+        self.assertAlmostEqual(summary["score_between_bank_se"]**2, empirical_variance / 400)
+        with self.assertRaises(ValueError):
+            summarize_score_diagnostics(records[:1])
+        with self.assertRaises(ValueError):
+            summarize_score_diagnostics([records[0], {**records[1], "normalizers": [2, 1]}])
+
+    def test_score_diagnostic_does_not_recenter_misspecification(self):
+        ratios = np.tile([2.0, 1.0], (20, 1))
+        result = simulator_score_diagnostic(ratios, ratios, [10, 50])
+        self.assertGreater(result["score_at_truth"], 1)
+        self.assertLess(result["score_mc_se"], 1e-12)
 
     def test_finite_reference_global_maximum(self):
         for m in (1, 2, 11, len(self.ratios)):

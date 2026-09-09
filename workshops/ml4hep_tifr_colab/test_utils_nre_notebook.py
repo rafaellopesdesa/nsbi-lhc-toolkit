@@ -12,7 +12,9 @@ import io
 import json
 from pathlib import Path
 import tempfile
+from types import SimpleNamespace
 import unittest
+from unittest.mock import patch
 
 import matplotlib
 matplotlib.use("Agg")
@@ -32,7 +34,9 @@ class TestPredictor:
     fingerprint = "notebook-test-predictor-v1"
     histories = {
         component: [dict(train_loss=[0.7, 0.65], validation_loss=[0.71, 0.67],
-                         best_epoch=1, seed=1, member=0)]
+                         learning_rate=[1e-4, 1e-5], selected_epoch=2,
+                         selected_learning_rate=1e-5, best_validation_loss=0.67,
+                         best_epoch=2, seed=1, member=0)]
         for component in ("signal", "background")
     }
 
@@ -57,6 +61,27 @@ class NotebookTests(unittest.TestCase):
                 self.assertIsNone(cell["execution_count"])
                 self.assertEqual(cell["outputs"], [])
                 compile("".join(cell["source"]), f"notebook-cell-{index}", "exec")
+
+    def test_full_configuration_and_gpu_guard(self):
+        with tempfile.TemporaryDirectory() as tmp, contextlib.redirect_stdout(io.StringIO()):
+            namespace = {"WORK_DIR": Path(tmp), "ARTIFACT_ROOT": Path(tmp) / "artifacts"}
+            source = "".join(self.notebook["cells"][3]["source"])
+            fake_torch = SimpleNamespace(cuda=SimpleNamespace(is_available=lambda: True))
+            with patch.dict("sys.modules", {"torch": fake_torch}):
+                exec(source, namespace)
+            self.assertEqual(namespace["N_TRAIN_PER_CLASS"], 5_000_000)
+            self.assertEqual(namespace["DEPLOYMENT_REF_EVENTS"], 5_000_000)
+            self.assertEqual(namespace["SIMULATOR_TOY_BANK_EVENTS"], 5_000_000)
+            cfg = namespace["TRAINING_CONFIG"]
+            self.assertEqual((cfg["epochs"], cfg["ensemble_size"], cfg["device"]), (140, 4, "cuda"))
+            self.assertIsNone(cfg["patience"])
+            self.assertEqual(cfg["checkpoint_selection"], "last")
+            self.assertEqual(namespace["FIGURE_SCRIPT_DIR"].name, "full")
+            self.assertEqual(namespace["MC_SIZES"][-1], 2_000_000)
+            fake_torch.cuda.is_available = lambda: False
+            with patch.dict("sys.modules", {"torch": fake_torch}), self.assertRaisesRegex(RuntimeError, "GPU runtime"):
+                exec(source, namespace)
+            self.assertFalse((namespace["ARTIFACT_ROOT"] / "banks").exists())
 
     def test_analysis_cells_with_mock_training(self):
         with tempfile.TemporaryDirectory() as tmp, contextlib.redirect_stdout(io.StringIO()):
@@ -86,11 +111,16 @@ class NotebookTests(unittest.TestCase):
             self.assertEqual(set(namespace["compression_checks"]), {"model", "simulator"})
             figures = namespace["FIGURE_SCRIPT_DIR"]
             scripts = list(figures.glob("*.py"))
-            self.assertEqual(len(scripts), 11)
+            self.assertEqual(len(scripts), 13)
             for script in scripts:
                 self.assertTrue(script.with_suffix(".pdf").is_file())
                 compile(script.read_text(), str(script), "exec")
-            self.assertTrue((namespace["ARTIFACT_ROOT"] / "asimov_convergence.csv").is_file())
+            for name in ("asimov_convergence.csv", "training_summary.csv",
+                         "simulator_score_closure.csv", "simulator_score_closure_summary.csv"):
+                self.assertTrue((namespace["RESULT_DIR"] / name).is_file())
+            self.assertEqual(len(namespace["SCORE_DIAGNOSTICS"]), namespace["MC_REPETITIONS"])
+            self.assertEqual(namespace["score_summary"]["n_banks"], namespace["MC_REPETITIONS"])
+            self.assertEqual(namespace["FIGURE_SCRIPT_DIR"].name, "smoke")
 
     def test_compression_refines_without_retraining(self):
         # Exercise the FULL-only control flow with small synthetic banks. The

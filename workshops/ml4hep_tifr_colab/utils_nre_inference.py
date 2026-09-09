@@ -246,6 +246,72 @@ def raw_simulator_asimov(signal_ratios, background_ratios, yields, mu_true=1.0,
     return result
 
 
+def simulator_score_diagnostic(signal_ratios, background_ratios, yields, mu_true=1.0,
+                               normalizers=(1.0, 1.0)):
+    """Expected score and integration SE from independent, fixed-size S/B banks.
+
+    g(x)=q/(1+mu_true*q), U=-S+mu_true*S*mean_S(g)+B*mean_B(g).
+    Var_MC(U)=(mu_true*S)^2*var_S(g)/nS+B^2*var_B(g)/nB, using
+    unbiased sample variances. This is NOT the Poisson-toy score variance.
+    Errors are conditional on the frozen NN and deployment normalizers; they
+    do not include training or deployment-reference uncertainty. U/I estimates
+    the pseudo-true displacement only to first order near an interior optimum.
+    Its reported SE treats I as fixed (valid to leading order near score
+    closure), omitting curvature variance/covariance away from closure.
+    """
+    signal, background = _yields(yields)
+    mu_true = _nonnegative(mu_true, "mu_true")
+    normalizers = _normalizers(normalizers)
+    banks = [_ratios(signal_ratios), _ratios(background_ratios)]
+    if any(len(bank) < 2 for bank in banks):
+        raise ValueError("Score MC errors need at least two events in each independent bank.")
+    score, variance, information = -signal, 0.0, 0.0
+    for bank, weight in zip(banks, (mu_true * signal, background)):
+        q = ratio_to_q(bank, yields, normalizers)
+        g = _score_factors(q, np.array(mu_true))
+        score += weight * np.mean(g)
+        variance += weight**2 * np.var(g, ddof=1) / len(g)
+        information += weight * np.mean(g**2)
+    if not np.isfinite([score, variance, information]).all() or information <= 0:
+        raise ValueError("The score diagnostic needs finite moments and positive information.")
+    standard_error = float(np.sqrt(variance))
+    return {"n_signal": len(banks[0]), "n_background": len(banks[1]),
+            "mu_true": mu_true, "yields": [float(signal), float(background)],
+            "normalizers": normalizers.tolist(), "score_at_truth": float(score),
+            "score_mc_se": standard_error, "information_at_truth": float(information),
+            "linearized_shift": float(score / information),
+            "linearized_shift_mc_se": float(standard_error / information)}
+
+
+def summarize_score_diagnostics(diagnostics):
+    """Equal-weight mean of independent-bank scores for one frozen likelihood.
+
+    Report both propagated within-bank integration errors and the empirical
+    between-bank standard error. The latter has only R-1 degrees of freedom.
+    Independence must come from the caller's simulation streams, not labels.
+    """
+    if len(diagnostics) < 2:
+        raise ValueError("Use at least two independent banks to measure between-bank scatter.")
+    for item in diagnostics[1:]:
+        for key in ("mu_true", "yields", "normalizers"):
+            if not np.array_equal(item[key], diagnostics[0][key]):
+                raise ValueError("All score diagnostics must use the same frozen likelihood and truth.")
+    scores = np.array([item["score_at_truth"] for item in diagnostics], dtype=float)
+    errors = np.array([item["score_mc_se"] for item in diagnostics], dtype=float)
+    information = np.array([item["information_at_truth"] for item in diagnostics], dtype=float)
+    if not np.isfinite([scores, errors, information]).all() or np.any(errors < 0) or np.any(information <= 0):
+        raise ValueError("Invalid score diagnostics.")
+    count = len(scores)
+    mean_score, mean_information = float(scores.mean()), float(information.mean())
+    mc_se = float(np.sqrt(np.sum(errors**2)) / count)
+    between_se = float(np.std(scores, ddof=1) / np.sqrt(count))
+    return {"n_banks": count, "score_mean": mean_score, "score_mc_se": mc_se,
+            "score_between_bank_se": between_se, "information_mean": mean_information,
+            "linearized_shift": mean_score / mean_information,
+            "linearized_shift_mc_se": mc_se / mean_information,
+            "linearized_shift_between_bank_se": between_se / mean_information}
+
+
 def _log_q(q):
     """A monotone binning coordinate retaining q=0 and arbitrarily large q."""
     q = np.asarray(q, dtype=np.float64)

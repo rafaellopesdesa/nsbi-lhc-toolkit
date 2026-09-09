@@ -18,6 +18,7 @@ from utils_plotting import export_standalone_figure_script
 __all__ = [
     "plot_training", "plot_ratio_validation", "plot_mle_convergence",
     "plot_asimov_scans", "plot_toy_comparison", "plot_compression_validation",
+    "plot_simulator_score_closure",
 ]
 
 
@@ -114,7 +115,48 @@ def plot_training(histories, output_dir):
             ax.grid(alpha=0.2)
             ax.legend(loc="upper right")
             figures[component] = _export(fig, output_dir, f"nre_training_{component}")
+        # Old histories remain plottable; new runs also export the actual rate
+        # used for every epoch and indicate the deployed checkpoint.
+        if all("learning_rate" in history for members in histories.values() for history in members):
+            fig, ax = plt.subplots(figsize=(7, 5))
+            for component, color in (("signal", "C0"), ("background", "C1")):
+                for index, history in enumerate(histories[component]):
+                    rates = _array(history["learning_rate"], "learning rates")
+                    if np.any(rates <= 0) or len(rates) != len(history["train_loss"]):
+                        raise ValueError("Learning rates must be positive and match the training epochs.")
+                    ax.plot(np.arange(1, len(rates) + 1), rates, color=color, alpha=0.6,
+                            label=component.capitalize() if index == 0 else None)
+                    selected = int(history.get("selected_epoch", history["best_epoch"]))
+                    ax.plot(selected, rates[selected - 1], "o", color=color,
+                            label="Selected weights" if component == "signal" and index == 0 else None)
+            ax.set(yscale="log", xlabel="Epoch", ylabel="Learning rate")
+            ax.grid(alpha=0.2)
+            ax.legend(loc="upper right")
+            figures["learning_rates"] = _export(fig, output_dir, "nre_training_learning_rates")
     return figures
+
+
+def plot_simulator_score_closure(diagnostics, summary, output_dir):
+    """MC uncertainty in the expected score, conditional on the frozen NRE."""
+    scores = _array([item["score_at_truth"] for item in diagnostics], "scores")
+    errors = _array([item["score_mc_se"] for item in diagnostics], "score errors")
+    if np.any(errors < 0):
+        raise ValueError("Score standard errors must be nonnegative.")
+    with plt.rc_context(_STYLE):
+        fig, ax = plt.subplots(figsize=(7, 5))
+        positions = np.arange(1, len(scores) + 1)
+        _errorbar(ax, positions, scores, yerr=errors, fmt="o", color="C0", capsize=3,
+                  label="Independent banks (MC error)")
+        _errorbar(ax, [len(scores) + 1], [summary["score_mean"]],
+                  yerr=[summary["score_mc_se"]], fmt="s", color="black", capsize=4,
+                  label="Combined (propagated MC error)")
+        ax.axhline(0, color="C3", linestyle="--", linewidth=1.4, label="Simulator score closure")
+        ax.set_xticks(np.r_[positions, len(scores) + 1], [str(x) for x in positions] + ["Combined"])
+        ax.set(xlabel="Independent integration bank",
+               ylabel=rf"Expected likelihood score at $\mu={diagnostics[0]['mu_true']:g}$")
+        ax.grid(alpha=0.2)
+        ax.legend(loc="best")
+        return _export(fig, output_dir, "nre_simulator_score_closure")
 
 
 def plot_ratio_validation(ref_ratios, signal_ratios, background_ratios, output_dir):
