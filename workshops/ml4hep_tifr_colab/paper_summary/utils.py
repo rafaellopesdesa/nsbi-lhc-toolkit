@@ -4850,6 +4850,76 @@ def _launch_checkpoint_compatible_jana_evaluation(
     return json.loads(manifest_path.read_text())
 
 
+def _launch_checkpoint_compatible_jana_ratio_export(
+    python_executable: Path,
+    *,
+    run_directory: Path,
+    master_bank_path: Path,
+    validation_bank_path: Path,
+    budget: int,
+    seed: int,
+    output_directory: Path,
+    context_batch_size: int,
+    load_if_available: bool,
+) -> Mapping[str, Any]:
+    """Export ratio banks with the checkpoint-compatible spline guard."""
+
+    try:
+        from . import utils_jana as jana_runtime
+    except ImportError:
+        import utils_jana as jana_runtime
+
+    runner = Path(__file__).resolve().parent / "utils_jana_ratio_export.py"
+    if not runner.is_file():
+        raise FileNotFoundError(f"Missing exact-JANA ratio runner: {runner}")
+    command = [
+        str(python_executable),
+        str(runner),
+        "export-ratio-bank",
+        "--run-directory",
+        str(run_directory),
+        "--master-bank",
+        str(master_bank_path),
+        "--validation-bank",
+        str(validation_bank_path),
+        "--budget",
+        str(int(budget)),
+        "--seed",
+        str(int(seed)),
+        "--output-directory",
+        str(output_directory),
+        "--context-batch-size",
+        str(int(context_batch_size)),
+    ]
+    if not load_if_available:
+        command.append("--no-load-if-available")
+    completed = subprocess.run(
+        command,
+        text=True,
+        capture_output=True,
+        env=jana_runtime._isolated_jana_subprocess_env(),
+    )
+    if completed.returncode:
+        details = "\n".join(
+            part.strip()
+            for part in (completed.stdout, completed.stderr)
+            if part and part.strip()
+        )
+        raise RuntimeError(
+            "The isolated exact-JANA ratio-bank export failed. Its trained "
+            "checkpoint was not modified. Isolated-process diagnostics:\n"
+            + (details[-12000:] or "(no subprocess output was captured)")
+        )
+    if completed.stdout.strip():
+        print(completed.stdout.strip())
+    manifest_path = output_directory / "manifest.json"
+    if not manifest_path.is_file():
+        raise RuntimeError(
+            f"Isolated JANA ratio export did not write {manifest_path}."
+        )
+    return json.loads(manifest_path.read_text())
+
+
 def run_jana_campaign(
     artifact_root: str | Path,
     campaign: Mapping[str, Any],
@@ -6497,12 +6567,15 @@ def run_exact_jana_corrections(
     """Export nominal JANA banks, train ratios, and merge corrected shards."""
 
     try:
-        from .utils_jana import (
-            export_exact_jana_ratio_banks,
-            run_exact_jana_campaign,
-        )
+        from . import utils_jana as jana_runtime
     except ImportError:
-        from utils_jana import export_exact_jana_ratio_banks, run_exact_jana_campaign
+        import utils_jana as jana_runtime
+    # Keep the checkpoint-fingerprinted scientific driver unchanged.  Only
+    # replace its sampling-process launcher with the external runner that
+    # applies the same algebraically equivalent spline guard as evaluation.
+    jana_runtime._launch_isolated_ratio_export = (
+        _launch_checkpoint_compatible_jana_ratio_export
+    )
     artifact_root = Path(artifact_root).expanduser().resolve()
     signature = _config_module().campaign_signature(campaign)
     exact_groups = _exact_jana_budget_seed_groups(
@@ -6518,7 +6591,7 @@ def run_exact_jana_corrections(
     exact_frames = []
     export_by_key = {}
     for budget, exact_seeds in exact_groups:
-        current_rows = run_exact_jana_campaign(
+        current_rows = jana_runtime.run_exact_jana_campaign(
             artifact_root,
             campaign,
             load_if_available=load_if_available,
@@ -6529,7 +6602,7 @@ def run_exact_jana_corrections(
             current_rows = pd.DataFrame(current_rows)
         if not current_rows.empty:
             exact_frames.append(current_rows)
-        exports = export_exact_jana_ratio_banks(
+        exports = jana_runtime.export_exact_jana_ratio_banks(
             artifact_root,
             campaign,
             load_if_available=load_if_available,
