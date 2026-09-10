@@ -167,6 +167,15 @@ The extra pins live in `requirements_jana_gpu.txt`; the original driver and
 requirements fingerprints are unchanged so existing smaller-budget results
 remain reusable. There is no silent CPU fallback in 02.
 
+Notebook 03 reuses completed exact-JANA checkpoints with the same training
+contracts, including batch size 1024 at 1M. Its TensorFlow evaluation can run
+on CPU; it does not start or restart flow training. Before exporting ratio
+banks, it reports any selected budget/seed without a completed checkpoint.
+Finish those runs in 02 with `LOAD_IF_AVAILABLE=True`, then rerun 03 from the
+top. The checkpoint reuse launcher also surfaces the isolated process's
+underlying error. Evaluation uses the same numerical fixes and preserves
+stale outputs after retraining as in 02. No training fingerprints change.
+
 Every PAPER budget, including **1,000,000**, again requires all three seeds:
 31082026, 31082027 and 31082028. The former two-repetition exception is removed
 from training, corrections and comparison completion checks.

@@ -6581,9 +6581,16 @@ def run_exact_jana_corrections(
         from . import utils_jana as jana_runtime
     except ImportError:
         import utils_jana as jana_runtime
-    # Keep the checkpoint-fingerprinted scientific driver unchanged.  Only
-    # replace its sampling-process launcher with the external runner that
-    # applies the same algebraically equivalent spline guard as evaluation.
+    from utils_jana_gpu import activate_runtime_hooks
+    from utils_jana_reuse import launch_saved_campaign, require_completed_checkpoints
+
+    activate_runtime_hooks(jana_runtime)
+    # Reuse 02's batch-1024 1M checkpoints without calling the default batch-32
+    # training path. The original driver and its fingerprints remain unchanged.
+    jana_runtime.launch_isolated_campaign = launch_saved_campaign
+    jana_runtime._launch_isolated_evaluation = (
+        _launch_checkpoint_compatible_jana_evaluation
+    )
     jana_runtime._launch_isolated_ratio_export = (
         _launch_checkpoint_compatible_jana_ratio_export
     )
@@ -6599,9 +6606,17 @@ def run_exact_jana_corrections(
         for budget, seeds in exact_groups
         for seed in seeds
     }
+    require_completed_checkpoints(artifact_root, sorted(requested_pairs))
     exact_frames = []
     export_by_key = {}
     for budget, exact_seeds in exact_groups:
+        if load_if_available:
+            _preserve_nonreusable_exact_jana_evaluations(
+                artifact_root=artifact_root,
+                campaign_signature=signature,
+                budgets=(budget,),
+                ml_seeds=exact_seeds,
+            )
         current_rows = jana_runtime.run_exact_jana_campaign(
             artifact_root,
             campaign,

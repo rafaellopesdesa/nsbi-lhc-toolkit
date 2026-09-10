@@ -427,6 +427,13 @@ broadened Gaussian latent base; the posterior proposal adds a defensive prior
 component, while the observation-space likelihood proposal uses broadening
 alone.  No posterior or likelihood flow is retrained here.
 
+Finish every selected budget/seed in notebook 02 first. This notebook reuses
+its saved training contracts (including batch size 1024 for 1M), even when
+TensorFlow evaluation runs on CPU. Missing or unfinished flows are reported
+before exporting ratio banks; return to 02 with `LOAD_IF_AVAILABLE=True` to
+finish them. Changing `LOAD_IF_AVAILABLE` here affects corrections and
+diagnostics, not the pretrained flow weights.
+
 At 100k, a disjoint train/checkpoint-validation/untouched-closure split and
 importance efficiency select one `(tau, epsilon)` pair without access to
 reference posterior samples.  The rule takes the worst route and worst of the
@@ -456,9 +463,13 @@ INSTALL_EXACT_JANA_ENV_IF_MISSING = (
 import importlib
 import utils_jana
 import utils_jana_runtime
+import utils_jana_gpu
+import utils_jana_reuse
 
 utils_jana = importlib.reload(utils_jana)
 utils_jana_runtime = importlib.reload(utils_jana_runtime)
+utils_jana_gpu = importlib.reload(utils_jana_gpu)
+utils_jana_reuse = importlib.reload(utils_jana_reuse)
 
 print("Preparing the isolated exact-JANA runtime (first install can take several minutes).")
 JANA_PYTHON = utils_jana_runtime.ensure_jana_environment(
@@ -471,9 +482,13 @@ print("Exact-JANA Python:", JANA_PYTHON)
         code("paper-03-display-helper", DISPLAY_RESULT),
         code(
             "paper-03-run",
-            '''from utils import run_hybrid_campaign
+            '''import importlib
+import utils
 
-HYBRID_RESULT = run_hybrid_campaign(
+# Pull repository fixes into an already-open Colab runtime.
+utils = importlib.reload(utils)
+
+HYBRID_RESULT = utils.run_hybrid_campaign(
     artifact_root=ARTIFACT_ROOT,
     campaign=CAMPAIGN,
     factorizations=FACTORIZATIONS,
