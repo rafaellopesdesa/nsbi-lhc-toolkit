@@ -17,6 +17,9 @@ from typing import Sequence
 import numpy as np
 
 import utils_jana as jana
+from utils_jana_checkpoint import (
+    install_checkpoint_restore_hook, preserve_old_inference, stamp_inference_manifest,
+)
 
 
 _AUDIT_CYCLE_THETA: np.ndarray | None = None
@@ -314,6 +317,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     parsed = jana._cli_parser().parse_args(arguments)
     if parsed.command != "evaluate":
         raise ValueError("utils_jana_evaluation.py supports only 'evaluate'.")
+    output_directory = (
+        Path(parsed.output_directory) if parsed.output_directory
+        else Path(parsed.run_directory).expanduser().resolve() / "standardized_results"
+    )
     input_path = Path(parsed.input).expanduser().resolve()
     with np.load(input_path, allow_pickle=False) as saved:
         if "audit_reference_theta" not in saved.files:
@@ -324,10 +331,15 @@ def main(argv: Sequence[str] | None = None) -> int:
             saved["audit_reference_theta"], dtype=np.float32
         ).reshape(-1, jana.POSTERIOR_DIMENSION)
 
+    install_checkpoint_restore_hook()
+    preserve_old_inference(output_directory, "evaluation_manifest.json")
     _install_bayesflow_numerical_guards()
     jana.evaluate_nominal_log_posterior = _log_posterior_with_cycle_mask
     jana.evaluate_nominal_log_likelihood = _log_likelihood_with_cycle_mask
-    return jana._main(arguments)
+    result = jana._main(arguments)
+    if result == 0:
+        stamp_inference_manifest(output_directory / "evaluation_manifest.json")
+    return result
 
 
 if __name__ == "__main__":

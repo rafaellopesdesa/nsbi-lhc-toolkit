@@ -9,10 +9,14 @@ evaluation, then returns to the checkpoint's float32 model dtype.
 from __future__ import annotations
 
 import sys
+from pathlib import Path
 from typing import Sequence
 
 import utils_jana as jana
 from utils_jana_evaluation import _install_bayesflow_numerical_guards
+from utils_jana_checkpoint import (
+    install_checkpoint_restore_hook, preserve_old_inference, stamp_inference_manifest,
+)
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -22,8 +26,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         raise ValueError(
             "utils_jana_ratio_export.py supports only 'export-ratio-bank'."
         )
+    install_checkpoint_restore_hook()
+    preserve_old_inference(parsed.output_directory, "manifest.json")
     _install_bayesflow_numerical_guards()
-    return jana._main(arguments)
+    result = jana._main(arguments)
+    if result == 0:
+        stamp_inference_manifest(Path(parsed.output_directory) / "manifest.json")
+    return result
 
 
 if __name__ == "__main__":

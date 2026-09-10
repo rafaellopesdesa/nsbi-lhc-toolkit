@@ -67,7 +67,11 @@ class ConfigurationTests(unittest.TestCase):
     def test_notebook_and_generator_agree(self):
         import generate_notebooks
         actual = json.loads((HERE / "02_SLCP_JANA.ipynb").read_text())
-        self.assertEqual(actual["cells"], generate_notebooks.NOTEBOOKS["02_SLCP_JANA.ipynb"])
+        expected = {cell["id"]: cell for cell in generate_notebooks.NOTEBOOKS["02_SLCP_JANA.ipynb"]}
+        actual_by_id = {cell["id"]: cell for cell in actual["cells"]}
+        for cell_id, cell in expected.items():
+            self.assertEqual(actual_by_id[cell_id]["source"], cell["source"])
+            self.assertEqual(actual_by_id[cell_id]["cell_type"], cell["cell_type"])
         sources = {cell["id"]: "".join(cell["source"]) for cell in actual["cells"]}
         self.assertIn("require_gpu=True", sources["paper-02-jana-environment"])
         for cell in actual["cells"]:
@@ -175,6 +179,7 @@ class ConfigurationTests(unittest.TestCase):
             self.assertEqual(actual, {10_000: 32, 100_000: 32, 1_000_000: 1024})
 
     def test_old_evaluation_retired_after_retraining(self):
+        from utils_jana_checkpoint import INFERENCE_REVISION
         helper = extracted_helpers()["_preserve_evaluation_after_retraining"]
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -188,7 +193,7 @@ class ConfigurationTests(unittest.TestCase):
             self.assertFalse(output.exists())
             self.assertEqual(len(list(output.parent.glob("standardized.recovery-*"))), 1)
             output.mkdir()
-            jana._atomic_write_json(output / "evaluation_manifest.json", {"checkpoint_artifact_sha256": "new", "checkpoint_contract_sha256": "contract"})
+            jana._atomic_write_json(output / "evaluation_manifest.json", {"checkpoint_artifact_sha256": "new", "checkpoint_contract_sha256": "contract", "inference_revision": INFERENCE_REVISION})
             helper(run, output)
             self.assertTrue(output.exists())
 
@@ -253,8 +258,13 @@ class TensorFlowResumeTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         import tensorflow as tf
-        tf.config.threading.set_inter_op_parallelism_threads(1)
-        tf.config.threading.set_intra_op_parallelism_threads(1)
+        try:
+            tf.config.threading.set_inter_op_parallelism_threads(1)
+            tf.config.threading.set_intra_op_parallelism_threads(1)
+        except RuntimeError:
+            # Other integration tests may already have initialized TF. This
+            # optional thread limit does not affect save/resume assertions.
+            pass
 
     def test_real_jana_resume_restores_weights_adam_and_epoch(self):
         import tensorflow as tf

@@ -2576,6 +2576,9 @@ def _implementation_manifest() -> dict[str, Any]:
         "utils.py",
         "utils_ratio.py",
         "utils_jana.py",
+        "utils_jana_checkpoint.py",
+        "utils_jana_evaluation.py",
+        "utils_jana_ratio_export.py",
         "utils_plotting.py",
         "generate_notebooks.py",
         "requirements_jana.txt",
@@ -4646,6 +4649,8 @@ def _preserve_nonreusable_exact_jana_evaluations(
     checkpoint can be evaluated again with load_if_available=True.
     """
 
+    from utils_jana_checkpoint import inference_manifest_current
+
     preserved: list[Path] = []
     result_root = (
         artifact_root / "results" / "jana_paper" / campaign_signature
@@ -4716,6 +4721,7 @@ def _preserve_nonreusable_exact_jana_evaluations(
             )
             reusable = (
                 evaluation is not None
+                and inference_manifest_current(evaluation)
                 and evaluation.get("status") == "complete"
                 and evaluation.get("checkpoint_artifact_sha256")
                 == current_artifact
@@ -4842,13 +4848,15 @@ def _launch_checkpoint_compatible_jana_evaluation(
 
 
 def _preserve_evaluation_after_retraining(run_directory: Path, output_directory: Path) -> None:
-    """Retire only evaluation data belonging to a replaced checkpoint."""
+    """Retire evaluation data from a replaced checkpoint or broken restore."""
+    from utils_jana_checkpoint import inference_manifest_current
     checkpoint = _read_json_mapping(run_directory / "checkpoint_manifest.json")
     evaluation = _read_json_mapping(output_directory / "evaluation_manifest.json")
     if checkpoint is None or not output_directory.is_dir():
         return
     if evaluation is not None and (
-        evaluation.get("checkpoint_artifact_sha256") == checkpoint.get("checkpoint_artifact_sha256")
+        inference_manifest_current(evaluation)
+        and evaluation.get("checkpoint_artifact_sha256") == checkpoint.get("checkpoint_artifact_sha256")
         and evaluation.get("checkpoint_contract_sha256") == checkpoint.get("training_contract_sha256")
     ):
         return
@@ -4856,7 +4864,7 @@ def _preserve_evaluation_after_retraining(run_directory: Path, output_directory:
         return
     archive = _unused_recovery_path(output_directory, "recovery-before-new-checkpoint-evaluation")
     output_directory.rename(archive)
-    print(f"[exact JANA evaluation] Preserved outputs from the previous checkpoint in {archive.name}; evaluating the new training.", flush=True)
+    print(f"[exact JANA evaluation] Preserved obsolete diagnostics in {archive.name}; evaluating the saved checkpoint.", flush=True)
 
 
 def _launch_checkpoint_compatible_jana_ratio_export(
@@ -5043,7 +5051,9 @@ def run_jana_campaign(
         except ImportError:
             import utils_jana as jana_runtime
         from utils_jana_gpu import activate_runtime_hooks
+        from utils_jana_checkpoint import install_evaluation_cache_guard
         activate_runtime_hooks(jana_runtime)
+        install_evaluation_cache_guard()
         # The scientific/training driver is checkpoint-fingerprinted and must
         # remain unchanged.  Replace only its modern-process evaluation
         # launcher with the external, evaluation-only runner above.
@@ -6022,6 +6032,8 @@ def train_exact_jana_ratio_models(
 ) -> dict[str, Any]:
     """Train CE corrections on nominal S/P/L banks exported by exact JANA."""
 
+    from utils_jana_checkpoint import INFERENCE_REVISION
+
     artifact_root = Path(artifact_root).expanduser().resolve()
     signature = _config_module().campaign_signature(campaign)
     arrays_path = Path(export_manifest["arrays_path"]).expanduser().resolve()
@@ -6098,6 +6110,7 @@ def train_exact_jana_ratio_models(
         / signature
         / f"budget_{int(budget)}"
         / f"seed_{int(ml_seed)}"
+        / INFERENCE_REVISION
     )
     classifiers = ratio_api.train_ratio_ensembles(
         train_bank,
@@ -6270,6 +6283,8 @@ def evaluate_exact_jana_correction(
     exact_rows: pd.DataFrame,
 ) -> pd.DataFrame:
     """Evaluate one ratio factorization over saved exact-JANA proposals."""
+
+    from utils_jana_checkpoint import INFERENCE_REVISION
 
     factorization = str(factorization).lower()
     if factorization not in {"multiclass", "binary"}:
@@ -6563,7 +6578,9 @@ def evaluate_exact_jana_correction(
                 },
             }
         )
-    return pd.DataFrame(rows)
+    result = pd.DataFrame(rows)
+    result["inference_revision"] = INFERENCE_REVISION
+    return result
 
 
 def run_exact_jana_corrections(
@@ -6583,8 +6600,10 @@ def run_exact_jana_corrections(
         import utils_jana as jana_runtime
     from utils_jana_gpu import activate_runtime_hooks
     from utils_jana_reuse import launch_saved_campaign, require_completed_checkpoints
+    from utils_jana_checkpoint import INFERENCE_REVISION, install_evaluation_cache_guard
 
     activate_runtime_hooks(jana_runtime)
+    install_evaluation_cache_guard()
     # Reuse 02's batch-1024 1M checkpoints without calling the default batch-32
     # training path. The original driver and its fingerprints remain unchanged.
     jana_runtime.launch_isolated_campaign = launch_saved_campaign
@@ -6669,6 +6688,13 @@ def run_exact_jana_corrections(
                 if load_if_available and per_run_path.exists()
                 else pd.DataFrame()
             )
+            if not existing.empty and (
+                "inference_revision" not in existing
+                or not existing["inference_revision"].eq(INFERENCE_REVISION).all()
+            ):
+                archive = _unused_recovery_path(per_run_path, "recovery-before-seeded-restore")
+                per_run_path.rename(archive)
+                existing = pd.DataFrame()
             present = set()
             if not existing.empty and {
                 "method",
@@ -6719,9 +6745,14 @@ def run_exact_jana_corrections(
     )
     if not shard_files:
         raise RuntimeError("No exact-JANA correction metric shards were produced.")
-    merged = pd.concat(
-        [pd.read_csv(path) for path in shard_files], ignore_index=True
-    ).drop_duplicates(
+    current_shards = []
+    for path in shard_files:
+        frame = pd.read_csv(path)
+        if "inference_revision" in frame:
+            current_shards.append(frame[frame["inference_revision"].eq(INFERENCE_REVISION)])
+    if not current_shards:
+        raise RuntimeError("No correction shards use the repaired JANA restore yet.")
+    merged = pd.concat(current_shards, ignore_index=True).drop_duplicates(
         ["method", "budget", "ml_seed", "observation"], keep="last"
     )
     result_path = (

@@ -217,6 +217,24 @@ def display_result(result):
 '''
 
 
+RESTORE_RECOVERY = r'''## Repairing saved-model evaluation (02 and 03)
+
+The pinned BayesFlow version stores its orthogonal rotation matrices as ordinary
+Tensors, so they are absent from TensorFlow checkpoints. The inference loader
+now reconstructs these matrices with the saved **training seed** before restoring
+the trained weights. Previously, fresh random rotations could make all posterior
+proposals fall outside the prior and raise `All likelihood-route importance
+weights are zero`, even though training had completed successfully.
+
+Rerun this notebook from the setup cell with `LOAD_IF_AVAILABLE=True` and the
+same artifact root. No completed flow needs retraining. Old JANA diagnostics
+and ratio banks are preserved under recovery names and regenerated once.
+JANA correction classifiers trained on the old banks must also be fitted again;
+they are preserved separately from the corrected classifiers. Separate-flow
+models and their corrections are unaffected. Subsequent runs reuse the repaired
+outputs normally. The prior, proposals and importance-weight formula are unchanged.
+'''
+
 NOTEBOOKS = {
     "00_prepare_SLCP_samples.ipynb": [
         markdown("paper-00-badge", badge("00_prepare_SLCP_samples.ipynb")),
@@ -321,6 +339,7 @@ Drive artifact root.  Each runtime claims one pending `(budget, ML seed)` shard
 at a time and skips shards already being trained by another live runtime.
 ''',
         ),
+        markdown("paper-02-restore-recovery", RESTORE_RECOVERY),
         code("paper-02-setup", COMMON_SETUP),
         code("paper-02-config", COMMON_CONFIGURATION),
         code(
@@ -377,10 +396,12 @@ is reclaimed once its existing six-hour lease expires.
     import utils_jana
     import utils_jana_runtime
     import utils_jana_gpu
+    import utils_jana_checkpoint
 
     utils_jana = importlib.reload(utils_jana)
     utils_jana_runtime = importlib.reload(utils_jana_runtime)
     utils_jana_gpu = importlib.reload(utils_jana_gpu)
+    utils_jana_checkpoint = importlib.reload(utils_jana_checkpoint)
 
     print("Preparing the isolated exact-JANA runtime (first install can take several minutes).")
     JANA_PYTHON = utils_jana_runtime.ensure_jana_environment(
@@ -445,6 +466,7 @@ corresponding flows.  The 100k proposal ablation applies to the separate-flow
 base and is retained as a control, not as another headline pipeline.
 ''',
         ),
+        markdown("paper-03-restore-recovery", RESTORE_RECOVERY),
         code("paper-03-setup", COMMON_SETUP),
         code("paper-03-config", COMMON_CONFIGURATION),
         code(
@@ -465,11 +487,13 @@ import utils_jana
 import utils_jana_runtime
 import utils_jana_gpu
 import utils_jana_reuse
+import utils_jana_checkpoint
 
 utils_jana = importlib.reload(utils_jana)
 utils_jana_runtime = importlib.reload(utils_jana_runtime)
 utils_jana_gpu = importlib.reload(utils_jana_gpu)
 utils_jana_reuse = importlib.reload(utils_jana_reuse)
+utils_jana_checkpoint = importlib.reload(utils_jana_checkpoint)
 
 print("Preparing the isolated exact-JANA runtime (first install can take several minutes).")
 JANA_PYTHON = utils_jana_runtime.ensure_jana_environment(

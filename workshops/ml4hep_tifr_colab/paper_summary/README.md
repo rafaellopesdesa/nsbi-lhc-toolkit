@@ -164,7 +164,7 @@ isolated Python 3.11 environment, and verifies an actual GPU computation.
 It does not upgrade BayesFlow, change the model architecture, replace
 Colab's NVIDIA driver, or change the modern notebook's CUDA library path.
 The extra pins live in `requirements_jana_gpu.txt`; the original driver and
-requirements fingerprints are unchanged so existing smaller-budget results
+requirements fingerprints are unchanged so existing smaller-budget checkpoints
 remain reusable. There is no silent CPU fallback in 02.
 
 Notebook 03 reuses completed exact-JANA checkpoints with the same training
@@ -175,6 +175,23 @@ Finish those runs in 02 with `LOAD_IF_AVAILABLE=True`, then rerun 03 from the
 top. The checkpoint reuse launcher also surfaces the isolated process's
 underlying error. Evaluation uses the same numerical fixes and preserves
 stale outputs after retraining as in 02. No training fingerprints change.
+
+## Repairing saved-model evaluation (02 and 03)
+
+The pinned BayesFlow version stores its orthogonal rotation matrices as ordinary
+Tensors, so they are absent from TensorFlow checkpoints. The inference loader
+now reconstructs these matrices with the saved **training seed** before restoring
+the trained weights. Previously, fresh random rotations could make all posterior
+proposals fall outside the prior and raise `All likelihood-route importance
+weights are zero`, even though training had completed successfully.
+
+Rerun this notebook from the setup cell with `LOAD_IF_AVAILABLE=True` and the
+same artifact root. No completed flow needs retraining. Old JANA diagnostics
+and ratio banks are preserved under recovery names and regenerated once.
+JANA correction classifiers trained on the old banks must also be fitted again;
+they are preserved separately from the corrected classifiers. Separate-flow
+models and their corrections are unaffected. Subsequent runs reuse the repaired
+outputs normally. The prior, proposals and importance-weight formula are unchanged.
 
 Every PAPER budget, including **1,000,000**, again requires all three seeds:
 31082026, 31082027 and 31082028. The former two-repetition exception is removed
