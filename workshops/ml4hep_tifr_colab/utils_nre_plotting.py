@@ -229,7 +229,7 @@ def plot_mle_convergence(study, output_dir):
         return _export(fig, output_dir, "nre_asimov_mle_convergence")
 
 
-def plot_asimov_scans(results, sizes, label, output_dir, script_name):
+def plot_asimov_scans(results, sizes, label, output_dir, script_name, *, truth=None):
     """Plot scans from one repetition, each referenced to its own minimum."""
     if len(results) != len(sizes) or not results:
         raise ValueError("One nonempty scan result is required per size.")
@@ -241,7 +241,10 @@ def plot_asimov_scans(results, sizes, label, output_dir, script_name):
             if scan_mu.shape != t_scan.shape:
                 raise ValueError("scan_mu and t_scan must have the same shape.")
             ax.plot(scan_mu, t_scan, color=f"C{index % 10}", linewidth=1.8,
-                    label=fr"$M={int(size):,}$, $\widehat\mu_A={result['mu_hat']:.4f}$")
+                    label=fr"$M={int(size):,}$")
+        if truth is not None:
+            ax.plot(truth["scan_mu"], truth["t_scan"], color="black", linewidth=2.3,
+                    linestyle="--", label=fr"Analytic truth ($M={truth['n_integration_events']:,}$)")
         ax.axhline(1.0, color="0.5", linestyle=":", linewidth=1)
         ax.set(xlabel=r"Signal strength $\mu$", ylabel=r"$t_{\mu,A}=-2\log[L_A(\mu)/L_A(\widehat\mu_A)]$", title=label)
         ax.set_ylim(bottom=0)
@@ -275,7 +278,8 @@ def _prediction_bin_probabilities(prediction, mu_edges, q_edges):
     return np.diff(mu_cdf), np.diff(q_cdf)
 
 
-def _toy_histogram(ax, values, bins, label, color, markers=False):
+def _toy_histogram(ax, values, bins, label, color, markers=False,
+                   marker="o", markerfacecolor=None):
     values = _array(values, label)
     if np.any(values < 0):
         raise ValueError("Physical toy estimates and q0 must be nonnegative.")
@@ -284,7 +288,8 @@ def _toy_histogram(ax, values, bins, label, color, markers=False):
     if markers:
         centers = 0.5 * (bins[:-1] + bins[1:])
         _errorbar(ax, centers, probability, yerr=np.sqrt(counts) / values.size,
-                    fmt="o", color=color, markersize=3.0, capsize=1.5, label=label)
+                    fmt=marker, color=color, markerfacecolor=markerfacecolor,
+                    markersize=3.0, capsize=1.5, label=label)
     else:
         ax.stairs(probability, bins, color=color, linewidth=1.8, label=label)
 
@@ -319,7 +324,8 @@ def plot_toy_comparison(toys_model, toys_simulator, predictions, labels, title,
             axes, (model_mu, model_q), (sim_mu, sim_q), (mu_edges, q_edges),
             (r"Fitted signal strength $\widehat\mu$", r"Discovery statistic $q_0$"),
         ):
-            _toy_histogram(ax, model, bins, "NRE-model toys", "0.45")
+            _toy_histogram(ax, model, bins, "NRE-model toys", "0.45",
+                           markers=True, marker="s", markerfacecolor="none")
             _toy_histogram(ax, simulator, bins, "Simulator toys", "black", markers=True)
             ax.set(xlabel=xlabel, ylabel="Probability / bin", xlim=(bins[0], bins[-1]))
             ax.grid(alpha=0.2)
