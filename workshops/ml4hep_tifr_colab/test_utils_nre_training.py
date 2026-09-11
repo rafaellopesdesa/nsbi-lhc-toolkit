@@ -209,6 +209,59 @@ class ConfigTests(unittest.TestCase):
 
 @unittest.skipUnless(importlib.util.find_spec("torch"), "PyTorch not installed")
 class TorchSmokeTests(unittest.TestCase):
+    def test_load_without_training_banks_preserves_model_and_checks_weights(self):
+        cfg = {"ensemble_size": 2, "hidden_layers": 1, "hidden_features": 8,
+               "epochs": 1, "batch_size": 16, "device": "cpu"}
+        with tempfile.TemporaryDirectory() as tmp:
+            arrays = [
+                nre.cached_features(tmp, AcceptAll(), role, component, 24, 31 + index, 16)
+                for index, (role, component) in enumerate(
+                    (role, component) for role in ("training", "validation")
+                    for component in ("signal", "background", "reference")
+                )
+            ]
+            trained = nre.train_nre(tmp, *arrays, config=cfg, seed=18)
+            directory = next(Path(tmp).glob("training/*/scaler/scaler.npz")).parents[1]
+            evaluation = np.random.default_rng(91).normal(size=(10, 5)).astype(np.float32)
+            expected = trained(evaluation)
+            bank = next((Path(tmp) / "banks" / "features").glob("*/values.npy"))
+            with bank.open("ab") as handle:
+                handle.write(b"corrupt")
+            contract = json.loads((bank.parent / "manifest.json").read_text())["contract"]
+            with self.assertRaisesRegex(nre.CacheError, "hash mismatch"):
+                nre._verified_manifest(bank.parent, contract)
+            before = {str(p): p.read_bytes() for p in Path(tmp).rglob("*") if p.is_file()}
+            original_load = np.load
+
+            def load_model_file(path, *args, **kwargs):
+                self.assertNotEqual(Path(path).name, "values.npy", "training events must not be opened")
+                return original_load(path, *args, **kwargs)
+
+            with patch.object(nre, "_train_member", side_effect=AssertionError("must not train")), \
+                 patch.object(nre, "selected_feature_chunks", side_effect=AssertionError("must not simulate")), \
+                 patch.object(nre.np, "load", side_effect=load_model_file):
+                loaded = nre.load_nre(tmp, config=cfg, seed=18)
+            np.testing.assert_array_equal(expected, loaded(evaluation))
+            self.assertEqual(trained.fingerprint, loaded.fingerprint)
+            self.assertEqual(trained.histories, loaded.histories)
+            self.assertEqual(before, {str(p): p.read_bytes() for p in Path(tmp).rglob("*") if p.is_file()})
+            with self.assertRaisesRegex(nre.CacheError, "No training was started"):
+                nre.load_nre(tmp, config=cfg, seed=19)
+
+            # Different input banks with the same settings must not be chosen silently.
+            other = [np.asarray(x) + 0.1 for x in arrays]
+            nre.train_nre(tmp, *other, config=cfg, seed=18)
+            with self.assertRaisesRegex(nre.CacheError, "Expected one saved NRE ensemble"):
+                nre.load_nre(tmp, config=cfg, seed=18)
+            chosen = nre.load_nre(tmp, config=cfg, seed=18, directory=directory)
+            self.assertEqual(chosen.fingerprint, trained.fingerprint)
+            np.testing.assert_array_equal(chosen(evaluation), expected)
+            weight_file = directory / "signal" / "member_00" / "weights.npz"
+            with weight_file.open("ab") as handle:
+                handle.write(b"corrupt")
+            with self.assertRaisesRegex(nre.CacheError, "hash mismatch"):
+                nre.load_nre(tmp, config=cfg, seed=18, directory=directory)
+
     def test_last_weights_and_full_schedule_despite_worsening_validation(self):
         import torch
 

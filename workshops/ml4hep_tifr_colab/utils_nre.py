@@ -650,6 +650,80 @@ class NREPredictor:
         return ratios
 
 
+def _load_nre_member(directory, contract, config, device):
+    manifest = _verified_manifest(directory, contract)
+    torch = _torch()
+    history = json.loads((directory / "history.json").read_text())
+    model = _network(config).to(device)
+    with np.load(directory / "weights.npz", allow_pickle=False) as payload:
+        weights = {key: torch.from_numpy(payload[key].copy()) for key in payload.files}
+    if any(not bool(torch.isfinite(value).all().item()) for value in weights.values()):
+        raise CacheError(f"Non-finite saved network weights: {directory}")
+    try:
+        model.load_state_dict(weights, strict=True)
+    except RuntimeError as error:
+        raise CacheError(f"Invalid saved member structure in {directory}: {error}") from error
+    model.eval()
+    return model, history, manifest
+
+
+def load_nre(root, config=None, seed=120005, *, directory=None):
+    """Load a completed ensemble and scaler without opening training-event banks.
+
+    Match the training settings and seed, or select an explicit training
+    directory when several ensembles match. Model hashes are still verified;
+    this function never generates events, trains, or changes cached files.
+    """
+    cfg = _training_config(config)
+    training_cfg = {key: value for key, value in cfg.items()
+                    if key not in ("device", "prediction_batch_size")}
+    directories = ([Path(directory)] if directory is not None
+                   else sorted((Path(root) / "training").glob("*")))
+    matches = []
+    for candidate in directories:
+        manifest_path = candidate / "scaler" / "manifest.json"
+        if not manifest_path.is_file():
+            continue
+        contract = json.loads(manifest_path.read_text())["contract"]
+        if (contract.get("version") == TRAINING_VERSION
+                and contract.get("config") == training_cfg
+                and contract.get("seed") == int(seed)
+                and candidate.name == _fingerprint(contract)):
+            matches.append((candidate, contract))
+    if len(matches) != 1:
+        paths = ", ".join(str(path) for path, _ in matches) or "none"
+        raise CacheError(
+            f"Expected one saved NRE ensemble matching this configuration and seed; found {paths}. "
+            "Set NRE_TRAINING_DIRECTORY to the intended ensemble directory if needed. "
+            "No training was started and no cache was modified."
+        )
+    directory, contract = matches[0]
+    _verified_manifest(directory / "scaler", contract)
+    with np.load(directory / "scaler" / "scaler.npz", allow_pickle=False) as payload:
+        minima, scale = payload["offset"].copy(), payload["scale"].copy()
+    if (minima.shape != (len(FEATURES),) or scale.shape != minima.shape
+            or not np.isfinite(minima).all() or not np.isfinite(scale).all()
+            or np.any(scale <= 0)):
+        raise CacheError(f"Invalid saved scaler in {directory}.")
+    device = _device(cfg)
+    models, histories, member_hashes = {}, {}, {}
+    for component_index, component in enumerate(("signal", "background")):
+        models[component], histories[component] = [], []
+        for member in range(cfg["ensemble_size"]):
+            member_seed = int(seed) + component_index * 1_000_000 + member * 10_007
+            member_contract = {**contract, "component": component,
+                               "member": member, "member_seed": member_seed}
+            model, history, manifest = _load_nre_member(
+                directory / component / f"member_{member:02d}", member_contract, cfg, device,
+            )
+            models[component].append(model)
+            histories[component].append(history)
+            member_hashes[f"{component}/{member}"] = manifest["files"]["weights.npz"]
+    print(f"Loaded saved NRE ensemble from {directory}; training-event banks were not opened.")
+    return NREPredictor(models, (minima, scale), cfg,
+                        _fingerprint({"contract": contract, "weights": member_hashes}), histories, device)
+
+
 def train_nre(root, train_signal, train_background, train_ref,
               validation_signal, validation_background, validation_ref, config=None, seed=120005):
     """Train/reuse independent S/REF and B/REF BCE-only classifier ensembles.
@@ -724,21 +798,9 @@ def train_nre(root, train_signal, train_background, train_ref,
             member_contract = {**contract, "component": component, "member": member, "member_seed": member_seed}
             member_directory = directory / component / f"member_{member:02d}"
             if member_directory.exists():
-                manifest = _verified_manifest(member_directory, member_contract)
-                with (member_directory / "history.json").open() as handle:
-                    history = json.load(handle)
-                # NPZ keeps loading independent of pickle or torch checkpoint
-                # serialization changes; strict state_dict keys/shapes remain.
-                model = _network(cfg).to(device)
-                with np.load(member_directory / "weights.npz", allow_pickle=False) as payload:
-                    weights = {key: torch.from_numpy(payload[key].copy()) for key in payload.files}
-                if any(not bool(torch.isfinite(value).all().item()) for value in weights.values()):
-                    raise CacheError(f"Non-finite saved network weights: {member_directory}")
-                try:
-                    model.load_state_dict(weights, strict=True)
-                except RuntimeError as error:
-                    raise CacheError(f"Invalid saved member structure in {member_directory}: {error}") from error
-                model.eval()
+                model, history, manifest = _load_nre_member(
+                    member_directory, member_contract, cfg, device,
+                )
                 print(f"Reused {component}/REF member {member + 1}/{cfg['ensemble_size']}.")
             else:
                 print(f"Training {component}/REF member {member + 1}/{cfg['ensemble_size']}.", flush=True)

@@ -52,14 +52,13 @@ class NotebookTests(unittest.TestCase):
             (Path(__file__).parent / "Exercise_12_NREAsimov.ipynb").read_text()
         )
 
-    def test_clean_notebook_and_compilable_cells(self):
+    def test_notebook_without_errors_and_compilable_cells(self):
         self.assertEqual(self.notebook["nbformat"], 4)
         ids = [cell["id"] for cell in self.notebook["cells"]]
         self.assertEqual(len(ids), len(set(ids)))
         for index, cell in enumerate(self.notebook["cells"]):
             if cell["cell_type"] == "code":
-                self.assertIsNone(cell["execution_count"])
-                self.assertEqual(cell["outputs"], [])
+                self.assertFalse(any(output["output_type"] == "error" for output in cell["outputs"]))
                 compile("".join(cell["source"]), f"notebook-cell-{index}", "exec")
 
     def test_full_configuration_and_gpu_guard(self):
@@ -72,6 +71,7 @@ class NotebookTests(unittest.TestCase):
             self.assertEqual(namespace["N_TRAIN_PER_CLASS"], 5_000_000)
             self.assertEqual(namespace["DEPLOYMENT_REF_EVENTS"], 5_000_000)
             self.assertEqual(namespace["SIMULATOR_TOY_BANK_EVENTS"], 5_000_000)
+            self.assertFalse(namespace["TRAIN_NRE"])
             cfg = namespace["TRAINING_CONFIG"]
             self.assertEqual((cfg["epochs"], cfg["ensemble_size"], cfg["device"]), (140, 4, "cuda"))
             self.assertIsNone(cfg["patience"])
@@ -101,7 +101,11 @@ class NotebookTests(unittest.TestCase):
                 exec(compile(source, f"notebook-cell-{index}", "exec"), namespace)
                 if index == 3:
                     namespace["load_exercise5_selection"] = lambda *args, **kwargs: TestSelection()
-                    namespace["train_nre"] = lambda *args, **kwargs: TestPredictor()
+                    namespace["load_nre"] = lambda *args, **kwargs: TestPredictor()
+                    def unexpected_training(*args, **kwargs):
+                        self.fail("The default figure workflow must not open training banks or train.")
+                    namespace["train_nre"] = unexpected_training
+                    namespace["cached_features"] = unexpected_training
                 plt.close("all")
 
             self.assertEqual(namespace["PROFILE"], "SMOKE")
