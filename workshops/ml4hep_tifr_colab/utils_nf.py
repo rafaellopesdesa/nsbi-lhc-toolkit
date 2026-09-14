@@ -1115,42 +1115,47 @@ def train_flow(
     )
     for epoch in range(1, n_epochs + 1):
         flow.train()
-        train_losses = []
+        train_nll_sum = 0.0
+        train_weight_sum = 0.0
         for packed_batch in train_loader:
             batch = packed_batch[0].to(device)
             event_nll = -flow.log_prob(batch)
             if len(packed_batch) == 1:
                 loss = event_nll.mean()
+                batch_nll_sum = loss
+                batch_weight_sum = 1.0
             else:
                 batch_weights = packed_batch[1].to(device)
-                loss = torch.sum(batch_weights * event_nll) / torch.sum(
-                    batch_weights
-                )
+                batch_nll_sum = torch.sum(batch_weights * event_nll)
+                # Weights are scaled once in _make_loaders, not per minibatch.
+                loss = batch_nll_sum / len(batch)
+                batch_weight_sum = float(batch_weights.sum().detach().cpu())
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(
-                flow.parameters(), max_norm=gradient_clip
-            )
+            torch.nn.utils.clip_grad_norm_(flow.parameters(), max_norm=gradient_clip)
             optimizer.step()
-            train_losses.append(float(loss.detach().cpu()))
+            train_nll_sum += float(batch_nll_sum.detach().cpu())
+            train_weight_sum += batch_weight_sum
 
         flow.eval()
-        val_losses = []
+        val_nll_sum = 0.0
+        val_weight_sum = 0.0
         with torch.no_grad():
             for packed_batch in val_loader:
                 batch = packed_batch[0].to(device)
                 event_nll = -flow.log_prob(batch)
                 if len(packed_batch) == 1:
-                    val_loss = event_nll.mean()
+                    batch_nll_sum = event_nll.mean()
+                    batch_weight_sum = 1.0
                 else:
                     batch_weights = packed_batch[1].to(device)
-                    val_loss = torch.sum(batch_weights * event_nll) / torch.sum(
-                        batch_weights
-                    )
-                val_losses.append(float(val_loss.detach().cpu()))
+                    batch_nll_sum = torch.sum(batch_weights * event_nll)
+                    batch_weight_sum = float(batch_weights.sum().cpu())
+                val_nll_sum += float(batch_nll_sum.cpu())
+                val_weight_sum += batch_weight_sum
 
-        train_loss = float(np.mean(train_losses))
-        val_loss = float(np.mean(val_losses))
+        train_loss = train_nll_sum / train_weight_sum
+        val_loss = val_nll_sum / val_weight_sum
         learning_rate_before_step = float(optimizer.param_groups[0]["lr"])
         scheduler.step(val_loss)
         current_learning_rate = float(optimizer.param_groups[0]["lr"])
