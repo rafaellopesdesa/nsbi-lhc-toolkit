@@ -1038,7 +1038,7 @@ def train_flow(
     weight_decay = float(training_config.get("weight_decay", 0.0))
     validation_fraction = float(training_config.get("validation_fraction", 0.2))
     patience = int(training_config.get("patience", n_epochs))
-    gradient_clip = float(training_config.get("gradient_clip", 5.0))
+    gradient_clip = training_config.get("gradient_clip", 5.0)
     lr_scheduler_factor = float(
         training_config.get("lr_scheduler_factor", 0.2)
     )
@@ -1132,7 +1132,8 @@ def train_flow(
                 batch_weight_sum = float(batch_weights.sum().detach().cpu())
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(flow.parameters(), max_norm=gradient_clip)
+            if gradient_clip is not None:
+                torch.nn.utils.clip_grad_norm_(flow.parameters(), max_norm=float(gradient_clip))
             optimizer.step()
             train_nll_sum += float(batch_nll_sum.detach().cpu())
             train_weight_sum += batch_weight_sum
