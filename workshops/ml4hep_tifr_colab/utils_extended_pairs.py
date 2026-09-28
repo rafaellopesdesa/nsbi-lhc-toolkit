@@ -9,6 +9,7 @@ from copy import deepcopy
 
 import numpy as np
 from scipy.optimize import brentq
+from scipy.special import logsumexp
 import torch
 from torch import nn
 from torch.nn import functional as F
@@ -211,6 +212,25 @@ def train_pairs(model, train, val, epochs=30, batch_size=512, lr=1e-3,
                              lr, patience, seed, device)
 
 
+def reference_fraction_posterior(q, n, fractions, ratio_scale):
+    """Exact fraction-class posterior for reference singletons and pairs.
+
+    q has shape (B,2), n has shape (B,), and fractions has shape (K,).
+    ratio_scale*q must equal p_s(x)/p_b(x) for the normalized reference
+    distribution that generated these sets. The class prior is uniform.
+    Padded events are excluded; no information from their q values is used.
+    """
+    q = np.asarray(q, dtype=np.float64)
+    n = np.asarray(n)
+    fractions = np.asarray(fractions, dtype=np.float64)
+    ratio = ratio_scale * q
+    mixture = (1.0 - fractions) + ratio[..., None] * fractions
+    mask = np.arange(q.shape[1])[None, :] < n[:, None]
+    mixture = np.where(mask[..., None], mixture, 1.0)
+    log_likelihood = np.log(mixture).sum(axis=1)
+    return np.exp(log_likelihood - logsumexp(log_likelihood, axis=1, keepdims=True))
+
+
 @torch.no_grad()
 def encode_events(encoder, x, batch_size=65536, device="cpu"):
     """Encode once; downstream pooling uses these individual event vectors."""
@@ -357,6 +377,42 @@ class FastHeads(nn.Module):
         return nu_hat, root_t.square()
 
 
+class RefinedHeads(FastHeads):
+    """Flexible statistic heads with an estimator that can reach zero.
+
+    signed_root learns sign(nu - teacher_nu_hat)*sqrt(T) with a linear
+    output; direct learns T with a softplus output. Neither mode imposes a
+    quadratic likelihood or ties the minimum to the separate estimator.
+    FastHeads is kept unchanged so earlier checkpoints remain loadable.
+    """
+
+    def __init__(self, input_dim, width=96, mode="signed_root"):
+        super().__init__(input_dim, width)
+        if mode not in ("signed_root", "direct"):
+            raise ValueError("mode must be 'signed_root' or 'direct'")
+        self.mode = mode
+        # Start on the active side of ReLU, while allowing fitted boundary zeros.
+        nn.init.constant_(self.estimator.bias, 1.0)
+
+    def forward_targets(self, z, nu):
+        """Return the estimator and the quantity used as a regression target."""
+        h = self.trunk((z - self.z_mean) / self.z_std)
+        nu_hat = F.relu(self.estimator(h).squeeze(-1)) * self.nu_scale
+        if nu.ndim == 1:
+            context = torch.cat([h, (nu / self.nu_scale)[:, None]], dim=-1)
+        else:
+            h = h[:, None, :].expand(-1, nu.shape[1], -1)
+            context = torch.cat([h, (nu / self.nu_scale)[..., None]], dim=-1)
+        raw = self.statistic(context).squeeze(-1)
+        target = raw if self.mode == "signed_root" else F.softplus(raw)
+        return nu_hat, target
+
+    def forward(self, z, nu):
+        nu_hat, target = self.forward_targets(z, nu)
+        t = target.square() if self.mode == "signed_root" else target
+        return nu_hat, t
+
+
 def train_heads(model, train, val, epochs=80, batch_size=256, lr=1e-3,
                 patience=10, seed=13, device="cpu"):
     """Data keys: z:(B,d), nu_hat:(B,), nu:(B,Q), t:(B,Q).
@@ -378,6 +434,104 @@ def train_heads(model, train, val, epochs=80, batch_size=256, lr=1e-3,
 
     return _supervised_train(model, train, val, loss_fn, epochs, batch_size,
                              lr, patience, seed, device)
+
+
+def train_refined_heads(model, train, val, epochs=400, batch_size=256,
+                        lr=1e-3, patience=70, lr_patience=20, seed=13,
+                        device="cpu", lr_factor=0.3, min_lr=1e-5):
+    """Train refined heads on cached experiments and restore the best weights.
+
+    Required keys are z, nu_hat, nu, t; other cache metadata is ignored.
+    Splits are by complete experiment, and scalers use training data only.
+    The loss adds scaled estimator MSE to signed-root MSE, or to smooth-L1
+    loss on direct T (beta=1). The latter reduces the influence of large T
+    errors without imposing a particular likelihood shape. Plateau learning
+    rate reductions and early stopping use the total validation loss.
+    """
+    torch.manual_seed(seed)
+    keys = ("z", "nu_hat", "nu", "t")
+    train, val = ({key: data[key] for key in keys} for data in (train, val))
+    model.to(device)
+    model.fit_scaler(train["z"], train["nu_hat"])
+    train, val = _tensor_dict(train), _tensor_dict(val)
+    n_train, n_val = len(train["z"]), len(val["z"])
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, factor=lr_factor, patience=lr_patience, min_lr=min_lr,
+    )
+    generator = torch.Generator().manual_seed(seed)
+
+    def losses(batch):
+        nu = batch["nu"].float()
+        truth_hat, truth_t = batch["nu_hat"].float(), batch["t"].float()
+        nu_hat, prediction = model.forward_targets(batch["z"].float(), nu)
+        estimator = F.mse_loss(nu_hat / model.nu_scale, truth_hat / model.nu_scale)
+        if model.mode == "signed_root":
+            center = truth_hat if nu.ndim == 1 else truth_hat[:, None]
+            target = torch.sign(nu - center) * torch.sqrt(truth_t)
+            statistic = F.mse_loss(prediction, target)
+        else:
+            statistic = F.smooth_l1_loss(prediction, truth_t)
+        return estimator + statistic, estimator, statistic
+
+    def validation_losses():
+        model.eval()
+        totals = np.zeros(3)
+        with torch.no_grad():
+            for start in range(0, n_val, batch_size):
+                batch = {key: value[start:start + batch_size].to(device)
+                         for key, value in val.items()}
+                totals += np.array([float(value) for value in losses(batch)]) * len(batch["z"])
+        return totals / n_val
+
+    def history_row(epoch, train_loss, val_loss, learning_rate):
+        return {
+            "epoch": epoch,
+            "train": None if train_loss is None else float(train_loss[0]),
+            "val": float(val_loss[0]),
+            "train_estimator": None if train_loss is None else float(train_loss[1]),
+            "train_statistic": None if train_loss is None else float(train_loss[2]),
+            "val_estimator": float(val_loss[1]),
+            "val_statistic": float(val_loss[2]),
+            "lr": float(learning_rate),
+        }
+
+    val_loss = validation_losses()
+    best_loss, best_state = float(val_loss[0]), deepcopy(model.state_dict())
+    history = [history_row(0, None, val_loss, lr)]
+    scheduler.step(best_loss)
+    bad_epochs = 0
+    for epoch in range(1, epochs + 1):
+        model.train()
+        order = torch.randperm(n_train, generator=generator)
+        totals = np.zeros(3)
+        learning_rate = optimizer.param_groups[0]["lr"]
+        for start in range(0, n_train, batch_size):
+            index = order[start:start + batch_size]
+            batch = {key: value[index].to(device) for key, value in train.items()}
+            optimizer.zero_grad(set_to_none=True)
+            batch_losses = losses(batch)
+            batch_losses[0].backward()
+            optimizer.step()
+            totals += np.array([float(value.detach()) for value in batch_losses]) * len(index)
+        train_loss = totals / n_train
+        val_loss = validation_losses()
+        history.append(history_row(epoch, train_loss, val_loss, learning_rate))
+        scheduler.step(float(val_loss[0]))
+        if val_loss[0] < best_loss:
+            best_loss, best_state = float(val_loss[0]), deepcopy(model.state_dict())
+            bad_epochs = 0
+        else:
+            bad_epochs += 1
+        if epoch == 1 or epoch % 20 == 0:
+            print(f"{model.mode} epoch {epoch:3d}: val={val_loss[0]:.5g}, "
+                  f"estimator={val_loss[1]:.5g}, statistic={val_loss[2]:.5g}, "
+                  f"lr={learning_rate:.2g}")
+        if bad_epochs >= patience:
+            break
+    model.load_state_dict(best_state)
+    model.eval()
+    return history
 
 
 @torch.no_grad()

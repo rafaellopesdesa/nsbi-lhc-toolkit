@@ -127,3 +127,11 @@ browser.
   Results and checkpoints are stored in `saved_exercise13_extendedPAIRS/`.
   This scalar, no-nuisance prototype stops before distribution-flow training
   and coverage calibration, which belong in a subsequent notebook.
+  The refined-head revision compares signed-root and direct-statistic targets,
+  uses longer training with learning-rate reduction, and adds an exact
+  reference pair-posterior benchmark plus normalization and encoding-precision
+  diagnostics. Neither head assumes a quadratic likelihood. By default it
+  reuses the completed `5f97501b6b87` run when present and writes new heads and
+  reports under that run's `refinements/` directory. Set `REUSE_RUN = None`
+  when deliberately changing the physical model or representation; head-only
+  settings can change without regenerating the banks and experiments.
