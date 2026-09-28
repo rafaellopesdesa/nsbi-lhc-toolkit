@@ -39,6 +39,7 @@ browser.
 | Exercise 9c — Modest-flow hybrid SBIBM campaign: multiclass vs binary corrections | [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/rafaellopesdesa/nsbi-lhc-toolkit/blob/ml4hep_school_tutorial/workshops/ml4hep_tifr_colab/Exercise_9c_SBIBM_hybrid.ipynb) |
 | Exercise 10 — `sbibm` hybrid benchmark | [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/rafaellopesdesa/nsbi-lhc-toolkit/blob/ml4hep_school_tutorial/workshops/ml4hep_tifr_colab/Exercise_10_SBIBM_Hybrid_Benchmark.ipynb) |
 | Exercise 11 — Hybrid Neyman construction | [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/rafaellopesdesa/nsbi-lhc-toolkit/blob/ml4hep_school_tutorial/workshops/ml4hep_tifr_colab/Exercise_11_Hybrid_Neyman_Construction.ipynb) |
+| Exercise 13 — Extended PAIRS: unbinned representations and fast inference | [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/rafaellopesdesa/nsbi-lhc-toolkit/blob/ml4hep_school_tutorial/workshops/ml4hep_tifr_colab/Exercise_13_extendedPAIRS.ipynb) |
 
 ## Notes for running on Colab
 
@@ -114,3 +115,15 @@ browser.
   100,000-toy audit; set `FAST_MODE = True` for a structural first pass. Run
   Exercise 5 through its hybrid-density validation first and keep
   `USE_DRIVE = True` so all required checkpoints and arrays persist.
+- Exercise 13 starts from Exercise 7's controlled signal-shape deformation.
+  It trains a PAIRS-style encoder on singletons/pairs, freezes and caches
+  unbinned event embeddings, learns the population response without fitted
+  response labels, and trains common estimator/statistic heads for reference
+  and simulator experiments. It compares these with direct unbinned fits,
+  independent-bank population roots, and a count-only baseline. Run Exercise 5
+  and Exercise 7 first and keep `USE_DRIVE = True`; no existing model is
+  retrained. `DEFORMATION_MIXTURE` is the shared mismatch control. The default
+  `full` mode retains nominal yields; `quick` reduces banks and training sizes.
+  Results and checkpoints are stored in `saved_exercise13_extendedPAIRS/`.
+  This scalar, no-nuisance prototype stops before distribution-flow training
+  and coverage calibration, which belong in a subsequent notebook.
