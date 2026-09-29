@@ -147,14 +147,23 @@ browser.
   banks. New reports and diagnostic checkpoints live under
   `refinements/<id>/diagnostics/<id>/`; these are development checks, not a
   calibrated coverage measurement or a fresh independent-bank audit.
-  A further controlled study defaults to 3,000 training experiments per source:
-  it preserves the original 1,500 and caches additional toy blocks from the
-  same training banks, then fits the same signed-root head with both seeds.
-  `TRAINING_TARGET_PER_SOURCE=6000` extends the study while reusing existing
-  blocks and candidate checkpoints; `RUN_TRAINING_EXTENSION=False` skips it.
-  Validation experiments, the encoder, response, likelihood, and original
-  inference heads stay fixed. Candidate fits and reports are saved separately
-  beneath the data run's `training_extensions/` directory.
+  The working baseline now uses 12,000 training experiments per source
+  (24,000 total), preserving the original 1,500 and reusing cached toy blocks
+  and both-seed fits at 1,500, 3,000, 6,000, and 12,000 per source.
+  `TRAINING_TARGET_PER_SOURCE` controls both the final study size and the
+  selected signed-root baseline; `BASELINE_SEED` fixes the inference seed
+  (13019 by default), without selecting it by audit performance.
+  The study runs before the detailed diagnostics, so plots, boundary checks,
+  scan minima, interval endpoints, timing, and `infer_experiment` use the
+  selected larger head. Original models remain comparison entries; the
+  count-only comparison retains matched original sample sizes.
+  Validation experiments, encoder, response, likelihood, and existing
+  checkpoints stay fixed. The dense-scan teacher cache is reused, while
+  learned predictions are recomputed and saved under
+  `refinements/<id>/diagnostics/<id>/selected_baselines/<id>/`.
+  The manifest records the selected checkpoint, count, seed, and file hash.
+  Training-size fits and reports remain under `training_extensions/`.
+  `RUN_TRAINING_EXTENSION=False` explicitly returns to the original head.
   Simulator population-root diagnostics now estimate Monte Carlo errors from
   cached event scores, with a separate score check for boundary fits. These
   errors condition on the frozen model and normalization; they distinguish
