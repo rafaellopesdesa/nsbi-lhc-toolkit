@@ -135,3 +135,15 @@ browser.
   reports under that run's `refinements/` directory. Set `REUSE_RUN = None`
   when deliberately changing the physical model or representation; head-only
   settings can change without regenerating the banks and experiments.
+  The diagnostic extension checks paired boundary decisions, residuals versus
+  physical and fitted parameters, estimator/scan-minimum agreement, and all
+  connected threshold intervals (including scan-edge truncation). It also
+  reports covariance-aware relative-normalization errors and validation-bank
+  population roots. A cached learning curve fits signed-root heads at 375, 750,
+  and 1,500 training experiments per source with two seeds and a fixed
+  validation set; set `RUN_LEARNING_CURVE=False` to skip these six head fits.
+  Existing banks, encoder, response, and main heads are reused unchanged.
+  The full scan check draws 100 additional experiments from the existing audit
+  banks. New reports and diagnostic checkpoints live under
+  `refinements/<id>/diagnostics/<id>/`; these are development checks, not a
+  calibrated coverage measurement or a fresh independent-bank audit.
