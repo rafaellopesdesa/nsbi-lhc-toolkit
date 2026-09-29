@@ -1,0 +1,17 @@
+numpy
+pandas
+scipy
+matplotlib
+seaborn
+scikit-learn
+pyarrow
+torch
+pytorch-lightning
+onnx
+onnxruntime-gpu; sys_platform == "linux"
+onnxruntime; sys_platform != "linux"
+onnxscript
+iminuit
+mplhep
+nflows
+nbformat
