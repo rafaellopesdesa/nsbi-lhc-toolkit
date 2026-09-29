@@ -147,3 +147,15 @@ browser.
   banks. New reports and diagnostic checkpoints live under
   `refinements/<id>/diagnostics/<id>/`; these are development checks, not a
   calibrated coverage measurement or a fresh independent-bank audit.
+  A further controlled study defaults to 3,000 training experiments per source:
+  it preserves the original 1,500 and caches additional toy blocks from the
+  same training banks, then fits the same signed-root head with both seeds.
+  `TRAINING_TARGET_PER_SOURCE=6000` extends the study while reusing existing
+  blocks and candidate checkpoints; `RUN_TRAINING_EXTENSION=False` skips it.
+  Validation experiments, the encoder, response, likelihood, and original
+  inference heads stay fixed. Candidate fits and reports are saved separately
+  beneath the data run's `training_extensions/` directory.
+  Simulator population-root diagnostics now estimate Monte Carlo errors from
+  cached event scores, with a separate score check for boundary fits. These
+  errors condition on the frozen model and normalization; they distinguish
+  event-bank integration precision from the head-training toy budget.
