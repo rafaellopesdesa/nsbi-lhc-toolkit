@@ -1,24 +1,37 @@
-"""The small, fully unbinned likelihood shared by the calibration notebooks.
+"""The normalized, fully unbinned likelihood shared by the notebooks.
 
-Anchor axis order is [down, nominal, up], and process order is [signal,
-background].  Each anchor is a normalized process/reference density ratio.
-The nuisance changes shape only; the expected process yields stay fixed.
+Anchor order is [down, nominal, up], process order [signal, background].
+Inputs always contain the GOOD process/reference ratios. The configured
+bad-signal mixture is applied after normalized nuisance interpolation.
 """
 
 import json
 from pathlib import Path
 
 import numpy as np
-from scipy.optimize import minimize, minimize_scalar
+from scipy.optimize import minimize
+
+try:  # Notebooks import helpers directly; tests may import the package.
+    from .interpolation import (
+        derivative_polynomial, evaluate_polynomial, normalization_coefficients,
+        numpy_coefficients, numpy_raw_derivative, numpy_raw_morph,
+    )
+except ImportError:
+    from interpolation import (
+        derivative_polynomial, evaluate_polynomial, normalization_coefficients,
+        numpy_coefficients, numpy_raw_derivative, numpy_raw_morph,
+    )
 
 FEATURES = [f"x{i}" for i in range(1, 6)]
 DEFAULT_CONFIG = {
     "signal_yield": 100.0,
-    "background_yield": 10000.0,
+    "background_yield": 1000.0,
     "nu_bounds": [0.0, 3.0],
     "alpha_bounds": [-1.0, 1.0],
     "mu_range": [0.0, 2.0],
     "epsilon": 0.05,
+    "model_epsilon": 0.0,
+    "interpolation_version": "normalized_exp_poly_c2_positive_v1",
     "seed": 13001,
 }
 
@@ -34,122 +47,184 @@ def load_config(run):
     return json.loads((Path(run) / "config.json").read_text())
 
 
-def morph(anchors, alpha):
-    """Piecewise-linear interpolation, defined for -1 <= alpha <= 1."""
-    anchors = np.asarray(anchors)
-    return (
-        (1.0 - abs(alpha)) * anchors[..., 1]
-        + max(alpha, 0.0) * anchors[..., 2]
-        + max(-alpha, 0.0) * anchors[..., 0]
-    )
+def with_model_epsilon(config, epsilon):
+    """Return a config for the deliberate normalized signal/background mix."""
+    epsilon = float(epsilon)
+    if not 0 <= epsilon <= 1:
+        raise ValueError('model_epsilon must lie in [0,1].')
+    return {**config, 'model_epsilon': epsilon}
 
 
-def bad_anchors(anchors, epsilon):
-    """Replace signal by (1-epsilon)*signal + epsilon*background."""
-    mixed = np.array(anchors, copy=True)
-    mixed[..., 0, :] = (
-        (1.0 - epsilon) * anchors[..., 0, :]
-        + epsilon * anchors[..., 1, :]
-    )
+def _mix_processes(values, config):
+    epsilon = float(config.get('model_epsilon', 0.0))
+    if not 0 <= epsilon <= 1:
+        raise ValueError('model_epsilon must lie in [0,1].')
+    mixed = np.array(values, copy=True)
+    mixed[..., 0] = (1-epsilon)*values[..., 0] + epsilon*values[..., 1]
     return mixed
 
 
-def intensity(anchors, nu, alpha, config):
-    """Extended-model intensity divided by the common reference density."""
-    ratios = morph(anchors, alpha)
-    return (
-        nu * config["signal_yield"] * ratios[..., 0]
-        + config["background_yield"] * ratios[..., 1]
-    )
+def morph(anchors, alpha, config=None, coefficients=None):
+    """Smooth process morph, normalized using the fixed reference bank.
 
-
-def nll(anchors, nu, alpha, auxiliary, config, weights=None):
-    """Negative log likelihood, omitting parameter-independent terms.
-
-    `weights=None` means an ordinary unbinned experiment.  Asimov weights
-    represent expected event counts, so only the event sum is weighted.
-    The Gaussian auxiliary constraint is included exactly once.
+    Supplying config requires its explicit ``morph_normalization`` table.
+    ``config=None`` returns the raw interpolation for normalization diagnostics.
+    Passing precomputed coefficients avoids repeated positivity certification.
     """
+    if config is not None and np.any(np.abs(np.asarray(alpha)) > 1):
+        raise ValueError('The cached normalized model is defined on alpha in [-1,1].')
+    values = numpy_raw_morph(anchors, alpha, coefficients=coefficients)
+    if config is None:
+        return values
+    denominator = evaluate_polynomial(normalization_coefficients(config), alpha)
+    if np.any(denominator <= 0):
+        raise FloatingPointError('Nonpositive exp-poly normalization.')
+    return _mix_processes(values / denominator, config)
+
+
+def morph_derivative(anchors, alpha, config=None, coefficients=None):
+    """Nuisance derivative including the derivative of normalization."""
+    coefficients = numpy_coefficients(anchors) if coefficients is None else coefficients
+    derivative = numpy_raw_derivative(anchors, alpha, coefficients)
+    if config is None:
+        return derivative
+    raw = numpy_raw_morph(anchors, alpha, coefficients)
+    normalization = normalization_coefficients(config)
+    denominator = evaluate_polynomial(normalization, alpha)
+    denominator_derivative = derivative_polynomial(normalization, alpha)
+    values = derivative / denominator - raw * denominator_derivative / denominator**2
+    return _mix_processes(values, config)
+
+
+def bad_anchors(anchors, epsilon):
+    """Anchor-only diagnostic mixture; do not pass it to the likelihood.
+
+    The exp-poly interpolation does not commute with process mixing. For fits
+    and toys, retain good anchors and use ``with_model_epsilon`` instead.
+    """
+    mixed = np.array(anchors, copy=True)
+    mixed[..., 0, :] = ((1.0-epsilon)*anchors[..., 0, :] + epsilon*anchors[..., 1, :])
+    return mixed
+
+
+def intensity(anchors, nu, alpha, config, coefficients=None):
+    """Extended intensity divided by the common reference density."""
+    ratios = morph(anchors, alpha, config, coefficients=coefficients)
+    return (nu * config['signal_yield'] * ratios[..., 0]
+            + config['background_yield'] * ratios[..., 1])
+
+
+def nll(anchors, nu, alpha, auxiliary, config, weights=None, coefficients=None):
+    """Extended NLL, omitting parameter-independent event-density terms."""
     anchors = np.asarray(anchors, dtype=np.float64)
-    event_log = np.log(intensity(anchors, nu, alpha, config))
+    density = intensity(anchors, nu, alpha, config, coefficients)
+    if np.any(density <= 0) or not np.all(np.isfinite(density)):
+        raise FloatingPointError('The normalized likelihood has a nonpositive/nonfinite intensity.')
+    event_log = np.log(density)
     event_sum = event_log.sum() if weights is None else np.dot(weights, event_log)
-    expected = nu * config["signal_yield"] + config["background_yield"]
-    return float(expected - event_sum + 0.5 * (auxiliary - alpha) ** 2)
+    expected = nu*config['signal_yield'] + config['background_yield']
+    return float(expected - event_sum + .5*(auxiliary-alpha)**2)
 
 
-def asimov_weights(anchors, mu, alpha, config):
+def asimov_weights(anchors, mu, alpha, config, coefficients=None):
     """Reference-sampled quadrature weights for the expected event sum."""
-    return intensity(anchors, mu, alpha, config) / len(anchors)
+    return intensity(anchors, mu, alpha, config, coefficients) / len(anchors)
 
 
-def fit(anchors, auxiliary, config, weights=None, fixed_nu=None):
-    """Direct numerical fit, checking both nuisance branches and their join.
+def _projected_gradient(parameters, gradient, bounds):
+    gradient = np.asarray(gradient, dtype=float).copy()
+    for i, (value, (low, high)) in enumerate(zip(parameters, bounds)):
+        tolerance = 1e-8 * max(1., abs(low), abs(high))
+        if value <= low+tolerance and gradient[i] > 0:
+            gradient[i] = 0.
+        if value >= high-tolerance and gradient[i] < 0:
+            gradient[i] = 0.
+    return gradient
 
-    The interpolation has a kink at alpha=0.  Optimize the two smooth
-    branches separately, and explicitly include alpha=0 and the endpoints.
-    For a global fit, three POI starting points reduce sensitivity to local
-    optima.  This is the numerical validation reference, not a fit-label
-    generator for training the amortized networks.
+
+def fit(anchors, auxiliary, config, weights=None, fixed_nu=None, coefficients=None):
+    """Numerical validation fit of the smooth, normalized likelihood.
+
+    Multiple starts and explicit faces of the parameter box protect against
+    local optima. The optimized objective uses event log-density ratios to a
+    fixed baseline; it never subtracts two large full-event NLLs. Success is
+    checked using the projected gradient at the returned solution, including
+    boundary solutions, rather than trusting an optimizer termination flag.
+    Coefficients are certified once per experiment, outside the optimizer.
     """
     anchors = np.asarray(anchors, dtype=np.float64)
-    event_weights = np.ones(len(anchors)) if weights is None else np.asarray(weights)
-    signal_yield, background_yield = config["signal_yield"], config["background_yield"]
-    nu_low, nu_high = config["nu_bounds"]
-    alpha_low, alpha_high = config["alpha_bounds"]
-    nu_start = 0.5 * (nu_low + nu_high) if fixed_nu is None else float(fixed_nu)
-    # A parameter-independent shift makes the optimizer's stopping tolerance
-    # meaningful even when the full event sum is very large.
-    offset = nll(anchors, nu_start, 0.0, auxiliary, config, weights)
+    coefficients = numpy_coefficients(anchors) if coefficients is None else coefficients
+    event_weights = np.ones(len(anchors)) if weights is None else np.asarray(weights, dtype=np.float64)
+    signal_yield, background_yield = config['signal_yield'], config['background_yield']
+    nu_bounds, alpha_bounds = tuple(config['nu_bounds']), tuple(config['alpha_bounds'])
+    if alpha_bounds[0] < -1 or alpha_bounds[1] > 1:
+        raise ValueError('The normalized exp-poly coefficient cache supports [-1,1].')
+    if fixed_nu is not None and not nu_bounds[0] <= fixed_nu <= nu_bounds[1]:
+        raise ValueError('fixed_nu lies outside nu_bounds.')
+    nu_reference = float(np.clip(1., *nu_bounds))
+    alpha_reference = float(np.clip(0., *alpha_bounds))
+    baseline = intensity(anchors, nu_reference, alpha_reference, config, coefficients)
+    offset = nll(anchors, nu_reference, alpha_reference, auxiliary, config, weights, coefficients)
     candidates = []
 
-    def objective(nu, alpha, slope):
-        ratios = morph(anchors, alpha)
-        density = nu * signal_yield * ratios[:, 0] + background_yield * ratios[:, 1]
-        value = (nu * signal_yield + background_yield
-                 - np.dot(event_weights, np.log(density))
-                 + 0.5 * (auxiliary - alpha) ** 2 - offset)
+    def objective(nu, alpha):
+        ratios = morph(anchors, alpha, config, coefficients)
+        slopes = morph_derivative(anchors, alpha, config, coefficients)
+        density = nu*signal_yield*ratios[:, 0] + background_yield*ratios[:, 1]
+        if np.any(density <= 0) or not np.all(np.isfinite(density)):
+            return np.inf, np.array([np.nan, np.nan])
+        value = ((nu-nu_reference)*signal_yield
+                 - np.dot(event_weights, np.log(density / baseline))
+                 + .5*((auxiliary-alpha)**2-(auxiliary-alpha_reference)**2))
         weighted_inverse = event_weights / density
-        grad_nu = signal_yield - np.dot(weighted_inverse, signal_yield * ratios[:, 0])
-        grad_alpha = alpha - auxiliary - np.dot(
-            weighted_inverse, nu * signal_yield * slope[:, 0] + background_yield * slope[:, 1]
-        )
-        return value, np.array([grad_nu, grad_alpha])
+        gradient = np.array([
+            signal_yield - np.dot(weighted_inverse, signal_yield*ratios[:, 0]),
+            alpha-auxiliary - np.dot(weighted_inverse, nu*signal_yield*slopes[:, 0]+background_yield*slopes[:, 1]),
+        ])
+        return float(value), gradient
 
-    for bounds, anchor_index, sign in [((alpha_low, 0.0), 0, -1.0), ((0.0, alpha_high), 2, 1.0)]:
-        slope = sign * (anchors[:, :, anchor_index] - anchors[:, :, 1])
-        if fixed_nu is None:
-            def branch_objective(parameters):
-                return objective(parameters[0], parameters[1], slope)
+    options = {'ftol': 1e-14, 'gtol': 1e-7, 'maxiter': 500, 'maxls': 40}
 
-            for start in np.linspace(nu_low, nu_high, 3):
-                result = minimize(
-                    branch_objective, [start, np.mean(bounds)], jac=True,
-                    method="L-BFGS-B", bounds=[(nu_low, nu_high), bounds],
-                    options={"ftol": 1e-12, "gtol": 1e-7, "maxiter": 200},
-                )
-                candidates.append((result.fun + offset, *result.x, bool(result.success)))
-        else:
-            def branch_objective(parameters):
-                value, gradient = objective(fixed_nu, parameters[0], slope)
-                return value, gradient[1:]
+    def optimize(start, free_indices, fixed):
+        bounds = [nu_bounds, alpha_bounds]
+        def free_objective(parameters):
+            full = np.array(fixed, dtype=float)
+            full[free_indices] = parameters
+            value, gradient = objective(*full)
+            return value, gradient[free_indices]
+        result = minimize(free_objective, start, jac=True, method='L-BFGS-B',
+                          bounds=[bounds[i] for i in free_indices], options=options)
+        point = np.array(fixed, dtype=float)
+        point[free_indices] = result.x
+        value, gradient = objective(*point)
+        candidates.append((value, point, gradient, bool(result.success), str(result.message)))
 
-            result = minimize(
-                branch_objective, [np.mean(bounds)], jac=True,
-                method="L-BFGS-B", bounds=[bounds],
-                options={"ftol": 1e-12, "gtol": 1e-7, "maxiter": 200},
-            )
-            candidates.append((result.fun + offset, fixed_nu, result.x[0], bool(result.success)))
-
-    # Include the nondifferentiable join and both outer nuisance boundaries.
-    for alpha in [alpha_low, 0.0, alpha_high]:
-        if fixed_nu is None:
-            result = minimize_scalar(
-                lambda nu: nll(anchors, nu, alpha, auxiliary, config, weights) - offset,
-                bounds=(nu_low, nu_high), method="bounded", options={"xatol": 1e-10},
-            )
-            for nu in [nu_low, result.x, nu_high]:
-                candidates.append((nll(anchors, nu, alpha, auxiliary, config, weights), nu, alpha, True))
-        else:
-            candidates.append((nll(anchors, fixed_nu, alpha, auxiliary, config, weights), fixed_nu, alpha, True))
-    value, nu, alpha, success = min(candidates, key=lambda candidate: candidate[0])
-    return {"nu": float(nu), "alpha": float(alpha), "nll": float(value), "success": success}
+    alpha_starts = np.linspace(*alpha_bounds, 5)
+    if fixed_nu is None:
+        for nu in np.linspace(*nu_bounds, 3):
+            for alpha in alpha_starts[::2]:
+                optimize([nu, alpha], [0, 1], [nu, alpha])
+        # Optimize every face as well as the two-dimensional interior.
+        for nu in nu_bounds:
+            for alpha in alpha_starts[::2]:
+                optimize([alpha], [1], [nu, alpha])
+        for alpha in alpha_bounds:
+            optimize([nu_reference], [0], [nu_reference, alpha])
+        free = [0, 1]
+        fit_bounds = [nu_bounds, alpha_bounds]
+    else:
+        for alpha in alpha_starts:
+            optimize([alpha], [1], [fixed_nu, alpha])
+        for alpha in alpha_bounds:
+            value, gradient = objective(fixed_nu, alpha)
+            candidates.append((value, np.array([fixed_nu, alpha]), gradient, True, 'Explicit nuisance boundary'))
+        free = [1]
+        fit_bounds = [alpha_bounds]
+    value, point, gradient, optimizer_success, message = min(candidates, key=lambda item: item[0])
+    projected = _projected_gradient(point[free], gradient[free], fit_bounds)
+    gradient_norm = float(np.max(np.abs(projected)))
+    success = bool(np.isfinite(value) and gradient_norm <= 1e-4)
+    return {'nu': float(point[0]), 'alpha': float(point[1]), 'nll': float(value+offset),
+            'centered_nll': float(value), 'success': success,
+            'projected_gradient_norm': gradient_norm, 'optimizer_success': optimizer_success,
+            'message': message, 'n_starts': len(candidates)}

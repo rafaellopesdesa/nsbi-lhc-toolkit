@@ -212,7 +212,7 @@ def flow_identity(run, config):
     paths = [run / "inference" / name for name in
              ("networks.pt", "metadata.json", "run_spec.json")]
     paths += [run / "hybrid" / name for name in
-              ("reference.pt", "anchor_normalization.npy", "manifest.json")]
+              ("reference.pt", "anchor_normalization.npy", "morph_normalization.npy", "manifest.json")]
     paths += [path for path in (run / "hybrid" / "ratios").rglob("*")
               if path.suffix in (".onnx", ".data", ".bin") or path.name == "ensemble.json"]
     for path in sorted(path for path in paths if path.is_file()):
@@ -220,7 +220,7 @@ def flow_identity(run, config):
         with path.open("rb") as source:
             for block in iter(lambda: source.read(1024 * 1024), b""):
                 digest.update(block)
-    for name in ("inference.py", "model.py", "utils.py", "sampling.py", "statistic_flows.py"):
+    for name in ("inference.py", "model.py", "interpolation.py", "utils.py", "sampling.py", "statistic_flows.py"):
         digest.update(Path(__file__).with_name(name).read_bytes())
     return digest.hexdigest()
 
@@ -234,7 +234,6 @@ def generate_statistics(inference, hybrid, config, mu, *, source,
     uses the physical model at (mu, 0). Both evaluate at nu=g(mu) and use
     uniform auxiliary observations. The signed NN gap is retained unchanged.
     """
-    from model import bad_anchors
     from sampling import sample_experiment
     mu = np.asarray(mu, float)
     metadata = json.dumps(dict(source=source, seed=seed, epsilon=epsilon,
@@ -259,7 +258,9 @@ def generate_statistics(inference, hybrid, config, mu, *, source,
             proposal_ess.append(np.nan)
         else:
             raise ValueError("source must be 'reference' or 'simulator'")
-        anchors = bad_anchors(good_anchors, epsilon)
+        # The frozen likelihood mixes normalized process densities after the
+        # nuisance morph; the six encoder features remain the GOOD anchors.
+        anchors = good_anchors
         result = inference.evaluate(anchors, toy["auxiliary"], float(nu))
         raw.append(float(np.asarray(result["statistic"])))
         auxiliary.append(toy["auxiliary"])

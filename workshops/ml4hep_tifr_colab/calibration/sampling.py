@@ -31,18 +31,19 @@ def _sample_latent(components, n, rng):
 
 
 def sample_process(process, n, rng, alpha=0.0):
-    """Sample the normalized, piecewise-linear physical process density.
+    """Draw fresh events with the continuous physical detector scale.
 
-    Alpha lies in [-1, 1]. Draw the nominal detector response with probability
-    1-|alpha|, and its signed anchor with probability |alpha|. This is density
-    interpolation, not a continuously shifted detector response.
+    The response is scale*(1+0.1*alpha), with independent detector resolution.
+    Nominal and +/-1 anchors are unchanged. At intermediate nuisance values
+    this exact Gaussian-mixture simulator need not coincide with the fitted
+    exp-poly interpolation; that interpolation approximation is diagnosed
+    separately from learned-density error and intentional epsilon mixing.
     """
     if not -1.0 <= alpha <= 1.0:
-        raise ValueError("The linear density model is defined on alpha in [-1, 1].")
+        raise ValueError("The detector-scale model is defined on alpha in [-1, 1].")
     z = _sample_latent(_components(process), int(n), rng)
     scale, resolution = smearing_parameters()
-    anchor = np.sign(alpha) * (rng.random(int(n)) < abs(alpha))
-    x = z * scale[None, :] * (1.0 + 0.1 * anchor[:, None])
+    x = z * scale[None, :] * (1.0 + 0.1 * float(alpha))
     x += rng.normal(size=x.shape) * resolution[None, :]
     return x
 
@@ -69,27 +70,23 @@ def sample_experiment(mu, alpha, config, rng):
 
 
 def process_density(x, process, alpha=0.0):
-    """Analytic reco density, available only because this example is simple."""
+    """Exact density of the continuously scaled physical Gaussian mixture."""
     from scipy.stats import multivariate_normal
 
     if not -1.0 <= alpha <= 1.0:
-        raise ValueError("The linear density model is defined on alpha in [-1, 1].")
+        raise ValueError("The detector-scale model is defined on alpha in [-1, 1].")
     scale, resolution = smearing_parameters()
+    response = scale * (1.0 + 0.1 * float(alpha))
     density = np.zeros(len(x))
-    anchors = [(0.0, 1.0 - abs(alpha)), (np.sign(alpha), abs(alpha))]
     components = _components(process)
     total_fraction = sum(component[0] for component in components)
-    for anchor, anchor_fraction in anchors:
-        if anchor_fraction == 0.0:
-            continue
-        response = scale * (1.0 + 0.1 * anchor)
-        for fraction, mean, covariance in components:
-            reco_covariance = covariance * np.outer(response, response)
-            reco_covariance += np.diag(resolution ** 2)
-            density += (
-                anchor_fraction * fraction / total_fraction
-                * multivariate_normal.pdf(x, mean=mean * response, cov=reco_covariance)
-            )
+    for fraction, mean, covariance in components:
+        reco_covariance = covariance * np.outer(response, response)
+        reco_covariance += np.diag(resolution ** 2)
+        density += (
+            fraction / total_fraction
+            * multivariate_normal.pdf(x, mean=mean * response, cov=reco_covariance)
+        )
     return density
 
 

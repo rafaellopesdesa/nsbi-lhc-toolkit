@@ -1,8 +1,8 @@
 """Fresh hNDE helpers for the calibration notebooks.
 
 NSBI trains binary classifiers with a logit output. Equal class weights imply
-ratio = exp(logit). Six complete process/reference anchors are normalized once
-on an independent reference integration sample, then linearly interpolated.
+ratio = exp(logit). Complete process/reference anchors and the exp-poly shape
+interpolation are normalized on one independent reference integration sample.
 """
 from pathlib import Path
 from contextlib import contextmanager
@@ -13,8 +13,8 @@ import os
 import numpy as np
 import pandas as pd
 
-from model import FEATURES, bad_anchors, intensity
-from flow_reference import ReferenceFlow
+from model import FEATURES
+from interpolation import numpy_coefficients
 
 RATIO_DEFAULTS = dict(hidden_layers=4, neurons=1024, number_of_epochs=50,
                       batch_size=4096, learning_rate=1e-3, scalerType='MinMax',
@@ -119,20 +119,37 @@ class RatioEnsemble:
 
 
 class HybridModel:
-    def __init__(self, run, flow, ratios, normalization=None, model_id=None):
+    def __init__(self, run, flow, ratios, normalization=None, model_id=None,
+                 morph_normalization=None, morph_diagnostics=None):
         self.run, self.flow, self.ratios = Path(run), flow, ratios
         self.normalization = normalization
+        self.morph_normalization = morph_normalization
+        self.morph_diagnostics = morph_diagnostics or {}
         self.model_id = model_id
         self._integration_sampler = None
 
     @classmethod
     def load(cls, run, device='cpu'):
+        from flow_reference import ReferenceFlow
         root = Path(run) / 'hybrid'
         manifest = json.loads((root / 'manifest.json').read_text())
+        if not (root / 'morph_normalization.npy').exists():
+            raise RuntimeError('This cache predates normalized exp-poly interpolation; '
+                               'rerun notebook 02 with the new TAG.')
         return cls(run, ReferenceFlow.load(root / 'reference.pt', device),
                    {name: RatioEnsemble.load(root / 'ratios' / name, device=device)
                     for name in RATIO_NAMES},
-                   np.load(root / 'anchor_normalization.npy'), manifest['model_id'])
+                   np.load(root / 'anchor_normalization.npy'), manifest['model_id'],
+                   np.load(root / 'morph_normalization.npy'),
+                   manifest.get('morph_diagnostics', {}))
+
+    def configure(self, config):
+        """Attach this frozen model's normalization to a GOOD-model config."""
+        if self.morph_normalization is None:
+            raise RuntimeError('Save/normalize the hybrid before configuring its likelihood.')
+        return dict(config, morph_normalization=self.morph_normalization.tolist(),
+                    interpolation_version='normalized_exp_poly_c2_positive_v1',
+                    model_epsilon=0.0)
 
     def raw_anchors(self, x):
         output = np.empty((len(x), 2, 3), dtype=np.float64)
@@ -182,7 +199,12 @@ class HybridModel:
 
 
 def save_hybrid(hybrid, n_reference=5_000_000, seed=13031, batch_size=100_000):
-    """Normalize complete anchors; store the independent integration sample."""
+    """Store anchors and the nuisance-dependent process normalization.
+
+    Averaging the polynomial coefficients computes Z_s(alpha) on precisely the
+    same integration sample as the anchor normalization. Both likelihoods and
+    reference toys use these coefficients; their derivative is inexpensive.
+    """
     root = hybrid.run / 'hybrid'
     root.mkdir(parents=True, exist_ok=True)
     x = hybrid.sample_reference(n_reference, seed)
@@ -196,15 +218,47 @@ def save_hybrid(hybrid, n_reference=5_000_000, seed=13031, batch_size=100_000):
     for start in range(0, n_reference, batch_size):
         anchors[start:start + batch_size] /= normalization
     anchors.flush()
+    coefficient_sum = None
+    repaired = np.zeros(2, dtype=np.int64)
+    repair_sum = np.zeros(2, dtype=np.float64)
+    repair_max = np.zeros(2, dtype=np.float64)
+    for start in range(0, n_reference, batch_size):
+        coefficients, diagnostics = numpy_coefficients(
+            anchors[start:start + batch_size], return_diagnostics=True)
+        if coefficient_sum is None:
+            coefficient_sum = np.zeros(coefficients.shape[1:], dtype=np.float64)
+        coefficient_sum += coefficients.sum(axis=0)
+        amplitudes = diagnostics['repair_amplitude']
+        repaired += np.count_nonzero(diagnostics['repair_mask'], axis=0)
+        repair_sum += amplitudes.sum(axis=0)
+        repair_max = np.maximum(repair_max, amplitudes.max(axis=0))
+    morph_normalization = coefficient_sum / n_reference
     np.save(root / 'anchor_normalization.npy', normalization)
+    np.save(root / 'morph_normalization.npy', morph_normalization)
     hybrid.normalization = normalization
+    hybrid.morph_normalization = morph_normalization
+    hybrid.morph_diagnostics = dict(
+        process_order=['signal', 'background'],
+        repaired_rows=repaired.tolist(), repaired_fraction=(repaired / n_reference).tolist(),
+        mean_repair_amplitude=(repair_sum / n_reference).tolist(),
+        max_repair_amplitude=repair_max.tolist(),
+        repair='Positive degree-eight bubble only on unsafe polynomial rows; '
+               'preserves anchors, nominal first derivative, and endpoint C2 matching.')
+    hybrid._integration_sampler = None
     paths = [root / 'reference.pt', root / 'anchor_normalization.npy',
-             root / 'reference_anchors.npy', root / 'reference_x.npy']
+             root / 'morph_normalization.npy', root / 'reference_anchors.npy',
+             root / 'reference_x.npy']
     paths += sorted((root / 'ratios').glob('*/*.onnx*'))
     paths += sorted((root / 'ratios').glob('*/*.bin'))
     hashes = {str(path.relative_to(root)): file_hash(path) for path in paths}
-    model_id = hashlib.sha256(json.dumps(hashes, sort_keys=True).encode()).hexdigest()[:16]
+    interpolation_hash = file_hash(Path(__file__).with_name('interpolation.py'))
+    identity = dict(files=hashes, interpolation_source_sha256=interpolation_hash)
+    model_id = hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()[:16]
     manifest = dict(model_id=model_id, files=hashes, n_reference=n_reference,
+                    interpolation_source_sha256=interpolation_hash,
+                    interpolation='normalized_exp_poly',
+                    morph_diagnostics=hybrid.morph_diagnostics,
+                    morph_normalization=morph_normalization.tolist(),
                     normalization_seed=seed, anchor_order=['down', 'nominal', 'up'],
                     normalization=normalization.tolist(),
                     reference='balanced nominal S/B spline flow; no preselection',
@@ -223,37 +277,84 @@ def file_hash(path):
 
 
 class ReferenceSampler:
-    """Importance resampling approximation to the continuous hNDE distribution.
+    """Importance resampling approximation to the normalized exp-poly model.
 
-    Poisson event count is exact. Conditional event density is the weighted
-    empirical proposal law. Returned anchors always belong to the GOOD model;
-    epsilon changes sampling probabilities, not the returned feature convention.
+    Counts are Poisson; conditional events follow an explicitly finite weighted
+    proposal law. Coefficient prefix sums allow exact sampling from that law in
+    O(n_events*log(n_bank)) per toy, without rescanning a five-million-event
+    integration bank for every nuisance value. Returned features are always
+    GOOD anchors; intentional epsilon mixing changes the sampling law only.
     """
-    def __init__(self, x, anchors, method='reference bank'):
+    def __init__(self, x, anchors, method='reference bank', batch_size=100_000):
+        if len(x) != len(anchors) or not len(anchors):
+            raise ValueError('A reference sampler needs matching, nonempty banks.')
         self.x, self.anchors, self.method = x, anchors, method
-        values = np.asarray(anchors).reshape(-1, 6)
-        self.sums = values.sum(axis=0)
-        self.cdf = np.cumsum(values, axis=0) / self.sums
-        self.gram = values.T @ values
+        first = numpy_coefficients(np.asarray(anchors[:1]))
+        self.n_coefficients = first.shape[-1]
+        width = 2 * self.n_coefficients
+        self.cumulative_coefficients = np.empty((len(anchors), width), dtype=np.float64)
+        self.gram = np.zeros((width, width), dtype=np.float64)
+        previous = np.zeros(width, dtype=np.float64)
+        self.positivity_repaired_rows = np.zeros(2, dtype=np.int64)
+        for start in range(0, len(anchors), batch_size):
+            coefficients = numpy_coefficients(np.asarray(anchors[start:start + batch_size]))
+            if self.n_coefficients > 7:
+                self.positivity_repaired_rows += np.count_nonzero(coefficients[..., 8], axis=0)
+            values = coefficients.reshape(-1, width)
+            self.gram += values.T @ values
+            prefix = np.cumsum(values, axis=0)
+            prefix += previous
+            self.cumulative_coefficients[start:start + len(values)] = prefix
+            previous = prefix[-1].copy()
+        self.sums = previous
+
+    def _weights(self, mu, alpha, config, epsilon):
+        if not -1.0 <= alpha <= 1.0:
+            raise ValueError('Reference interpolation is defined on [-1, 1].')
+        if not 0.0 <= epsilon <= 1.0 or mu < 0:
+            raise ValueError('Sampling requires mu >= 0 and epsilon in [0, 1].')
+        powers = float(alpha) ** np.arange(self.n_coefficients)
+        normalization = np.asarray(config['morph_normalization'], dtype=np.float64)
+        if normalization.shape != (2, self.n_coefficients):
+            raise ValueError('Morph normalization does not match the reference sampler.')
+        partitions = normalization @ powers
+        if np.any(partitions <= 0) or not np.all(np.isfinite(partitions)):
+            raise ValueError('Invalid nuisance-dependent process normalization.')
+        yields = np.array([mu * config['signal_yield'] * (1 - epsilon),
+                           config['background_yield'] + mu * config['signal_yield'] * epsilon])
+        return (yields[:, None] / partitions[:, None] * powers).reshape(-1)
 
     def sample_experiment(self, mu, alpha, config, rng, epsilon=0., n=None):
         if n is None:
             n = rng.poisson(mu * config['signal_yield'] + config['background_yield'])
-        # Decompose the linear intensity into six positive anchor coefficients.
-        fractions = np.array([max(-alpha, 0.), 1 - abs(alpha), max(alpha, 0.)])
-        yields = np.array([mu * config['signal_yield'] * (1 - epsilon),
-                           config['background_yield'] + mu * config['signal_yield'] * epsilon])
-        coefficients = (yields[:, None] * fractions).reshape(6)
-        total = coefficients @ self.sums
-        counts = rng.multinomial(n, coefficients * self.sums / total)
-        indices = np.concatenate([
-            np.searchsorted(self.cdf[:, i], rng.random(count), side='right')
-            for i, count in enumerate(counts)])
-        rng.shuffle(indices)
-        ess = total ** 2 / (coefficients @ self.gram @ coefficients)
+        coefficients = self._weights(mu, alpha, config, epsilon)
+        total = float(coefficients @ self.sums)
+        if not np.isfinite(total) or total <= 0:
+            raise ValueError('The reference proposal has invalid total intensity.')
+        targets = rng.random(n) * total
+        left = np.zeros(n, dtype=np.int64)
+        right = np.full(n, len(self.anchors), dtype=np.int64)
+        # Vectorized search over an implicit CDF. Polynomial coefficients can
+        # have either sign; their evaluated intensity is positive by construction.
+        for _ in range(len(self.anchors).bit_length()):
+            active = left < right
+            if not np.any(active):
+                break
+            slots = np.flatnonzero(active)
+            middle = (left[slots] + right[slots]) // 2
+            values = np.einsum('ij,j->i', self.cumulative_coefficients[middle],
+                               coefficients, optimize=False)
+            go_right = values <= targets[slots]
+            left[slots[go_right]] = middle[go_right] + 1
+            right[slots[~go_right]] = middle[~go_right]
+        indices = np.minimum(left, len(self.anchors) - 1)
+        squared_sum = float(coefficients @ self.gram @ coefficients)
+        ess = total ** 2 / squared_sum
+        expected = mu * config['signal_yield'] + config['background_yield']
         return dict(x=np.asarray(self.x[indices]), anchors=np.asarray(self.anchors[indices]),
                     auxiliary=float(rng.uniform(-2., 2.)), mu=float(mu), alpha=float(alpha),
                     proposal_ess=float(ess), proposal_size=len(self.anchors),
+                    proposal_relative_mass=float(total / (len(self.anchors) * expected)),
                     sampling_method=self.method)
 
     def sample_anchor_experiment(self, mu, alpha, config, rng, epsilon=0.):

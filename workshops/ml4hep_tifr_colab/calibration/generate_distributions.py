@@ -42,7 +42,7 @@ parser = argparse.ArgumentParser()
 parser.add_argument("--output-dir", type=Path, default=Path("dataframes"))
 parser.add_argument("--seed", type=int, default=13001)
 parser.add_argument("--signal-yield", type=float, default=100.0)
-parser.add_argument("--background-yield", type=float, default=10_000.0)
+parser.add_argument("--background-yield", type=float, default=1_000.0)
 parser.add_argument("--n_bkg", type=int, default=1_000_000)
 parser.add_argument("--n_sig", type=int, default=100_000)
 parser.add_argument(
