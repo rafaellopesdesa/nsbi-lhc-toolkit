@@ -25,6 +25,19 @@ million per class. These are input pool sizes before the trainer's internal
 training/validation/holdout split. All six physical anchor files share row
 partitions so paired systematic variations cannot cross the external holdout.
 
+Notebook 02 currently defaults to `DIAGNOSTICS_ONLY = True`: with the existing
+TAG and trained models, restart the runtime and use **Run all**. Sections 1–6
+are skipped. Section 7 loads the saved networks directly and checks every
+member, the arithmetic ratio ensemble, and the analytic toy ratio on fresh
+independent events. Reliability residuals include approximate pointwise 95%
+intervals and class counts; exact log-ratio errors, cross-entropy differences,
+normalization, ESS, and tail fractions are saved under
+`hybrid/ratio_diagnostics/`. This mode never trains or changes model artifacts,
+normalization, or configuration, and missing checkpoints produce an error.
+For a first training run or the original full closure study, set
+`DIAGNOSTICS_ONLY = False`. Diagnostic samples used for development decisions
+must be followed by fresh independent final validation.
+
 The fitted nuisance uses the paper's polynomial–exponential interpolation,
 with $-1\leq\alpha\leq1$. Each complete process density is divided by its
 nuisance-dependent normalization; the denominator is differentiated in every
@@ -121,3 +134,6 @@ For focused numerical checks, run `python -m unittest test_calibration.py` from
 this directory. These checks exercise interpolation and gradients, finite-bank
 closure and sampling, small inference training/checkpoint round trips, and
 the three statistic-flow stages; they do not establish full-training accuracy.
+The lighter `python -m unittest test_ratio_diagnostics` checks the new ratio
+diagnostics, exact-density oracle, and frozen-member prediction interface
+without loading trained networks or requiring a GPU.

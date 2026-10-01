@@ -117,6 +117,39 @@ class RatioEnsemble:
             chunks.append(np.mean(predictions, axis=0))
         return np.concatenate(chunks) if chunks else np.empty(0)
 
+    def member_log_ratios(self, x, batch_size=8192):
+        """Read each frozen member's log ratio without changing the ensemble.
+
+        Returns a float64 array with shape ``(n_members, n_events)``. The
+        preprocessing and ONNX outputs are identical to ``__call__``; keeping
+        the logits avoids overflow when inspecting extreme diagnostic tails.
+        """
+        if not self.members:
+            raise ValueError('Cannot evaluate an ensemble with no members.')
+        if int(batch_size) != batch_size or batch_size <= 0:
+            raise ValueError('batch_size must be a positive integer.')
+        batch_size = int(batch_size)
+        output = np.empty((len(self.members), len(x)), dtype=np.float64)
+        for start in range(0, len(x), batch_size):
+            stop = min(start + batch_size, len(x))
+            frame = pd.DataFrame(x[start:stop], columns=FEATURES)
+            for member, (scaler, session) in enumerate(self.members):
+                inputs = np.asarray(scaler.transform(frame), dtype=np.float32)
+                name = session.get_inputs()[0].name
+                logits = np.asarray(
+                    session.run(None, {name: inputs})[0], dtype=np.float64
+                ).reshape(-1)
+                if len(logits) != stop - start:
+                    raise ValueError(
+                        f'Ratio member {member} returned {len(logits)} logits '
+                        f'for {stop - start} events.')
+                if not np.all(np.isfinite(logits)):
+                    raise ValueError(
+                        f'Ratio member {member} returned nonfinite log ratios '
+                        f'for events {start}:{stop}.')
+                output[member, start:stop] = logits
+        return output
+
 
 class HybridModel:
     def __init__(self, run, flow, ratios, normalization=None, model_id=None,

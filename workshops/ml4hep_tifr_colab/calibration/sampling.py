@@ -90,6 +90,39 @@ def process_density(x, process, alpha=0.0):
     return density
 
 
+def process_log_density(x, process, alpha=0.0):
+    """Exact physical log density, including tails where the PDF underflows.
+
+    This diagnostic oracle uses the same Gaussian mixture and detector response
+    as ``process_density``. Summing component log densities avoids taking the
+    logarithm of a density that has already rounded to zero.
+    """
+    from scipy.special import logsumexp
+    from scipy.stats import multivariate_normal
+
+    if not -1.0 <= alpha <= 1.0:
+        raise ValueError("The detector-scale model is defined on alpha in [-1, 1].")
+    x = np.asarray(x, dtype=np.float64)
+    if x.ndim != 2 or x.shape[1] != len(FEATURES):
+        raise ValueError(f"Expected x with shape (n_events, {len(FEATURES)}).")
+    components = _components(process)
+    if not len(x):
+        return np.empty(0, dtype=np.float64)
+    scale, resolution = smearing_parameters()
+    response = scale * (1.0 + 0.1 * float(alpha))
+    total_fraction = sum(component[0] for component in components)
+    component_logs = []
+    for fraction, mean, covariance in components:
+        reco_covariance = covariance * np.outer(response, response)
+        reco_covariance += np.diag(resolution ** 2)
+        component_logs.append(
+            np.log(fraction / total_fraction)
+            + multivariate_normal.logpdf(
+                x, mean=mean * response, cov=reco_covariance)
+        )
+    return np.asarray(logsumexp(component_logs, axis=0)).reshape(-1)
+
+
 def read_sample(run, process, partition="ratio_train", anchor="nominal", n=None):
     """Read reco features from one disjoint row block, without loading other rows.
 
