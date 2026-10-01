@@ -16,10 +16,11 @@ import pandas as pd
 from model import FEATURES
 from interpolation import numpy_coefficients
 
-RATIO_DEFAULTS = dict(hidden_layers=4, neurons=1024, number_of_epochs=50,
+RATIO_DEFAULTS = dict(hidden_layers=4, neurons=1024, number_of_epochs=150,
                       batch_size=4096, learning_rate=1e-3, scalerType='MinMax',
                       holdout_split=0.25, validation_split=0.20,
-                      callback_patience=10, num_workers=0, verbose=1,
+                      callback_patience=10, callback_factor=0.5,
+                      early_stopping_patience=150, num_workers=0, verbose=1,
                       calibration=False)
 RATIO_NAMES = ['signal', 'background', 'signal_down', 'signal_up',
                'background_down', 'background_up']

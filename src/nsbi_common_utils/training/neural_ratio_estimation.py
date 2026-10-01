@@ -178,7 +178,8 @@ class density_ratio_trainer:
                     plot_scaled_features=False, 
                     load_trained_models = False,
                     recalibrate_output=False,
-                    num_workers=0):
+                    num_workers=0,
+                    early_stopping_patience=None):
         """
         Train a density-ratio neural network.
 
@@ -217,10 +218,17 @@ class density_ratio_trainer:
             Enable early stopping and learning-rate monitoring callbacks. Default ``True``.
 
         callback_patience : int, optional
-            Early stopping patience in epochs. Default ``30``.
+            StepLR decay interval in epochs; also the early-stopping patience when
+            ``early_stopping_patience`` is omitted. Default ``30``.
 
         callback_factor : float, optional
-            Learning-rate reduction factor at plateau. Default ``0.01``.
+            Multiplicative StepLR reduction every ``callback_patience`` epochs.
+            Default ``0.01``.
+
+        early_stopping_patience : int or None, optional
+            Separate validation early-stopping patience. ``None`` preserves the
+            legacy behavior of using ``callback_patience``. Set at least
+            ``number_of_epochs`` to allow the complete scheduled decay.
 
         activation : str, optional
             Hidden-layer activation function. Default ``'swish'``.
@@ -413,7 +421,7 @@ class density_ratio_trainer:
                     devices="auto",
                     max_epochs=number_of_epochs,
                     callbacks=[
-                        EarlyStopping(monitor="val_loss", patience=callback_patience),
+                        EarlyStopping(monitor="val_loss", patience=(callback_patience if early_stopping_patience is None else early_stopping_patience)),
                         LearningRateMonitor(),
                         checkpoint_callback,
                         loss_history,

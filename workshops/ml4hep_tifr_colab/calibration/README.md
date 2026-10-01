@@ -13,30 +13,36 @@ in their setup cells. A GPU is recommended for notebooks 02 and 04.
 | `05_Statistic_Flows.ipynb` | Reference distribution, reference residual, and simulator residual flows; held-out calibration checks | [Colab](https://colab.research.google.com/github/rafaellopesdesa/nsbi-lhc-toolkit/blob/ml4hep_school_tutorial/workshops/ml4hep_tifr_colab/calibration/05_Statistic_Flows.ipynb) |
 
 The default expected yields are $S=100$ and $B=1\,000$ at $\mu=1$, so
-$S/B=1/10$. The shared `TAG = "sb10_exppoly_v2_20260930"` selects a fresh
+$S/B=1/10$. The shared `TAG = "sb10_exppoly_10m_slowlr_v3_20261001"` selects a fresh
 run directory in all five notebooks. Start with 01 and run through 05; the
 previous `default` run is preserved. An explicit `CALIBRATION_RUN` environment
 variable overrides the tagged path and is reported in the setup cell.
 Simulation sample sizes are independent of these experimental yields. The
 reference flow has a balanced signal/background training mixture, as in
-Exercise 5: 500,000 events from each process. The nominal ratios use five
+Exercise 5: 500,000 events from each process. The nominal ratios use ten
 million events per class and four members; each systematic ratio uses one
 million per class. These are input pool sizes before the trainer's internal
 training/validation/holdout split. All six physical anchor files share row
 partitions so paired systematic variations cannot cross the external holdout.
 
-Notebook 02 currently defaults to `DIAGNOSTICS_ONLY = True`: with the existing
-TAG and trained models, restart the runtime and use **Run all**. Sections 1–6
-are skipped. Section 7 loads the saved networks directly and checks every
-member, the arithmetic ratio ensemble, and the analytic toy ratio on fresh
-independent events. Reliability residuals include approximate pointwise 95%
-intervals and class counts; exact log-ratio errors, cross-entropy differences,
-normalization, ESS, and tail fractions are saved under
-`hybrid/ratio_diagnostics/`. This mode never trains or changes model artifacts,
-normalization, or configuration, and missing checkpoints produce an error.
-For a first training run or the original full closure study, set
-`DIAGNOSTICS_ONLY = False`. Diagnostic samples used for development decisions
-must be followed by fresh independent final validation.
+Notebook 02 defaults to `DIAGNOSTICS_ONLY = False` for this fresh training run.
+Run 01, restart the runtime, then run all of 02. The two nominal ratios use
+10 million events per class and four members each. The reference-flow budget
+and four one-member systematic-ratio budgets are unchanged. All six ratio
+estimators train for 150 epochs: StepLR halves the learning rate every 10
+epochs, starting at 1e-3 and using about 6.10e-8 during epochs 141–150.
+Early-stopping patience is separately set to 150, allowing the full schedule;
+the exported model is still the checkpoint with the best validation loss.
+Flow training retains its existing settings.
+
+Section 7 checks each member, the arithmetic-ratio ensemble, and the analytic
+toy ratio on fresh independent events. Reliability residuals include
+approximate pointwise 95% intervals and class counts; exact log-ratio errors,
+cross-entropy differences, normalization, ESS, and tail fractions are saved
+under `hybrid/ratio_diagnostics/`. Set `DIAGNOSTICS_ONLY = True` later to
+rerun only these checks with completed models; missing checkpoints raise an
+error without starting training. Diagnostic samples used for development
+decisions must be followed by fresh independent final validation.
 
 The fitted nuisance uses the paper's polynomial–exponential interpolation,
 with $-1\leq\alpha\leq1$. Each complete process density is divided by its
