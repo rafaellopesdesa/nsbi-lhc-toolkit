@@ -149,15 +149,22 @@ without loading trained networks or requiring a GPU.
 ### Optional signal experiment (02b)
 
 After the reference flow and signal ensemble from 02 are saved, run 02b with
-the same TAG. It trains one signal-density candidate with logit
-`f(x) - log q(x)` and balanced BCE. A Gaussian envelope plus bounded neural
-residual ensures integrability. It uses the existing 10M signal pool, 10M
-frozen-flow draws, the gradual 150-epoch LR schedule, and validation-only
-checkpoint selection. Exact simulator densities are used only for diagnostics.
-Results and resumable checkpoints are isolated in
-`hybrid/signal_nce/known_q_gaussian_v1/`; the baseline is preserved.
-Set `TRAIN = False` to rerun comparisons without optimization. No completed
-background or systematic model is needed. Independent normalization and
-same-event BCE comparisons help decide whether a later ensemble is warranted.
-Run `python -m unittest test_signal_nce -v` for small CPU checks of the density
-parameterization, validation selection, checkpoint resumption, and provenance guards.
+`TRAIN = True` and the same TAG. The current experiment trains one signal NCE
+candidate using 10M signal events and 10M negatives: 80% frozen-flow draws and
+20% draws from a Gaussian with twice the optimization-signal envelope widths.
+Both classes use the actual mixture log density in the training logit
+`f(x) - log m(x)`. The architecture and gradual 150-epoch LR schedule are
+unchanged. Selection uses validation BCE; an independent broad-Gaussian bank
+monitors normalization every five epochs without affecting optimization.
+
+New artifacts go to `hybrid/signal_nce/known_mixture_gaussian_v2/`. The previous
+`known_q_gaussian_v1/` candidate and baseline ensemble are preserved. Fresh
+final diagnostics still evaluate `f(x) - log q(x)` against the saved reference,
+including exact-density comparisons, independent Gaussian integration,
+precision checks, and a comparison at the previous candidate's saved extreme
+events. The old candidate is also evaluated on the new diagnostic events if
+its checkpoint is available. Exact simulator densities are never training inputs.
+
+Set `TRAIN = False` to rerun the completed experiment's diagnostics. No
+completed background or systematic model is needed. For small CPU checks, run
+`python -m unittest test_signal_nce test_signal_mixture_noise test_signal_tail_diagnostics -v`.

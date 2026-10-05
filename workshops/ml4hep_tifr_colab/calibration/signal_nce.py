@@ -56,11 +56,23 @@ def log_density(model, x, batch_size=8192):
                            for i in range(0, len(x), batch_size)])
 
 
-def train_signal(x_num, x_den, logq_num, logq_den, directory, settings, provenance, device='cpu'):
+def signal_envelope(x, seed):
+    """Same optimization-only envelope used by training and noise construction."""
+    indices = np.random.default_rng(seed).permutation(len(x))[:int(.60 * len(x))]
+    mean = x[indices].mean(0, dtype=np.float64).astype('float32')
+    std = x[indices].std(0, dtype=np.float64).astype('float32').clip(1e-6)
+    return mean, std
+
+
+def train_signal(x_num, x_den, logq_num, logq_den, directory, settings, provenance,
+                 device='cpu', monitor=None):
     """Resume at epoch boundaries; select only by independent validation BCE.
 
     Each class is split 60% optimization, 15% validation, 25% untouched holdout.
-    Equal numbers from each class in every batch give the logit f(x)-log q(x).
+    Equal class counts give logit f(x)-log noise(x). The logq arguments retain
+    their original names for compatibility but must contain the actual noise
+    log density on BOTH classes (log m for mixture noise).
+    Optional monitor(model, epoch) returns diagnostic scalars, never a loss.
     """
     directory = Path(directory)
     directory.mkdir(parents=True, exist_ok=True)
@@ -84,8 +96,7 @@ def train_signal(x_num, x_den, logq_num, logq_den, directory, settings, provenan
     nt, nv = int(.60 * len(x_num)), int(.15 * len(x_num))
     train_ids = [p[:nt] for p in permutations]
     val_ids = [p[nt:nt+nv] for p in permutations]
-    mean = x_num[train_ids[0]].mean(0, dtype=np.float64).astype('float32')
-    std = x_num[train_ids[0]].std(0, dtype=np.float64).astype('float32').clip(1e-6)
+    mean, std = signal_envelope(x_num, seed)
     architecture = dict(mean=mean.tolist(), std=std.tolist(), width=settings['width'],
                         layers=settings['layers'], bound=settings['bound'])
     model = SignalNCE(**architecture).to(device)
@@ -131,6 +142,12 @@ def train_signal(x_num, x_den, logq_num, logq_den, directory, settings, provenan
         training_loss = epoch_loss([shuffle.permutation(p) for p in train_ids], True)
         validation_loss = epoch_loss(val_ids, False)
         history.append(dict(epoch=epoch+1, learning_rate=lr, train_bce=training_loss, val_bce=validation_loss))
+        if monitor is not None:
+            with torch.no_grad():
+                diagnostics = monitor(model, epoch+1)
+            if set(diagnostics) & set(history[-1]):
+                raise ValueError('Monitor keys cannot replace training history fields.')
+            history[-1].update(diagnostics)
         if validation_loss < best:
             best = validation_loss
             atomic_save(dict(model=copy.deepcopy(model.state_dict()), architecture=architecture,
