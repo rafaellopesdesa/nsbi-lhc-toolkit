@@ -8,6 +8,7 @@ in their setup cells. A GPU is recommended for notebooks 02 and 04.
 |---|---|---|
 | `01_Samples.ipynb` | Five-dimensional signal/background samples and detector-scale anchors; no preselection | [Colab](https://colab.research.google.com/github/rafaellopesdesa/nsbi-lhc-toolkit/blob/ml4hep_school_tutorial/workshops/ml4hep_tifr_colab/calibration/01_Samples.ipynb) |
 | `02_Hybrid_Density.ipynb` | Reference flow, nominal and systematic ratios, closure plots, weighted unbinned Asimov fits | [Colab](https://colab.research.google.com/github/rafaellopesdesa/nsbi-lhc-toolkit/blob/ml4hep_school_tutorial/workshops/ml4hep_tifr_colab/calibration/02_Hybrid_Density.ipynb) |
+| `02b_Signal_NCE.ipynb` | Optional signal-only experiment: frozen-reference NCE, resumable training and fresh baseline comparison | [Colab](https://colab.research.google.com/github/rafaellopesdesa/nsbi-lhc-toolkit/blob/ml4hep_school_tutorial/workshops/ml4hep_tifr_colab/calibration/02b_Signal_NCE.ipynb) |
 | `03_Misspecified_Model.ipynb` | Signal contaminated by background, controlled by one mixture fraction | [Colab](https://colab.research.google.com/github/rafaellopesdesa/nsbi-lhc-toolkit/blob/ml4hep_school_tutorial/workshops/ml4hep_tifr_colab/calibration/03_Misspecified_Model.ipynb) |
 | `04_Amortized_Inference.ipynb` | Population response and finite-experiment profiling learned by minimizing the likelihood; direct-fit validation | [Colab](https://colab.research.google.com/github/rafaellopesdesa/nsbi-lhc-toolkit/blob/ml4hep_school_tutorial/workshops/ml4hep_tifr_colab/calibration/04_Amortized_Inference.ipynb) |
 | `05_Statistic_Flows.ipynb` | Reference distribution, reference residual, and simulator residual flows; held-out calibration checks | [Colab](https://colab.research.google.com/github/rafaellopesdesa/nsbi-lhc-toolkit/blob/ml4hep_school_tutorial/workshops/ml4hep_tifr_colab/calibration/05_Statistic_Flows.ipynb) |
@@ -143,3 +144,20 @@ the three statistic-flow stages; they do not establish full-training accuracy.
 The lighter `python -m unittest test_ratio_diagnostics` checks the new ratio
 diagnostics, exact-density oracle, and frozen-member prediction interface
 without loading trained networks or requiring a GPU.
+
+
+### Optional signal experiment (02b)
+
+After the reference flow and signal ensemble from 02 are saved, run 02b with
+the same TAG. It trains one signal-density candidate with logit
+`f(x) - log q(x)` and balanced BCE. A Gaussian envelope plus bounded neural
+residual ensures integrability. It uses the existing 10M signal pool, 10M
+frozen-flow draws, the gradual 150-epoch LR schedule, and validation-only
+checkpoint selection. Exact simulator densities are used only for diagnostics.
+Results and resumable checkpoints are isolated in
+`hybrid/signal_nce/known_q_gaussian_v1/`; the baseline is preserved.
+Set `TRAIN = False` to rerun comparisons without optimization. No completed
+background or systematic model is needed. Independent normalization and
+same-event BCE comparisons help decide whether a later ensemble is warranted.
+Run `python -m unittest test_signal_nce -v` for small CPU checks of the density
+parameterization, validation selection, checkpoint resumption, and provenance guards.
